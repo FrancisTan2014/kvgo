@@ -6,7 +6,7 @@ import (
 )
 
 func main() {
-	db := core.NewDB()
+	db := core.NewSimpleDB()
 
 	key := "user:100"
 	val := []byte("Hello World!")
