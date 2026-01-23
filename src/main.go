@@ -6,7 +6,11 @@ import (
 )
 
 func main() {
-	db := core.NewSimpleDB()
+	db, err := core.NewDB("test")
+	if err != nil {
+		fmt.Printf("error: failed to create database: %v\n", err)
+		return
+	}
 
 	key := "user:100"
 	val := []byte("Hello World!")
