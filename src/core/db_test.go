@@ -1,7 +1,9 @@
 package core
 
 import (
+	"bytes"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -39,5 +41,93 @@ func TestDurability(t *testing.T) {
 	}
 	if string(val) != "Alice" {
 		t.Fatalf("Expected 'Alice', got '%s'", val)
+	}
+
+	db2.Close()
+}
+
+func TestPut_EdgeCases(t *testing.T) {
+	tmpFile := "test_put_edges.db"
+	os.Remove(tmpFile)
+	defer os.Remove(tmpFile)
+
+	db, err := NewDB(tmpFile)
+	if err != nil {
+		t.Fatalf("Failed to create DB: %v", err)
+	}
+	defer db.Close()
+
+	tests := []struct {
+		name    string
+		key     string
+		value   []byte
+		wantErr bool
+	}{
+		// Basic cases
+		{name: "simple key-value", key: "foo", value: []byte("bar"), wantErr: false},
+		{name: "single char key", key: "x", value: []byte("y"), wantErr: false},
+
+		// Empty/nil values
+		{name: "empty key", key: "", value: []byte("value"), wantErr: false},
+		{name: "empty value", key: "key", value: []byte{}, wantErr: false},
+		{name: "nil value", key: "nilval", value: nil, wantErr: false},
+
+		// Special characters
+		{name: "key with spaces", key: "hello world", value: []byte("spaced"), wantErr: false},
+		{name: "key with unicode", key: "用户:123", value: []byte("中文"), wantErr: false},
+		{name: "key with emoji", key: "user:🔥", value: []byte("fire"), wantErr: false},
+		{name: "key with newlines", key: "line1\nline2", value: []byte("multiline"), wantErr: false},
+		{name: "key with null byte", key: "before\x00after", value: []byte("null"), wantErr: false},
+		{name: "key with tabs", key: "col1\tcol2", value: []byte("tabbed"), wantErr: false},
+
+		// Binary values
+		{name: "binary value", key: "binary", value: []byte{0x00, 0xFF, 0x7F, 0x80}, wantErr: false},
+		{name: "all zeros value", key: "zeros", value: make([]byte, 100), wantErr: false},
+
+		// Size edge cases
+		{name: "long key (1KB)", key: strings.Repeat("k", 1024), value: []byte("v"), wantErr: false},
+		{name: "long value (1MB)", key: "bigval", value: make([]byte, 1024*1024), wantErr: false},
+
+		// Redis-style patterns
+		{name: "colon separator", key: "user:100:profile", value: []byte("data"), wantErr: false},
+		{name: "dot separator", key: "config.db.host", value: []byte("localhost"), wantErr: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := db.Put(tt.key, tt.value)
+
+			if tt.wantErr && err == nil {
+				t.Error("expected error, got nil")
+				return
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+
+			// Verify round-trip
+			if !tt.wantErr {
+				got, ok := db.Get(tt.key)
+				if !ok {
+					t.Errorf("key not found after Put")
+					return
+				}
+
+				// Handle nil value case (stored as empty)
+				expected := tt.value
+				if expected == nil {
+					expected = []byte{}
+				}
+
+				if !bytes.Equal(got, expected) {
+					if len(got) > 50 || len(expected) > 50 {
+						t.Errorf("value mismatch: got %d bytes, want %d bytes", len(got), len(expected))
+					} else {
+						t.Errorf("value mismatch: got %q, want %q", got, expected)
+					}
+				}
+			}
+		})
 	}
 }

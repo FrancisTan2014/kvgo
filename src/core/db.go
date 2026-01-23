@@ -15,7 +15,7 @@ type DB struct {
 
 func NewDB(path string) (*DB, error) {
 	wal, err := NewWAL(path)
-	if err != nil && err != io.EOF {
+	if err != nil {
 		return nil, err
 	}
 
@@ -25,11 +25,12 @@ func NewDB(path string) (*DB, error) {
 	}
 
 	db := &DB{shards, wal}
-	// replay
-	err = wal.Read(func(key []byte, value []byte) error {
-		return db.Put(string(key), value)
-	})
 
+	// Replay WAL to restore state (skip writing back to WAL)
+	err = wal.Read(func(key, value []byte) error {
+		db.putInternal(string(key), value)
+		return nil
+	})
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -38,30 +39,31 @@ func NewDB(path string) (*DB, error) {
 }
 
 func (db *DB) Put(key string, value []byte) error {
-	bucket := db.getShard(key)
-	bucket.mu.Lock()
-	defer bucket.mu.Unlock()
-
-	err := db.wal.Write([]byte(key), value)
-	if err != nil {
+	if err := db.wal.Write([]byte(key), value); err != nil {
+		return err
+	}
+	if err := db.wal.Sync(); err != nil {
 		return err
 	}
 
-	err = db.wal.Sync()
-	if err != nil {
-		return err
-	}
-
-	bucket.data[key] = value
+	db.putInternal(key, value)
 	return nil
 }
 
-func (db *DB) Get(key string) ([]byte, bool) {
-	bucket := db.getShard(key)
-	bucket.mu.RLock()
-	defer bucket.mu.RUnlock()
+// putInternal writes to memory only (used by replay and Put)
+func (db *DB) putInternal(key string, value []byte) {
+	s := db.getShard(key)
+	s.mu.Lock()
+	s.data[key] = value
+	s.mu.Unlock()
+}
 
-	val, ok := bucket.data[key]
+func (db *DB) Get(key string) ([]byte, bool) {
+	s := db.getShard(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	val, ok := s.data[key]
 	return val, ok
 }
 
@@ -81,9 +83,7 @@ func newShard() *shard {
 }
 
 func (db *DB) getShard(key string) *shard {
-	hashCode := hash(key)
-	slot := hashCode % NumShards
-	return db.shards[slot]
+	return db.shards[hash(key)%NumShards]
 }
 
 func hash(s string) uint32 {
