@@ -1,13 +1,13 @@
 # Sabotage
-What if the process crashes or power is off at any time?
+What if the process crashes, or the machine loses power at any time?
 
-We lost the data, as a database, it is not acceptable.
+If we lose data, that’s not acceptable for a database.
 
 ## What to do
-`Write-Ahead Log` is the way that many other databases take to persist the data.
-The basic idea is to have a log file open once and append logs to it without seeking on the disk.
+`Write-Ahead Log` (WAL) is a common approach databases use to persist writes.
+The basic idea is to open a log file once, then append records to it (no seeking).
 
-A single protocol would be:
-`LenK (4bytes) + LenV (4bytes) + Key + Value`
+One simple record format is:
+`KeyLen (4 bytes) + ValueLen (4 bytes) + Key + Value`
 
-Thus, we can use a state machine to replay the database on restarting it.
+With that, we can replay the log on startup to rebuild the in-memory state.

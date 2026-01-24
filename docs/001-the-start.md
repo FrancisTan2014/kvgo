@@ -1,12 +1,13 @@
-# The start
+# The Start
 To build a key-value storage module, keys and values are both strings.
-`Map` is the natual structure that comes up with my mind, and I'm gonna write a tough one first.
-As far, we have two components only, the `Map` and the `Store`.
-At this moment, they have no differences, but they will serve different roles in the future.
-`Put` and `Get` are the only APIs currently.
+`map` is the natural structure that comes to mind, so I'm going to write a rough version first.
 
-Before writing the code, I need to learn how to write a module in the Go language.
-1. Go code is grouped into packages, and packages are grouped into modules. 
-2. Folder as package, prefer flat folder hierarchy.
+So far, we only have two components: `Map` and `Store`.
+Right now, they don't differ, but they will serve different roles in the future.
+`Put` and `Get` are the only APIs for now.
 
-Aha, `map` is a built-in feature of `Go`, I don't need to write a `Map` from the scratch at the moment.
+Before writing code, I need to learn how to structure a module in Go:
+1. Go code is grouped into packages, and packages are grouped into modules.
+2. A folder is a package; prefer a flat folder hierarchy.
+
+Aha—`map` is built into Go, so I don't need to implement a `Map` from scratch yet.
