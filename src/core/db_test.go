@@ -21,11 +21,17 @@ func TestDurability(t *testing.T) {
 	}
 
 	t.Log("Writing data...")
-	db.Put("user:1", []byte("Alice"))
-	db.Put("user:2", []byte("Bob"))
+	if err := db.Put("user:1", []byte("Alice")); err != nil {
+		t.Fatalf("Put user:1 failed: %v", err)
+	}
+	if err := db.Put("user:2", []byte("Bob")); err != nil {
+		t.Fatalf("Put user:2 failed: %v", err)
+	}
 
-	// CRITICAL: Close the DB to flush buffers and release file handles
-	db.Close()
+	// CRITICAL: Close before reopening (Windows won't delete open files)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 
 	// --- PHASE 2: Restart ---
 	t.Log("Restarting DB...")
@@ -33,6 +39,7 @@ func TestDurability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to re-open DB: %v", err)
 	}
+	defer db2.Close()
 
 	// --- PHASE 3: Verify ---
 	val, ok := db2.Get("user:1")
@@ -42,8 +49,6 @@ func TestDurability(t *testing.T) {
 	if string(val) != "Alice" {
 		t.Fatalf("Expected 'Alice', got '%s'", val)
 	}
-
-	db2.Close()
 }
 
 func TestPut_EdgeCases(t *testing.T) {
