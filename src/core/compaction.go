@@ -23,7 +23,7 @@ var defaultCompactionPolicy = compactionPolicy{
 	CheckEvery: time.Minute,
 
 	// Never compact more frequently than this.
-	// Compaction pauses writes, so this bounds how often we can stall Put().
+	// Compaction blocks the commit loop, so this bounds how often Put() can stall.
 	MinInterval: 10 * time.Minute,
 
 	// Force a rewrite if we have not compacted for too long.
@@ -121,19 +121,15 @@ func (db *DB) compact() error {
 	committer := db.committer
 	db.stateMu.RUnlock()
 
-	committer.pauseGate.pause()
-	defer committer.pauseGate.resume()
-
-	req := &compactRequest{done: make(chan struct{})}
+	req := &compactRequest{compactWork: db.doCompact, err: make(chan error)}
 	select {
 	case committer.compactCh <- req:
 		// ok
 	case <-committer.stopCh:
 		return ErrClosed
 	}
-	<-req.done
 
-	return db.doCompact()
+	return <-req.err
 }
 
 func (db *DB) doCompact() error {
@@ -237,8 +233,8 @@ func (db *DB) openWAL() error {
 	return nil
 }
 
-// snapshot should only be called after we have stopped the world (writes paused + drained),
-// so no shard locks are needed here.
+// snapshot is called from the group committer goroutine after a drain barrier,
+// so no map writers can run concurrently and no shard locks are needed.
 func (db *DB) snapshot() []byte {
 	total := 0
 	for _, s := range db.shards {
