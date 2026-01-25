@@ -16,11 +16,11 @@ type groupCommitter struct {
 	stopCh    chan struct{}      // shutdown signal
 	doneCh    chan struct{}      // closed when committer exits
 	compactCh chan *compactRequest
-	pauseGate *pauseGate // pause signal
 }
 
 type compactRequest struct {
-	done chan struct{}
+	compactWork func() error
+	err         chan error
 }
 
 type writeRequest struct {
@@ -38,7 +38,6 @@ func newGroupCommitter() *groupCommitter {
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
 		compactCh: make(chan *compactRequest),
-		pauseGate: newPauseGate(),
 	}
 }
 
@@ -82,7 +81,8 @@ func (db *DB) startGroupCommitter() {
 			case r := <-db.committer.reqCh:
 				appendToBatch(r)
 			case cr := <-db.committer.compactCh:
-				close(cr.done)
+				// On shutdown, don't start expensive compaction work.
+				cr.err <- ErrClosed
 			default:
 				flushBuffered()
 				return
@@ -99,7 +99,8 @@ func (db *DB) startGroupCommitter() {
 		case cr := <-db.committer.compactCh:
 			// Barrier: drain everything already enqueued before compaction proceeds.
 			drainReqCh()
-			close(cr.done)
+			err := cr.compactWork()
+			cr.err <- err
 		case <-db.committer.stopCh:
 			drainAllForShutdown()
 			return

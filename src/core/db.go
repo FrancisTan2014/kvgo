@@ -73,23 +73,17 @@ func (db *DB) Put(key string, value []byte) error {
 	committer := db.committer
 	db.stateMu.RUnlock()
 
-	// Block writes if DB is paused (e.g.: compaction happens).
-	// Important: do not hold stateMu while waiting, otherwise Close() can deadlock.
-	committer.pauseGate.wait()
-
-	db.stateMu.RLock()
-	if db.closed || db.committer == nil {
-		db.stateMu.RUnlock()
-		return ErrClosed
-	}
-
 	respCh := make(chan error, 1)
 	req := &writeRequest{key: key, value: value, respCh: respCh}
 
-	// Hold RLock until the enqueue is done so Close() can't start draining
-	// while we are in-flight (prevents "enqueued after worker exits" hangs).
-	db.committer.reqCh <- req
-	db.stateMu.RUnlock()
+	// Avoid holding stateMu while potentially blocking.
+	// If shutdown has started, stopCh is closed and we fail fast.
+	select {
+	case committer.reqCh <- req:
+		// ok
+	case <-committer.stopCh:
+		return ErrClosed
+	}
 
 	return <-respCh
 }
