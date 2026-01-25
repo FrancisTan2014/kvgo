@@ -5,13 +5,22 @@ import (
 	"time"
 )
 
+const syncBatchSize = 100                   // group commit: amortize fsync across many writes
+const syncDuration = 100 * time.Millisecond // latency bound: force a flush at least this often
+
 type groupCommitter struct {
-	ticker *time.Ticker       // periodic flush trigger
-	reqCh  chan *writeRequest // incoming Put() requests
-	buf    []*writeRequest    // current batch (reused to reduce allocations/GC pressure)
-	walBuf []byte             // reusable WAL encode buffer (reduces large short-lived allocs -> less GC)
-	stopCh chan struct{}      // shutdown signal
-	doneCh chan struct{}      // closed when committer exits
+	ticker    *time.Ticker       // periodic flush trigger
+	reqCh     chan *writeRequest // incoming Put() requests
+	buf       []*writeRequest    // current batch (reused to reduce allocations/GC pressure)
+	walBuf    []byte             // reusable WAL encode buffer (reduces large short-lived allocs -> less GC)
+	stopCh    chan struct{}      // shutdown signal
+	doneCh    chan struct{}      // closed when committer exits
+	compactCh chan *compactRequest
+	pauseGate *pauseGate // pause signal
+}
+
+type compactRequest struct {
+	done chan struct{}
 }
 
 type writeRequest struct {
@@ -20,42 +29,80 @@ type writeRequest struct {
 	respCh chan error
 }
 
+func newGroupCommitter() *groupCommitter {
+	return &groupCommitter{
+		ticker:    time.NewTicker(syncDuration), // pacing for periodic flushes
+		reqCh:     make(chan *writeRequest, syncBatchSize*2),
+		buf:       make([]*writeRequest, 0, syncBatchSize),
+		walBuf:    nil,
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		compactCh: make(chan *compactRequest),
+		pauseGate: newPauseGate(),
+	}
+}
+
 func (db *DB) startGroupCommitter() {
 	defer close(db.committer.doneCh)
+
+	appendToBatch := func(r *writeRequest) {
+		db.committer.buf = append(db.committer.buf, r)
+		if len(db.committer.buf) >= cap(db.committer.buf) {
+			// Flush on size to cap memory and maximize fsync amortization.
+			db.flush(db.committer.buf)
+			db.committer.buf = db.committer.buf[:0]
+		}
+	}
+
+	flushBuffered := func() {
+		if len(db.committer.buf) > 0 {
+			// Flush on timer/shutdown to bound write latency and ensure acks.
+			db.flush(db.committer.buf)
+			db.committer.buf = db.committer.buf[:0]
+		}
+	}
+
+	drainReqCh := func() {
+		// Drain reqCh so enqueued Put() callers always get an ack.
+		for {
+			select {
+			case r := <-db.committer.reqCh:
+				appendToBatch(r)
+			default:
+				flushBuffered()
+				return
+			}
+		}
+	}
+
+	drainAllForShutdown := func() {
+		// Drain writes and also unblock any in-flight compaction requests.
+		for {
+			select {
+			case r := <-db.committer.reqCh:
+				appendToBatch(r)
+			case cr := <-db.committer.compactCh:
+				close(cr.done)
+			default:
+				flushBuffered()
+				return
+			}
+		}
+	}
 
 	for {
 		select {
 		case r := <-db.committer.reqCh:
-			db.committer.buf = append(db.committer.buf, r)
-			if len(db.committer.buf) >= cap(db.committer.buf) {
-				// Flush on size to cap memory and maximize fsync amortization.
-				db.flush(db.committer.buf)
-				db.committer.buf = db.committer.buf[:0]
-			}
+			appendToBatch(r)
 		case <-db.committer.ticker.C:
-			if len(db.committer.buf) > 0 {
-				// Flush on timer to bound write latency.
-				db.flush(db.committer.buf)
-				db.committer.buf = db.committer.buf[:0]
-			}
+			flushBuffered()
+		case cr := <-db.committer.compactCh:
+			// Barrier: drain everything already enqueued before compaction proceeds.
+			drainReqCh()
+			close(cr.done)
 		case <-db.committer.stopCh:
-			// Drain reqCh before exit so enqueued Put() callers always get an ack.
-			for {
-				select {
-				case r := <-db.committer.reqCh:
-					db.committer.buf = append(db.committer.buf, r)
-					if len(db.committer.buf) >= cap(db.committer.buf) {
-						db.flush(db.committer.buf)
-						db.committer.buf = db.committer.buf[:0]
-					}
-				default:
-					if len(db.committer.buf) > 0 {
-						db.flush(db.committer.buf)
-						db.committer.buf = db.committer.buf[:0]
-					}
-					return
-				}
-			}
+			drainAllForShutdown()
+			return
 		}
 	}
 }
@@ -90,9 +137,16 @@ func (db *DB) flush(batch []*writeRequest) {
 		}
 		panic(fmt.Sprintf("wal write+sync failed: %v", err))
 	}
+
+	db.bytesOnDisk.Add(int64(len(buf)))
+
+	var ramDelta int64
 	for _, r := range batch {
 		// Apply to memory only after WAL fsync succeeds ("strict" durability for acks).
-		db.putInternal(r.key, r.value)
+		ramDelta += db.putInternalAndDelta(r.key, r.value)
 		r.respCh <- nil
+	}
+	if ramDelta != 0 {
+		db.bytesInRAM.Add(ramDelta)
 	}
 }

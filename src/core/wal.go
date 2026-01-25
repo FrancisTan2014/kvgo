@@ -7,8 +7,11 @@ import (
 	"os"
 )
 
+const walRecordHeaderBytes = 8
+
 // wal is a private write-ahead log implementation.
 type wal struct {
+	path string
 	file *os.File
 }
 
@@ -18,7 +21,7 @@ func newWAL(path string) (*wal, error) {
 		return nil, err
 	}
 
-	return &wal{file: file}, nil
+	return &wal{path: path, file: file}, nil
 }
 
 func walRecordLen(keyLen int, valueLen int) int {

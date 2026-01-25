@@ -4,22 +4,23 @@ import (
 	"errors"
 	"io"
 	"sync"
-	"time"
+	"sync/atomic"
 )
 
-const numShards = 256      // lock striping: reduce contention vs 1 global mutex
-const syncBatchSize = 100  // group commit: amortize fsync across many writes
-const syncPeriodInMs = 100 // latency bound: force a flush at least this often
-const walRecordHeaderBytes = 8
+const numShards = 256 // lock striping: reduce contention vs 1 global mutex
 
 var ErrClosed = errors.New("db is closed")
 
 type DB struct {
-	shards    []*shard
-	wal       *wal
-	committer *groupCommitter
-	stateMu   sync.RWMutex // shutdown gate: prevents Put/Close race (no enqueue after drain)
-	closed    bool         // protected by stateMu
+	shards           []*shard
+	wal              *wal
+	committer        *groupCommitter
+	compactionWorker *compactWorker
+	bytesInRAM       atomic.Int64
+	bytesOnDisk      atomic.Int64
+
+	stateMu sync.RWMutex // shutdown gate: prevents Put/Close race (no enqueue after drain)
+	closed  bool         // protected by stateMu
 
 	closeOnce sync.Once
 	closeErr  error
@@ -40,28 +41,42 @@ func NewDB(path string) (*DB, error) {
 
 	// WAL replay: rebuild memory state without re-logging (no feedback loop).
 	err = wal.read(func(key, value []byte) error {
-		db.putInternal(string(key), value)
+		delta := db.putInternalAndDelta(string(key), value)
+		db.bytesInRAM.Add(delta)
 		return nil
 	})
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
 
-	db.committer = &groupCommitter{
-		ticker: time.NewTicker(syncPeriodInMs * time.Millisecond), // pacing for periodic flushes
-		reqCh:  make(chan *writeRequest, syncBatchSize*2),
-		buf:    make([]*writeRequest, 0, syncBatchSize),
-		walBuf: nil,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
+	if info, statErr := wal.file.Stat(); statErr == nil {
+		db.bytesOnDisk.Store(info.Size())
 	}
 
+	db.committer = newGroupCommitter()
+	db.compactionWorker, err = newCompactionWorker(defaultCompactionPolicy)
+	if err != nil {
+		return nil, err
+	}
 	go db.startGroupCommitter()
+	go db.startCompactionWorker()
 
 	return db, nil
 }
 
 func (db *DB) Put(key string, value []byte) error {
+	db.stateMu.RLock()
+	if db.closed || db.committer == nil {
+		db.stateMu.RUnlock()
+		return ErrClosed
+	}
+	committer := db.committer
+	db.stateMu.RUnlock()
+
+	// Block writes if DB is paused (e.g.: compaction happens).
+	// Important: do not hold stateMu while waiting, otherwise Close() can deadlock.
+	committer.pauseGate.wait()
+
 	db.stateMu.RLock()
 	if db.closed || db.committer == nil {
 		db.stateMu.RUnlock()
@@ -88,12 +103,20 @@ func (db *DB) Get(key string) ([]byte, bool) {
 	return val, ok
 }
 
-// putInternal writes to memory only (used by replay and Put)
-func (db *DB) putInternal(key string, value []byte) {
+// putInternalAndDelta writes to memory only and reports the logical delta bytes in RAM.
+// We track logical bytes (key bytes + value bytes), not actual heap usage.
+func (db *DB) putInternalAndDelta(key string, value []byte) int64 {
 	s := db.getShard(key)
 	s.mu.Lock()
+	oldV, existed := s.data[key]
 	s.data[key] = value
 	s.mu.Unlock()
+
+	delta := int64(len(value) - len(oldV))
+	if !existed {
+		delta += int64(len(key))
+	}
+	return delta
 }
 
 func (db *DB) Close() error {
