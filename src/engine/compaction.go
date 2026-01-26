@@ -1,4 +1,4 @@
-package core
+package engine
 
 import (
 	"errors"
@@ -121,7 +121,7 @@ func (db *DB) compact() error {
 	committer := db.committer
 	db.stateMu.RUnlock()
 
-	req := &compactRequest{compactWork: db.doCompact, err: make(chan error)}
+	req := &compactRequest{doCompact: db.doCompact, err: make(chan error)}
 	select {
 	case committer.compactCh <- req:
 		// ok

@@ -1,4 +1,4 @@
-package core
+package engine
 
 import (
 	"fmt"
@@ -19,8 +19,8 @@ type groupCommitter struct {
 }
 
 type compactRequest struct {
-	compactWork func() error
-	err         chan error
+	doCompact func() error
+	err       chan error
 }
 
 type writeRequest struct {
@@ -99,7 +99,7 @@ func (db *DB) startGroupCommitter() {
 		case cr := <-db.committer.compactCh:
 			// Barrier: drain everything already enqueued before compaction proceeds.
 			drainReqCh()
-			err := cr.compactWork()
+			err := cr.doCompact()
 			cr.err <- err
 		case <-db.committer.stopCh:
 			drainAllForShutdown()
