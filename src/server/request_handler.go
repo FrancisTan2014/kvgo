@@ -41,17 +41,22 @@ func (s *Server) handle(req protocol.Request) protocol.Response {
 	case protocol.OpGet:
 		val, ok := s.db.Get(key)
 		if !ok {
+			s.logf("GET %q -> not found", key)
 			return protocol.Response{Status: protocol.StatusNotFound}
 		}
+		s.logf("GET %q -> %d bytes", key, len(val))
 		// Avoid aliasing engine memory.
 		copyVal := append([]byte(nil), val...)
 		return protocol.Response{Status: protocol.StatusOK, Value: copyVal}
 	case protocol.OpPut:
 		if err := s.db.Put(key, req.Value); err != nil {
+			s.logf("PUT %q -> error: %v", key, err)
 			return protocol.Response{Status: protocol.StatusError}
 		}
+		s.logf("PUT %q <- %d bytes", key, len(req.Value))
 		return protocol.Response{Status: protocol.StatusOK}
 	default:
+		s.logf("unknown op %d", req.Op)
 		return protocol.Response{Status: protocol.StatusError}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"kvgo/server"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,6 +20,7 @@ func main() {
 		readTO   = flag.Duration("read-timeout", 0, "per-request read timeout (0 = no timeout)")
 		writeTO  = flag.Duration("write-timeout", 0, "per-request write timeout (0 = no timeout)")
 		maxFrame = flag.Int("max-frame", 0, "max frame size in bytes (0 = default 16MB)")
+		debug    = flag.Bool("debug", false, "enable debug logging")
 	)
 	flag.Parse()
 
@@ -38,6 +40,11 @@ func main() {
 		os.Exit(2)
 	}
 
+	var logger *log.Logger
+	if *debug {
+		logger = log.New(os.Stderr, "[kv-server] ", log.LstdFlags|log.Lmicroseconds)
+	}
+
 	opts := server.Options{
 		Network:      *network,
 		Host:         *host,
@@ -46,6 +53,7 @@ func main() {
 		ReadTimeout:  *readTO,
 		WriteTimeout: *writeTO,
 		MaxFrameSize: *maxFrame,
+		Logger:       logger,
 	}
 
 	s, err := server.NewServer(opts)
