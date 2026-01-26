@@ -14,14 +14,15 @@ import (
 
 func main() {
 	var (
-		network  = flag.String("network", "", "network type: tcp, tcp4, tcp6, unix (default tcp)")
-		host     = flag.String("host", "", "listen address or unix socket path (default 127.0.0.1)")
-		port     = flag.Int("port", 4000, "listen port (ignored for unix)")
-		dataDir  = flag.String("data-dir", "", "data directory (required)")
-		readTO   = flag.Duration("read-timeout", 0, "per-request read timeout (0 = no timeout)")
-		writeTO  = flag.Duration("write-timeout", 0, "per-request write timeout (0 = no timeout)")
-		maxFrame = flag.Int("max-frame", 0, "max frame size in bytes (0 = default 16MB)")
-		debug    = flag.Bool("debug", false, "enable debug logging")
+		network      = flag.String("network", "", "network type: tcp, tcp4, tcp6, unix (default tcp)")
+		host         = flag.String("host", "", "listen address or unix socket path (default 127.0.0.1)")
+		port         = flag.Int("port", 4000, "listen port (ignored for unix)")
+		dataDir      = flag.String("data-dir", "", "data directory (required)")
+		readTO       = flag.Duration("read-timeout", 0, "per-request read timeout (0 = no timeout)")
+		writeTO      = flag.Duration("write-timeout", 0, "per-request write timeout (0 = no timeout)")
+		maxFrame     = flag.Int("max-frame", 0, "max frame size in bytes (0 = default 16MB)")
+		syncInterval = flag.Duration("sync", 0, "WAL fsync interval (0 = default 100ms, lower = faster but more fsync)")
+		debug        = flag.Bool("debug", false, "enable debug logging")
 	)
 	flag.Parse()
 
@@ -54,6 +55,7 @@ func main() {
 		ReadTimeout:  *readTO,
 		WriteTimeout: *writeTO,
 		MaxFrameSize: *maxFrame,
+		SyncInterval: *syncInterval,
 		Logger:       logger,
 	}
 

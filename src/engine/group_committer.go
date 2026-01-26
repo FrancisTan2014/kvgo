@@ -5,8 +5,12 @@ import (
 	"time"
 )
 
-const syncBatchSize = 100                   // group commit: amortize fsync across many writes
-const syncDuration = 100 * time.Millisecond // latency bound: force a flush at least this often
+const syncBatchSize = 100 // group commit: amortize fsync across many writes
+
+// DefaultSyncInterval is the default latency bound for group commits.
+// Lower values = lower latency but more fsyncs (slower throughput).
+// Higher values = better throughput but higher tail latency.
+const DefaultSyncInterval = 10 * time.Millisecond
 
 type groupCommitter struct {
 	ticker    *time.Ticker       // periodic flush trigger
@@ -29,9 +33,12 @@ type writeRequest struct {
 	respCh chan error
 }
 
-func newGroupCommitter() *groupCommitter {
+func newGroupCommitter(syncInterval time.Duration) *groupCommitter {
+	if syncInterval <= 0 {
+		syncInterval = DefaultSyncInterval
+	}
 	return &groupCommitter{
-		ticker:    time.NewTicker(syncDuration), // pacing for periodic flushes
+		ticker:    time.NewTicker(syncInterval), // pacing for periodic flushes
 		reqCh:     make(chan *writeRequest, syncBatchSize*2),
 		buf:       make([]*writeRequest, 0, syncBatchSize),
 		walBuf:    nil,

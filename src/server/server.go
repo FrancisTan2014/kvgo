@@ -49,6 +49,11 @@ type Options struct {
 	WriteTimeout time.Duration
 	MaxFrameSize int
 
+	// SyncInterval controls how often the WAL is fsynced (latency vs throughput tradeoff).
+	// Lower values reduce latency but increase fsync overhead.
+	// Zero means use engine.DefaultSyncInterval (100ms).
+	SyncInterval time.Duration
+
 	Logger *log.Logger // optional debug logger; nil disables logging
 }
 
@@ -126,7 +131,9 @@ func (s *Server) Start() (err error) {
 	}
 
 	walPath := filepath.Join(s.opts.DataDir, "wal.db")
-	db, err = engine.NewDB(walPath)
+	db, err = engine.NewDBWithOptions(walPath, engine.Options{
+		SyncInterval: s.opts.SyncInterval,
+	})
 	if err != nil {
 		return err
 	}

@@ -5,11 +5,20 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const numShards = 256 // lock striping: reduce contention vs 1 global mutex
 
 var ErrClosed = errors.New("db is closed")
+
+// Options configures the database.
+type Options struct {
+	// SyncInterval controls how often the WAL is fsynced.
+	// Lower = lower latency, higher = better throughput.
+	// Zero means use DefaultSyncInterval (100ms).
+	SyncInterval time.Duration
+}
 
 type DB struct {
 	shards           []*shard
@@ -26,7 +35,13 @@ type DB struct {
 	closeErr  error
 }
 
+// NewDB opens or creates a database at path with default options.
 func NewDB(path string) (*DB, error) {
+	return NewDBWithOptions(path, Options{})
+}
+
+// NewDBWithOptions opens or creates a database at path with the given options.
+func NewDBWithOptions(path string, opts Options) (*DB, error) {
 	wal, err := newWAL(path)
 	if err != nil {
 		return nil, err
@@ -53,7 +68,7 @@ func NewDB(path string) (*DB, error) {
 		db.bytesOnDisk.Store(info.Size())
 	}
 
-	db.committer = newGroupCommitter()
+	db.committer = newGroupCommitter(opts.SyncInterval)
 	db.compactionWorker, err = newCompactionWorker(defaultCompactionPolicy)
 	if err != nil {
 		return nil, err
