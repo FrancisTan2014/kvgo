@@ -11,4 +11,4 @@ Go makes this straightforward because symbol visibility is controlled by naming:
 That means I can split `db.go` into focused files without losing cohesion:
 - `wal.go`: the WAL + disk I/O layer
 - `shard.go`: the in-memory storage engine (shards, hashing, locking)
-- `worker.go`: the strict group commit worker (batching, flush policy, graceful shutdown)
+- `group_committer.go`: the strict group commit worker (batching, flush policy, graceful shutdown)
