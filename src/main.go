@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
-	"kvgo/core"
+	"kvgo/engine"
 )
 
 func main() {
-	db, err := core.NewDB("test")
+	db, err := engine.NewDB("test")
 	if err != nil {
 		fmt.Printf("error: failed to create database: %v\n", err)
 		return
