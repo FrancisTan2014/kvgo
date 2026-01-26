@@ -11,6 +11,26 @@ import (
 	"time"
 )
 
+const (
+	defaultHost    = "127.0.0.1" // localhost only; override with Options.Host
+	defaultNetwork = NetworkTCP
+)
+
+// Supported network types for Options.Network.
+const (
+	NetworkTCP  = "tcp"
+	NetworkTCP4 = "tcp4"
+	NetworkTCP6 = "tcp6"
+	NetworkUnix = "unix"
+)
+
+var supportedNetworks = map[string]bool{
+	NetworkTCP:  true,
+	NetworkTCP4: true,
+	NetworkTCP6: true,
+	NetworkUnix: true,
+}
+
 var (
 	ErrAlreadyStarted = errors.New("server: already started")
 	ErrNotStarted     = errors.New("server: not started")
@@ -18,7 +38,9 @@ var (
 )
 
 type Options struct {
-	Port    uint16
+	Network string // NetworkTCP, NetworkTCP4, NetworkTCP6, or NetworkUnix
+	Host    string // address, or socket path when Network is NetworkUnix
+	Port    uint16 // ignored when Network is NetworkUnix
 	DataDir string
 
 	ReadTimeout  time.Duration
@@ -44,6 +66,12 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.DataDir == "" {
 		return nil, fmt.Errorf("server: DataDir is required")
 	}
+	if opts.Network != "" && !supportedNetworks[opts.Network] {
+		return nil, fmt.Errorf("server: unsupported Network %q", opts.Network)
+	}
+	if opts.Network == NetworkUnix && opts.Host == "" {
+		return nil, fmt.Errorf("server: Host (socket path) is required for %s network", NetworkUnix)
+	}
 	if opts.MaxFrameSize <= 0 {
 		// Default to protocol DefaultMaxFrameSize, but keep it local to avoid
 		// pulling protocol into the server config.
@@ -59,14 +87,34 @@ func (s *Server) Addr() string {
 	return s.ln.Addr().String()
 }
 
-func (s *Server) Start() error {
+func (s *Server) Start() (err error) {
 	if !s.started.CompareAndSwap(false, true) {
 		return ErrAlreadyStarted
 	}
 
-	lock, err := acquireDataDirLock(s.opts.DataDir)
+	var (
+		lock *dataDirLock
+		db   *engine.DB
+		ln   net.Listener
+	)
+
+	defer func() {
+		if err != nil {
+			if ln != nil {
+				_ = ln.Close()
+			}
+			if db != nil {
+				_ = db.Close()
+			}
+			if lock != nil {
+				_ = lock.Close()
+			}
+			s.started.Store(false)
+		}
+	}()
+
+	lock, err = acquireDataDirLock(s.opts.DataDir)
 	if err != nil {
-		s.started.Store(false)
 		if errors.Is(err, errLockBusy) {
 			return ErrDBInUse
 		}
@@ -74,28 +122,44 @@ func (s *Server) Start() error {
 	}
 
 	walPath := filepath.Join(s.opts.DataDir, "wal.db")
-	db, err := engine.NewDB(walPath)
+	db, err = engine.NewDB(walPath)
 	if err != nil {
-		_ = lock.Close()
-		s.started.Store(false)
 		return err
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", s.opts.Port)
-	ln, err := net.Listen("tcp", addr)
+	ln, err = net.Listen(s.network(), s.listenAddr())
 	if err != nil {
-		_ = db.Close()
-		_ = lock.Close()
-		s.started.Store(false)
 		return err
 	}
 
-	s.db = db
-	s.lock = lock
-	s.ln = ln
-
+	s.lock, s.db, s.ln = lock, db, ln
 	go s.acceptLoop()
 	return nil
+}
+
+func (s *Server) network() string {
+	if s.opts.Network == "" {
+		return defaultNetwork
+	}
+	return s.opts.Network
+}
+
+func (s *Server) listenAddr() string {
+	network := s.network()
+	if network == NetworkUnix {
+		return s.opts.Host
+	}
+
+	host := s.opts.Host
+	if host == "" {
+		host = defaultHost
+	}
+
+	// IPv6 addresses need brackets in host:port format.
+	if network == NetworkTCP6 && host != "" && host[0] != '[' {
+		return fmt.Sprintf("[%s]:%d", host, s.opts.Port)
+	}
+	return fmt.Sprintf("%s:%d", host, s.opts.Port)
 }
 
 func (s *Server) Shutdown() error {
