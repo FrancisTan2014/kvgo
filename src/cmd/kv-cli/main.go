@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"kvgo/protocol"
 	"net"
 	"os"
@@ -60,6 +62,10 @@ func main() {
 			key := parts[1]
 			if err := doGet(f, key, *timeout); err != nil {
 				fmt.Printf("error: %v\n", err)
+				if isConnectionError(err) {
+					fmt.Println("connection lost, exiting")
+					os.Exit(1)
+				}
 			}
 
 		case "put":
@@ -71,6 +77,10 @@ func main() {
 			value := parts[2]
 			if err := doPut(f, key, value, *timeout); err != nil {
 				fmt.Printf("error: %v\n", err)
+				if isConnectionError(err) {
+					fmt.Println("connection lost, exiting")
+					os.Exit(1)
+				}
 			}
 
 		default:
@@ -148,4 +158,26 @@ func doPut(f *protocol.Framer, key, value string, timeout time.Duration) error {
 		fmt.Printf("(unexpected status: %d)\n", resp.Status)
 	}
 	return nil
+}
+
+// isConnectionError returns true if the error indicates the connection is dead.
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// EOF means server closed the connection.
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	// Check for network errors (connection reset, broken pipe, etc.).
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// Also check for common wrapped errors.
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "forcibly closed") ||
+		strings.Contains(errStr, "EOF")
 }
