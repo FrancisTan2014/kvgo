@@ -68,6 +68,133 @@ func TestServer_PutGet(t *testing.T) {
 	}
 }
 
+func TestServer_Networks(t *testing.T) {
+	tests := []struct {
+		name    string
+		network string
+		host    string // for tcp: leave empty to use default; for unix: socket path
+		skip    func() bool
+	}{
+		{
+			name:    "tcp (default)",
+			network: "", // empty defaults to tcp
+		},
+		{
+			name:    "tcp explicit",
+			network: NetworkTCP,
+		},
+		{
+			name:    "tcp4",
+			network: NetworkTCP4,
+		},
+		{
+			name:    "tcp6",
+			network: NetworkTCP6,
+			host:    "::1",
+			skip: func() bool {
+				// Skip if IPv6 localhost is not available.
+				ln, err := net.Listen("tcp6", "[::1]:0")
+				if err != nil {
+					return true
+				}
+				ln.Close()
+				return false
+			},
+		},
+		{
+			name:    "unix",
+			network: NetworkUnix,
+			host:    "", // filled in per-test with temp path
+			skip: func() bool {
+				// Skip on systems that don't support unix sockets.
+				dir := os.TempDir()
+				sock := filepath.Join(dir, "kvgo-test-unix.sock")
+				defer os.Remove(sock)
+				ln, err := net.Listen("unix", sock)
+				if err != nil {
+					return true
+				}
+				ln.Close()
+				return false
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skip != nil && tc.skip() {
+				t.Skipf("skipping %s: not supported on this system", tc.name)
+			}
+
+			dir := t.TempDir()
+			host := tc.host
+
+			// For unix, create a socket path in temp dir.
+			if tc.network == NetworkUnix {
+				host = filepath.Join(dir, "server.sock")
+			}
+
+			opts := Options{
+				Network:      tc.network,
+				Host:         host,
+				Port:         0, // ephemeral port for tcp*
+				DataDir:      dir,
+				ReadTimeout:  200 * time.Millisecond,
+				WriteTimeout: 200 * time.Millisecond,
+			}
+
+			s, err := NewServer(opts)
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			if err := s.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer s.Shutdown()
+
+			// Dial using the actual network and address.
+			network := tc.network
+			if network == "" {
+				network = NetworkTCP
+			}
+			conn, err := net.Dial(network, s.Addr())
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			defer conn.Close()
+
+			// Simple Put/Get round-trip.
+			f := protocol.NewConnFramer(conn)
+
+			putPayload, _ := protocol.EncodeRequest(protocol.Request{Op: protocol.OpPut, Key: []byte("net-test"), Value: []byte("ok")})
+			if err := f.WriteWithTimeout(putPayload, 200*time.Millisecond); err != nil {
+				t.Fatalf("write put: %v", err)
+			}
+			respPayload, err := f.ReadWithTimeout(200 * time.Millisecond)
+			if err != nil {
+				t.Fatalf("read put resp: %v", err)
+			}
+			resp, _ := protocol.DecodeResponse(respPayload)
+			if resp.Status != protocol.StatusOK {
+				t.Fatalf("put status: %v", resp.Status)
+			}
+
+			getPayload, _ := protocol.EncodeRequest(protocol.Request{Op: protocol.OpGet, Key: []byte("net-test")})
+			if err := f.WriteWithTimeout(getPayload, 200*time.Millisecond); err != nil {
+				t.Fatalf("write get: %v", err)
+			}
+			respPayload, err = f.ReadWithTimeout(200 * time.Millisecond)
+			if err != nil {
+				t.Fatalf("read get resp: %v", err)
+			}
+			resp, _ = protocol.DecodeResponse(respPayload)
+			if resp.Status != protocol.StatusOK || string(resp.Value) != "ok" {
+				t.Fatalf("get mismatch: status=%v value=%q", resp.Status, resp.Value)
+			}
+		})
+	}
+}
+
 func TestServer_LockPreventsSecondInstance(t *testing.T) {
 	dir := t.TempDir()
 	// Pre-create dir to match real usage.
