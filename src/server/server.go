@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"kvgo/engine"
@@ -165,27 +166,42 @@ func (s *Server) listenAddr() string {
 	return fmt.Sprintf("%s:%d", host, s.opts.Port)
 }
 
-func (s *Server) Shutdown() error {
+func (s *Server) Shutdown(ctx context.Context) error {
 	if !s.started.Load() {
 		return ErrNotStarted
 	}
+
+	s.logf("shutdown: stopping listener")
 
 	// Stop accepting new connections.
 	if s.ln != nil {
 		_ = s.ln.Close()
 	}
 
-	// Close active connections to unblock handlers.
-	s.mu.Lock()
-	for c := range s.conns {
-		_ = c.Close()
-	}
-	s.mu.Unlock()
+	// Wait for in-flight requests to finish, or context to cancel.
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
 
-	s.wg.Wait()
+	select {
+	case <-done:
+		s.logf("shutdown: all connections drained")
+	case <-ctx.Done():
+		s.logf("shutdown: context canceled, forcing close")
+		// Force close active connections to unblock handlers.
+		s.mu.Lock()
+		for c := range s.conns {
+			_ = c.Close()
+		}
+		s.mu.Unlock()
+		<-done // wait for handlers to exit after force close
+	}
 
 	var err error
 	if s.db != nil {
+		s.logf("shutdown: closing database")
 		err = s.db.Close()
 	}
 	if s.lock != nil {
@@ -199,6 +215,7 @@ func (s *Server) Shutdown() error {
 	}
 
 	s.started.Store(false)
+	s.logf("shutdown: complete")
 	return err
 }
 

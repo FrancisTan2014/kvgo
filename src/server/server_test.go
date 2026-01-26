@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"kvgo/protocol"
 	"net"
 	"os"
@@ -19,7 +20,7 @@ func TestServer_PutGet(t *testing.T) {
 	if err := s.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer s.Shutdown()
+	defer s.Shutdown(context.Background())
 
 	conn, err := net.Dial("tcp", s.Addr())
 	if err != nil {
@@ -150,7 +151,7 @@ func TestServer_Networks(t *testing.T) {
 			if err := s.Start(); err != nil {
 				t.Fatalf("Start: %v", err)
 			}
-			defer s.Shutdown()
+			defer s.Shutdown(context.Background())
 
 			// Dial using the actual network and address.
 			network := tc.network
@@ -210,14 +211,14 @@ func TestServer_LockPreventsSecondInstance(t *testing.T) {
 	if err := s1.Start(); err != nil {
 		t.Fatalf("Start s1: %v", err)
 	}
-	defer s1.Shutdown()
+	defer s1.Shutdown(context.Background())
 
 	s2, err := NewServer(Options{Port: 0, DataDir: dir})
 	if err != nil {
 		t.Fatalf("New s2: %v", err)
 	}
 	if err := s2.Start(); err == nil {
-		_ = s2.Shutdown()
+		_ = s2.Shutdown(context.Background())
 		t.Fatalf("expected lock error")
 	}
 }

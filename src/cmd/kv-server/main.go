@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"kvgo/server"
@@ -74,19 +75,14 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
-	fmt.Println("shutting down...")
+	fmt.Println("shutting down (5s grace period)...")
 
-	done := make(chan struct{})
-	go func() {
-		_ = s.Shutdown()
-		close(done)
-	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	select {
-	case <-done:
-		fmt.Println("bye")
-	case <-time.After(5 * time.Second):
-		fmt.Println("shutdown timed out, exiting")
+	if err := s.Shutdown(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "shutdown error: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Println("bye")
 }
