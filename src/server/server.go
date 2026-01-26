@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"kvgo/engine"
+	"log"
 	"net"
 	"path/filepath"
 	"sync"
@@ -46,6 +47,8 @@ type Options struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	MaxFrameSize int
+
+	Logger *log.Logger // optional debug logger; nil disables logging
 }
 
 type Server struct {
@@ -206,6 +209,8 @@ func (s *Server) acceptLoop() {
 			return
 		}
 
+		s.logf("accepted connection from %s", conn.RemoteAddr())
+
 		s.mu.Lock()
 		s.conns[conn] = struct{}{}
 		s.mu.Unlock()
@@ -216,6 +221,13 @@ func (s *Server) acceptLoop() {
 			delete(s.conns, conn)
 			s.mu.Unlock()
 			_ = conn.Close()
+			s.logf("closed connection from %s", conn.RemoteAddr())
 		})
+	}
+}
+
+func (s *Server) logf(format string, args ...any) {
+	if s.opts.Logger != nil {
+		s.opts.Logger.Printf(format, args...)
 	}
 }
