@@ -33,8 +33,9 @@ const (
 type Op uint8
 
 const (
-	OpGet Op = 1
-	OpPut Op = 2
+	OpGet       Op = 1
+	OpPut       Op = 2
+	OpReplicate Op = 3
 )
 
 type Status uint8
@@ -112,6 +113,16 @@ func EncodeRequest(req Request) ([]byte, error) {
 		copy(buf[requestKeyOff:requestKeyOff+klen], req.Key)
 		copy(buf[requestKeyOff+klen:], req.Value)
 		return buf, nil
+	case OpReplicate:
+		// Replicate has no key/value, just the op byte + zeros for lengths.
+		if klen != 0 || vlen != 0 {
+			return nil, ErrInvalidMessage
+		}
+		buf := make([]byte, requestHeaderSize)
+		buf[requestOpOff] = byte(req.Op)
+		putU32LE(buf, requestKLenOff, 0)
+		putU32LE(buf, requestVLenOff, 0)
+		return buf, nil
 	default:
 		return nil, ErrUnknownOp
 	}
@@ -155,6 +166,14 @@ func DecodeRequest(payload []byte) (Request, error) {
 		key := append([]byte(nil), payload[requestKeyOff:requestKeyOff+klen]...)
 		val := append([]byte(nil), payload[requestKeyOff+klen:need]...)
 		return Request{Op: op, Key: key, Value: val}, nil
+	case OpReplicate:
+		if klen != 0 || vlen != 0 {
+			return Request{}, ErrInvalidMessage
+		}
+		if len(payload) != requestHeaderSize {
+			return Request{}, ErrInvalidMessage
+		}
+		return Request{Op: op}, nil
 	default:
 		return Request{}, ErrUnknownOp
 	}

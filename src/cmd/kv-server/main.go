@@ -17,11 +17,12 @@ func main() {
 		network      = flag.String("network", "", "network type: tcp, tcp4, tcp6, unix (default tcp)")
 		host         = flag.String("host", "", "listen address or unix socket path (default 127.0.0.1)")
 		port         = flag.Int("port", 4000, "listen port (ignored for unix)")
+		replicaOf    = flag.String("replica-of", "", "primary address to replicate from (enables replica mode)")
 		dataDir      = flag.String("data-dir", "", "data directory (required)")
 		readTO       = flag.Duration("read-timeout", 0, "per-request read timeout (0 = no timeout)")
 		writeTO      = flag.Duration("write-timeout", 0, "per-request write timeout (0 = no timeout)")
 		maxFrame     = flag.Int("max-frame", 0, "max frame size in bytes (0 = default 16MB)")
-		syncInterval = flag.Duration("sync", 0, "WAL fsync interval (0 = default 100ms, lower = faster but more fsync)")
+		syncInterval = flag.Duration("sync", 0, "WAL fsync interval (0 = default 10ms, lower = faster but more fsync)")
 		debug        = flag.Bool("debug", false, "enable debug logging")
 	)
 	flag.Parse()
@@ -51,6 +52,7 @@ func main() {
 		Network:      *network,
 		Host:         *host,
 		Port:         uint16(*port),
+		ReplicaOf:    *replicaOf,
 		DataDir:      *dataDir,
 		ReadTimeout:  *readTO,
 		WriteTimeout: *writeTO,
@@ -70,7 +72,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("kv-server listening on %s\n", s.Addr())
+	if *replicaOf != "" {
+		fmt.Printf("kv-server (replica of %s) listening on %s\n", *replicaOf, s.Addr())
+	} else {
+		fmt.Printf("kv-server (primary) listening on %s\n", s.Addr())
+	}
 
 	// Wait for interrupt signal.
 	stop := make(chan os.Signal, 1)
