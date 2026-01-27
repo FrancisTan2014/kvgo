@@ -15,13 +15,18 @@ var (
 const (
 	u8Size  = 1
 	u32Size = 4
+	u64Size = 8
 
 	// Request payload: [op u8][klen u32][vlen u32][key][value]
-	requestHeaderSize = u8Size + u32Size + u32Size
-	requestOpOff      = 0
-	requestKLenOff    = requestOpOff + u8Size
-	requestVLenOff    = requestKLenOff + u32Size
-	requestKeyOff     = requestHeaderSize
+	// For OpPut: [op u8][klen u32][vlen u32][seq u64][key][value]
+	requestHeaderSize    = u8Size + u32Size + u32Size
+	requestHeaderSizePut = requestHeaderSize + u64Size // includes seq
+	requestOpOff         = 0
+	requestKLenOff       = requestOpOff + u8Size
+	requestVLenOff       = requestKLenOff + u32Size
+	requestSeqOff        = requestVLenOff + u32Size // only for OpPut
+	requestKeyOff        = requestHeaderSize
+	requestKeyOffPut     = requestHeaderSizePut // key starts after seq for OpPut
 
 	// Response payload: [status u8][vlen u32][value]
 	responseHeaderSize = u8Size + u32Size
@@ -50,6 +55,7 @@ type Request struct {
 	Op    Op
 	Key   []byte
 	Value []byte // only for OpPut
+	Seq   uint64 // sequence number for replication (only for OpPut)
 }
 
 type Response struct {
@@ -77,11 +83,19 @@ func putU32LE(buf []byte, off int, v int) {
 	binary.LittleEndian.PutUint32(buf[off:off+u32Size], uint32(v))
 }
 
+func putU64LE(buf []byte, off int, v uint64) {
+	binary.LittleEndian.PutUint64(buf[off:off+u64Size], v)
+}
+
 // EncodeRequest encodes a Request into a payload (without the outer frameLen).
 //
 // Request payload format:
 //
 //	[op uint8][klen uint32 LE][vlen uint32 LE][key bytes][value bytes]
+//
+// For OpPut, includes seq for replication:
+//
+//	[op uint8][klen uint32 LE][vlen uint32 LE][seq uint64 LE][key bytes][value bytes]
 //
 // For OpGet, vlen must be 0 and value bytes must be omitted.
 func EncodeRequest(req Request) ([]byte, error) {
@@ -106,22 +120,24 @@ func EncodeRequest(req Request) ([]byte, error) {
 		copy(buf[requestKeyOff:], req.Key)
 		return buf, nil
 	case OpPut:
-		buf := make([]byte, requestHeaderSize+klen+vlen)
+		buf := make([]byte, requestHeaderSizePut+klen+vlen)
 		buf[requestOpOff] = byte(req.Op)
 		putU32LE(buf, requestKLenOff, klen)
 		putU32LE(buf, requestVLenOff, vlen)
-		copy(buf[requestKeyOff:requestKeyOff+klen], req.Key)
-		copy(buf[requestKeyOff+klen:], req.Value)
+		putU64LE(buf, requestSeqOff, req.Seq)
+		copy(buf[requestKeyOffPut:requestKeyOffPut+klen], req.Key)
+		copy(buf[requestKeyOffPut+klen:], req.Value)
 		return buf, nil
 	case OpReplicate:
-		// Replicate has no key/value, just the op byte + zeros for lengths.
+		// Replicate carries seq (replica's last applied seq) but no key/value.
 		if klen != 0 || vlen != 0 {
 			return nil, ErrInvalidMessage
 		}
-		buf := make([]byte, requestHeaderSize)
+		buf := make([]byte, requestHeaderSize+u64Size)
 		buf[requestOpOff] = byte(req.Op)
 		putU32LE(buf, requestKLenOff, 0)
 		putU32LE(buf, requestVLenOff, 0)
+		putU64LE(buf, requestKeyOff, req.Seq) // seq follows header since no key/value
 		return buf, nil
 	default:
 		return nil, ErrUnknownOp
@@ -159,21 +175,25 @@ func DecodeRequest(payload []byte) (Request, error) {
 		key := append([]byte(nil), payload[requestKeyOff:requestKeyOff+klen]...)
 		return Request{Op: op, Key: key}, nil
 	case OpPut:
-		need := requestHeaderSize + klen + vlen
+		need := requestHeaderSizePut + klen + vlen
 		if len(payload) != need {
 			return Request{}, ErrInvalidMessage
 		}
-		key := append([]byte(nil), payload[requestKeyOff:requestKeyOff+klen]...)
-		val := append([]byte(nil), payload[requestKeyOff+klen:need]...)
-		return Request{Op: op, Key: key, Value: val}, nil
+		seq := binary.LittleEndian.Uint64(payload[requestSeqOff : requestSeqOff+u64Size])
+		key := append([]byte(nil), payload[requestKeyOffPut:requestKeyOffPut+klen]...)
+		val := append([]byte(nil), payload[requestKeyOffPut+klen:need]...)
+		return Request{Op: op, Key: key, Value: val, Seq: seq}, nil
 	case OpReplicate:
+		// Replicate carries seq (replica's last applied seq) but no key/value.
 		if klen != 0 || vlen != 0 {
 			return Request{}, ErrInvalidMessage
 		}
-		if len(payload) != requestHeaderSize {
+		need := requestHeaderSize + u64Size
+		if len(payload) != need {
 			return Request{}, ErrInvalidMessage
 		}
-		return Request{Op: op}, nil
+		seq := binary.LittleEndian.Uint64(payload[requestKeyOff : requestKeyOff+u64Size])
+		return Request{Op: op, Seq: seq}, nil
 	default:
 		return Request{}, ErrUnknownOp
 	}

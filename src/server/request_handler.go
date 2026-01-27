@@ -54,9 +54,10 @@ func (s *Server) receiveFromPrimary(f *protocol.Framer) {
 		if req.Op == protocol.OpPut {
 			key := string(req.Key)
 			if err := s.db.Put(key, req.Value); err != nil {
-				s.logf("replication PUT %q failed: %v", key, err)
+				s.logf("replication PUT %q failed: %v (seq=%d)", key, err, req.Seq)
 			} else {
-				s.logf("replication PUT %q <- %d bytes", key, len(req.Value))
+				s.lastSeq.Store(req.Seq)
+				s.logf("replication PUT %q <- %d bytes (seq=%d)", key, len(req.Value), req.Seq)
 			}
 		}
 	}
@@ -86,8 +87,9 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 			s.logf("PUT %q -> error: %v", key, err)
 			return protocol.Response{Status: protocol.StatusError}
 		}
-		s.logf("PUT %q <- %d bytes", key, len(req.Value))
-		s.forwardToReplicas(req)
+		seq := s.seq.Add(1)
+		s.logf("PUT %q <- %d bytes (seq=%d)", key, len(req.Value), seq)
+		s.forwardToReplicas(req, seq)
 		return protocol.Response{Status: protocol.StatusOK}
 
 	case protocol.OpReplicate:
@@ -95,16 +97,25 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 			s.logf("REPLICATE rejected: this node is a replica")
 			return protocol.Response{Status: protocol.StatusError}
 		}
+		replicaLastSeq := req.Seq
+		currentSeq := s.seq.Load()
+		gap := currentSeq - replicaLastSeq
 		rc := &replicaConn{
-			conn:   conn,
-			framer: protocol.NewConnFramer(conn),
-			sendCh: make(chan []byte, replicaSendBuffer),
+			conn:    conn,
+			framer:  protocol.NewConnFramer(conn),
+			sendCh:  make(chan []byte, replicaSendBuffer),
+			lastSeq: replicaLastSeq,
 		}
 		s.mu.Lock()
 		s.replicas[conn] = rc
 		s.mu.Unlock()
 		s.wg.Go(func() { s.replicaWriter(rc) })
-		s.logf("REPLICATE registered replica %s", conn.RemoteAddr())
+		if gap > 0 {
+			s.logf("REPLICATE registered replica %s (last_seq=%d, current=%d, gap=%d writes)",
+				conn.RemoteAddr(), replicaLastSeq, currentSeq, gap)
+		} else {
+			s.logf("REPLICATE registered replica %s (seq=%d, no gap)", conn.RemoteAddr(), currentSeq)
+		}
 		return protocol.Response{Status: protocol.StatusOK}
 
 	default:
@@ -125,7 +136,8 @@ func (s *Server) writeResponse(f *protocol.Framer, resp protocol.Response) error
 }
 
 // forwardToReplicas sends a write to all connected replicas (non-blocking).
-func (s *Server) forwardToReplicas(req protocol.Request) {
+func (s *Server) forwardToReplicas(req protocol.Request, seq uint64) {
+	req.Seq = seq
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		s.logf("failed to encode replica request: %v", err)
@@ -141,7 +153,7 @@ func (s *Server) forwardToReplicas(req protocol.Request) {
 			// queued
 		default:
 			// channel full, replica is slow — drop the write
-			s.logf("replica %s send buffer full, dropping write", rc.conn.RemoteAddr())
+			s.logf("replica %s send buffer full, dropping write (seq=%d)", rc.conn.RemoteAddr(), seq)
 		}
 	}
 }

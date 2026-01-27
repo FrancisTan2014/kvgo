@@ -19,6 +19,17 @@ const (
 	defaultNetwork = NetworkTCP
 )
 
+// Consistency Model
+//
+// Replication is async, fire-and-forget with no delivery guarantees.
+// The primary forwards writes to replicas but does not wait for acknowledgment.
+// If a replica disconnects and reconnects, it will miss all writes during the gap.
+//
+// This is eventual consistency at best — replicas may lag or diverge permanently.
+// We accept this trade-off to keep the system simple and fast (following Redis).
+//
+// Sequence numbers provide visibility into replication lag but do not fix it.
+
 // Supported network types for Options.Network.
 const (
 	NetworkTCP  = "tcp"
@@ -72,14 +83,18 @@ type Server struct {
 	replicas map[net.Conn]*replicaConn
 	wg       sync.WaitGroup
 
+	seq     atomic.Uint64 // monotonic sequence number for writes (primary only)
+	lastSeq atomic.Uint64 // last applied sequence number (replica only)
+
 	started atomic.Bool
 }
 
 // replicaConn manages a single replica connection with a dedicated write goroutine.
 type replicaConn struct {
-	conn   net.Conn
-	framer *protocol.Framer
-	sendCh chan []byte // buffered channel for outgoing writes
+	conn    net.Conn
+	framer  *protocol.Framer
+	sendCh  chan []byte // buffered channel for outgoing writes
+	lastSeq uint64      // last seq reported by this replica on connect
 }
 
 const replicaSendBuffer = 1024 // max queued writes per replica
@@ -302,11 +317,12 @@ func (s *Server) connectToPrimary() error {
 		return fmt.Errorf("connect to primary %s: %w", s.opts.ReplicaOf, err)
 	}
 
-	s.logf("connected to primary, sending replicate handshake")
+	lastSeq := s.lastSeq.Load()
+	s.logf("connected to primary, sending replicate handshake (last_seq=%d)", lastSeq)
 
 	// Send replicate handshake to register as a replica.
 	f := protocol.NewConnFramer(conn)
-	req := protocol.Request{Op: protocol.OpReplicate}
+	req := protocol.Request{Op: protocol.OpReplicate, Seq: lastSeq}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		_ = conn.Close()
