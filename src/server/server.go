@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"kvgo/engine"
+	"kvgo/protocol"
 	"log"
 	"net"
 	"path/filepath"
@@ -40,10 +41,11 @@ var (
 )
 
 type Options struct {
-	Network string // NetworkTCP, NetworkTCP4, NetworkTCP6, or NetworkUnix
-	Host    string // address, or socket path when Network is NetworkUnix
-	Port    uint16 // ignored when Network is NetworkUnix
-	DataDir string
+	Network   string // NetworkTCP, NetworkTCP4, NetworkTCP6, or NetworkUnix
+	Host      string // address, or socket path when Network is NetworkUnix
+	Port      uint16 // ignored when Network is NetworkUnix
+	ReplicaOf string // non-empty value indicates that it is a follower
+	DataDir   string
 
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
@@ -58,18 +60,29 @@ type Options struct {
 }
 
 type Server struct {
-	opts Options
+	opts      Options
+	isReplica bool
 
 	ln   net.Listener
 	db   *engine.DB
 	lock *dataDirLock
 
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
-	wg    sync.WaitGroup
+	mu       sync.Mutex
+	conns    map[net.Conn]struct{}
+	replicas map[net.Conn]*replicaConn
+	wg       sync.WaitGroup
 
 	started atomic.Bool
 }
+
+// replicaConn manages a single replica connection with a dedicated write goroutine.
+type replicaConn struct {
+	conn   net.Conn
+	framer *protocol.Framer
+	sendCh chan []byte // buffered channel for outgoing writes
+}
+
+const replicaSendBuffer = 1024 // max queued writes per replica
 
 func NewServer(opts Options) (*Server, error) {
 	if opts.DataDir == "" {
@@ -86,7 +99,19 @@ func NewServer(opts Options) (*Server, error) {
 		// pulling protocol into the server config.
 		opts.MaxFrameSize = 16 << 20
 	}
-	return &Server{opts: opts, conns: make(map[net.Conn]struct{})}, nil
+
+	isReplica := opts.ReplicaOf != ""
+	var replicas map[net.Conn]*replicaConn
+	if !isReplica {
+		replicas = make(map[net.Conn]*replicaConn)
+	}
+
+	return &Server{
+		opts:      opts,
+		conns:     make(map[net.Conn]struct{}),
+		isReplica: isReplica,
+		replicas:  replicas,
+	}, nil
 }
 
 func (s *Server) Addr() string {
@@ -121,6 +146,11 @@ func (s *Server) Start() (err error) {
 			s.started.Store(false)
 		}
 	}()
+
+	// Primary node just skips this roughly
+	if err = s.connectToPrimary(); err != nil {
+		return err
+	}
 
 	lock, err = acquireDataDirLock(s.opts.DataDir)
 	if err != nil {
@@ -197,12 +227,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.logf("shutdown: all connections drained")
 	case <-ctx.Done():
 		s.logf("shutdown: context canceled, forcing close")
-		// Force close active connections to unblock handlers.
-		s.mu.Lock()
-		for c := range s.conns {
-			_ = c.Close()
-		}
-		s.mu.Unlock()
+		s.closeConnections()
 		<-done // wait for handlers to exit after force close
 	}
 
@@ -224,6 +249,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.started.Store(false)
 	s.logf("shutdown: complete")
 	return err
+}
+
+func (s *Server) closeConnections() {
+	// Force close active connections to unblock handlers.
+	s.mu.Lock()
+	for c := range s.conns {
+		_ = c.Close()
+	}
+	if !s.isReplica {
+		for _, rc := range s.replicas {
+			close(rc.sendCh) // signal writer goroutine to exit
+			_ = rc.conn.Close()
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *Server) acceptLoop() {
@@ -248,6 +288,63 @@ func (s *Server) acceptLoop() {
 			s.logf("closed connection from %s", conn.RemoteAddr())
 		})
 	}
+}
+
+func (s *Server) connectToPrimary() error {
+	if s.opts.ReplicaOf == "" {
+		return nil
+	}
+
+	s.logf("connecting to primary at %s", s.opts.ReplicaOf)
+
+	conn, err := net.DialTimeout(s.network(), s.opts.ReplicaOf, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect to primary %s: %w", s.opts.ReplicaOf, err)
+	}
+
+	s.logf("connected to primary, sending replicate handshake")
+
+	// Send replicate handshake to register as a replica.
+	f := protocol.NewConnFramer(conn)
+	req := protocol.Request{Op: protocol.OpReplicate}
+	payload, err := protocol.EncodeRequest(req)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("encode replicate request: %w", err)
+	}
+
+	if err := f.Write(payload); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("send replicate request: %w", err)
+	}
+
+	// Wait for ack from primary.
+	respPayload, err := f.Read()
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("read replicate response: %w", err)
+	}
+
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("decode replicate response: %w", err)
+	}
+
+	if resp.Status != protocol.StatusOK {
+		_ = conn.Close()
+		return fmt.Errorf("primary rejected replication: status %d", resp.Status)
+	}
+
+	s.logf("replication handshake complete, receiving writes")
+
+	// Receive forwarded writes from primary in background.
+	s.wg.Go(func() {
+		defer conn.Close()
+		s.receiveFromPrimary(f)
+	})
+
+	return nil
 }
 
 func (s *Server) logf(format string, args ...any) {
