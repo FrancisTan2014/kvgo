@@ -3,7 +3,6 @@ package server
 import (
 	"kvgo/protocol"
 	"net"
-	"time"
 )
 
 func (s *Server) handleRequest(conn net.Conn) {
@@ -32,33 +31,6 @@ func (s *Server) handleRequest(conn net.Conn) {
 		resp := s.handle(req, conn)
 		if err := s.writeResponse(f, resp); err != nil {
 			return
-		}
-	}
-}
-
-func (s *Server) receiveFromPrimary(f *protocol.Framer) {
-	for {
-		payload, err := f.Read()
-		if err != nil {
-			s.logf("replication stream closed: %v", err)
-			return
-		}
-
-		req, err := protocol.DecodeRequest(payload)
-		if err != nil {
-			s.logf("replication decode error: %v", err)
-			return
-		}
-
-		// Apply write locally (fire-and-forget from primary's perspective).
-		if req.Op == protocol.OpPut {
-			key := string(req.Key)
-			if err := s.db.Put(key, req.Value); err != nil {
-				s.logf("replication PUT %q failed: %v (seq=%d)", key, err, req.Seq)
-			} else {
-				s.lastSeq.Store(req.Seq)
-				s.logf("replication PUT %q <- %d bytes (seq=%d)", key, len(req.Value), req.Seq)
-			}
 		}
 	}
 }
@@ -100,16 +72,11 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 		replicaLastSeq := req.Seq
 		currentSeq := s.seq.Load()
 		gap := currentSeq - replicaLastSeq
-		rc := &replicaConn{
-			conn:    conn,
-			framer:  protocol.NewConnFramer(conn),
-			sendCh:  make(chan []byte, replicaSendBuffer),
-			lastSeq: replicaLastSeq,
-		}
+		rc := newReplicaConn(conn, replicaLastSeq)
 		s.mu.Lock()
 		s.replicas[conn] = rc
 		s.mu.Unlock()
-		s.wg.Go(func() { s.replicaWriter(rc) })
+		s.wg.Go(func() { s.serveReplica(rc) })
 		if gap > 0 {
 			s.logf("REPLICATE registered replica %s (last_seq=%d, current=%d, gap=%d writes)",
 				conn.RemoteAddr(), replicaLastSeq, currentSeq, gap)
@@ -117,6 +84,9 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 			s.logf("REPLICATE registered replica %s (seq=%d, no gap)", conn.RemoteAddr(), currentSeq)
 		}
 		return protocol.Response{Status: protocol.StatusOK}
+
+	case protocol.OpPing:
+		return protocol.Response{Status: protocol.StatusPong}
 
 	default:
 		s.logf("unknown op %d", req.Op)
@@ -133,48 +103,4 @@ func (s *Server) writeResponse(f *protocol.Framer, resp protocol.Response) error
 		return f.WriteWithTimeout(payload, s.opts.WriteTimeout)
 	}
 	return f.Write(payload)
-}
-
-// forwardToReplicas sends a write to all connected replicas (non-blocking).
-func (s *Server) forwardToReplicas(req protocol.Request, seq uint64) {
-	req.Seq = seq
-	payload, err := protocol.EncodeRequest(req)
-	if err != nil {
-		s.logf("failed to encode replica request: %v", err)
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, rc := range s.replicas {
-		select {
-		case rc.sendCh <- payload:
-			// queued
-		default:
-			// channel full, replica is slow — drop the write
-			s.logf("replica %s send buffer full, dropping write (seq=%d)", rc.conn.RemoteAddr(), seq)
-		}
-	}
-}
-
-// replicaWriter is a dedicated goroutine that drains sendCh and writes to the replica.
-func (s *Server) replicaWriter(rc *replicaConn) {
-	for payload := range rc.sendCh {
-		if err := rc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-			s.logf("replica %s set deadline failed: %v", rc.conn.RemoteAddr(), err)
-			break
-		}
-		if err := rc.framer.Write(payload); err != nil {
-			s.logf("replica %s write failed: %v", rc.conn.RemoteAddr(), err)
-			break
-		}
-	}
-
-	// Clean up: remove from replicas map and close connection.
-	s.mu.Lock()
-	delete(s.replicas, rc.conn)
-	s.mu.Unlock()
-	_ = rc.conn.Close()
-	s.logf("replica %s disconnected", rc.conn.RemoteAddr())
 }

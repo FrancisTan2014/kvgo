@@ -222,3 +222,48 @@ func TestServer_LockPreventsSecondInstance(t *testing.T) {
 		t.Fatalf("expected lock error")
 	}
 }
+
+// TestServer_PingPong verifies that the server responds to ping requests
+// with a pong status. This is the foundation for heartbeat-based dead replica detection.
+func TestServer_PingPong(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := NewServer(Options{Port: 0, DataDir: dir, ReadTimeout: 200 * time.Millisecond, WriteTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Shutdown(context.Background())
+
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	f := protocol.NewConnFramer(conn)
+
+	// Send ping request
+	pingPayload, err := protocol.EncodeRequest(protocol.Request{Op: protocol.OpPing})
+	if err != nil {
+		t.Fatalf("EncodeRequest ping: %v", err)
+	}
+	if err := f.WriteWithTimeout(pingPayload, 200*time.Millisecond); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+
+	// Read pong response
+	respPayload, err := f.ReadWithTimeout(200 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("read pong resp: %v", err)
+	}
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		t.Fatalf("DecodeResponse pong: %v", err)
+	}
+	if resp.Status != protocol.StatusPong {
+		t.Fatalf("expected StatusPong (%d), got %d", protocol.StatusPong, resp.Status)
+	}
+}

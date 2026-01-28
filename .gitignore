@@ -33,3 +33,4 @@ Thumbs.db
 LOCK
 wal.db
 *.db
+.bench-data/
