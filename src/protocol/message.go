@@ -41,6 +41,7 @@ const (
 	OpGet       Op = 1
 	OpPut       Op = 2
 	OpReplicate Op = 3
+	OpPing      Op = 4
 )
 
 type Status uint8
@@ -49,6 +50,7 @@ const (
 	StatusOK       Status = 0
 	StatusNotFound Status = 1
 	StatusError    Status = 2
+	StatusPong     Status = 4
 )
 
 type Request struct {
@@ -119,6 +121,7 @@ func EncodeRequest(req Request) ([]byte, error) {
 		putU32LE(buf, requestVLenOff, 0)
 		copy(buf[requestKeyOff:], req.Key)
 		return buf, nil
+
 	case OpPut:
 		buf := make([]byte, requestHeaderSizePut+klen+vlen)
 		buf[requestOpOff] = byte(req.Op)
@@ -128,6 +131,7 @@ func EncodeRequest(req Request) ([]byte, error) {
 		copy(buf[requestKeyOffPut:requestKeyOffPut+klen], req.Key)
 		copy(buf[requestKeyOffPut+klen:], req.Value)
 		return buf, nil
+
 	case OpReplicate:
 		// Replicate carries seq (replica's last applied seq) but no key/value.
 		if klen != 0 || vlen != 0 {
@@ -139,6 +143,14 @@ func EncodeRequest(req Request) ([]byte, error) {
 		putU32LE(buf, requestVLenOff, 0)
 		putU64LE(buf, requestKeyOff, req.Seq) // seq follows header since no key/value
 		return buf, nil
+
+	case OpPing:
+		buf := make([]byte, requestHeaderSize)
+		buf[requestOpOff] = byte(req.Op)
+		putU32LE(buf, requestKLenOff, 0)
+		putU32LE(buf, requestVLenOff, 0)
+		return buf, nil
+
 	default:
 		return nil, ErrUnknownOp
 	}
@@ -194,6 +206,15 @@ func DecodeRequest(payload []byte) (Request, error) {
 		}
 		seq := binary.LittleEndian.Uint64(payload[requestKeyOff : requestKeyOff+u64Size])
 		return Request{Op: op, Seq: seq}, nil
+	case OpPing:
+		// Ping carries no data.
+		if klen != 0 || vlen != 0 {
+			return Request{}, ErrInvalidMessage
+		}
+		if len(payload) != requestHeaderSize {
+			return Request{}, ErrInvalidMessage
+		}
+		return Request{Op: op}, nil
 	default:
 		return Request{}, ErrUnknownOp
 	}
@@ -211,7 +232,7 @@ func EncodeResponse(resp Response) ([]byte, error) {
 	}
 
 	switch resp.Status {
-	case StatusOK, StatusNotFound, StatusError:
+	case StatusOK, StatusNotFound, StatusError, StatusPong:
 		// ok
 	default:
 		return nil, ErrUnknownStatus
@@ -247,7 +268,7 @@ func DecodeResponse(payload []byte) (Response, error) {
 	}
 
 	switch st {
-	case StatusOK, StatusNotFound, StatusError:
+	case StatusOK, StatusNotFound, StatusError, StatusPong:
 		// ok
 	default:
 		return Response{}, ErrUnknownStatus

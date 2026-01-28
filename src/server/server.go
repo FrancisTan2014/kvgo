@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"kvgo/engine"
-	"kvgo/protocol"
 	"log"
 	"net"
 	"path/filepath"
@@ -88,16 +87,6 @@ type Server struct {
 
 	started atomic.Bool
 }
-
-// replicaConn manages a single replica connection with a dedicated write goroutine.
-type replicaConn struct {
-	conn    net.Conn
-	framer  *protocol.Framer
-	sendCh  chan []byte // buffered channel for outgoing writes
-	lastSeq uint64      // last seq reported by this replica on connect
-}
-
-const replicaSendBuffer = 1024 // max queued writes per replica
 
 func NewServer(opts Options) (*Server, error) {
 	if opts.DataDir == "" {
@@ -303,64 +292,6 @@ func (s *Server) acceptLoop() {
 			s.logf("closed connection from %s", conn.RemoteAddr())
 		})
 	}
-}
-
-func (s *Server) connectToPrimary() error {
-	if s.opts.ReplicaOf == "" {
-		return nil
-	}
-
-	s.logf("connecting to primary at %s", s.opts.ReplicaOf)
-
-	conn, err := net.DialTimeout(s.network(), s.opts.ReplicaOf, 10*time.Second)
-	if err != nil {
-		return fmt.Errorf("connect to primary %s: %w", s.opts.ReplicaOf, err)
-	}
-
-	lastSeq := s.lastSeq.Load()
-	s.logf("connected to primary, sending replicate handshake (last_seq=%d)", lastSeq)
-
-	// Send replicate handshake to register as a replica.
-	f := protocol.NewConnFramer(conn)
-	req := protocol.Request{Op: protocol.OpReplicate, Seq: lastSeq}
-	payload, err := protocol.EncodeRequest(req)
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("encode replicate request: %w", err)
-	}
-
-	if err := f.Write(payload); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("send replicate request: %w", err)
-	}
-
-	// Wait for ack from primary.
-	respPayload, err := f.Read()
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("read replicate response: %w", err)
-	}
-
-	resp, err := protocol.DecodeResponse(respPayload)
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("decode replicate response: %w", err)
-	}
-
-	if resp.Status != protocol.StatusOK {
-		_ = conn.Close()
-		return fmt.Errorf("primary rejected replication: status %d", resp.Status)
-	}
-
-	s.logf("replication handshake complete, receiving writes")
-
-	// Receive forwarded writes from primary in background.
-	s.wg.Go(func() {
-		defer conn.Close()
-		s.receiveFromPrimary(f)
-	})
-
-	return nil
 }
 
 func (s *Server) logf(format string, args ...any) {
