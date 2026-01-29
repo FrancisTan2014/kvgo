@@ -88,6 +88,16 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 	case protocol.OpPing:
 		return protocol.Response{Status: protocol.StatusPong}
 
+	case protocol.OpPromote:
+		if !s.isReplica {
+			s.logf("PROMOTE rejected: this node is a primary")
+			return protocol.Response{Status: protocol.StatusError}
+		} else {
+			s.logf("PROMOTE: replica promoted to primary")
+			s.promote()
+			return protocol.Response{Status: protocol.StatusOK}
+		}
+
 	default:
 		s.logf("unknown op %d", req.Op)
 		return protocol.Response{Status: protocol.StatusError}

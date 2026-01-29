@@ -42,6 +42,7 @@ const (
 	OpPut       Op = 2
 	OpReplicate Op = 3
 	OpPing      Op = 4
+	OpPromote   Op = 5
 )
 
 type Status uint8
@@ -144,7 +145,7 @@ func EncodeRequest(req Request) ([]byte, error) {
 		putU64LE(buf, requestKeyOff, req.Seq) // seq follows header since no key/value
 		return buf, nil
 
-	case OpPing:
+	case OpPing, OpPromote:
 		buf := make([]byte, requestHeaderSize)
 		buf[requestOpOff] = byte(req.Op)
 		putU32LE(buf, requestKLenOff, 0)
@@ -186,6 +187,7 @@ func DecodeRequest(payload []byte) (Request, error) {
 		}
 		key := append([]byte(nil), payload[requestKeyOff:requestKeyOff+klen]...)
 		return Request{Op: op, Key: key}, nil
+
 	case OpPut:
 		need := requestHeaderSizePut + klen + vlen
 		if len(payload) != need {
@@ -195,6 +197,7 @@ func DecodeRequest(payload []byte) (Request, error) {
 		key := append([]byte(nil), payload[requestKeyOffPut:requestKeyOffPut+klen]...)
 		val := append([]byte(nil), payload[requestKeyOffPut+klen:need]...)
 		return Request{Op: op, Key: key, Value: val, Seq: seq}, nil
+
 	case OpReplicate:
 		// Replicate carries seq (replica's last applied seq) but no key/value.
 		if klen != 0 || vlen != 0 {
@@ -206,8 +209,9 @@ func DecodeRequest(payload []byte) (Request, error) {
 		}
 		seq := binary.LittleEndian.Uint64(payload[requestKeyOff : requestKeyOff+u64Size])
 		return Request{Op: op, Seq: seq}, nil
-	case OpPing:
-		// Ping carries no data.
+
+	case OpPing, OpPromote:
+		// These requests carry no data
 		if klen != 0 || vlen != 0 {
 			return Request{}, ErrInvalidMessage
 		}
@@ -215,6 +219,7 @@ func DecodeRequest(payload []byte) (Request, error) {
 			return Request{}, ErrInvalidMessage
 		}
 		return Request{Op: op}, nil
+
 	default:
 		return Request{}, ErrUnknownOp
 	}

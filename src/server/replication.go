@@ -86,6 +86,7 @@ func (s *Server) connectToPrimary() error {
 		s.receiveFromPrimary(f)
 	})
 
+	s.primary = conn
 	return nil
 }
 

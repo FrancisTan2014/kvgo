@@ -83,15 +83,56 @@ func main() {
 				}
 			}
 
+		case "promote":
+			if err := doPromote(f, *timeout); err != nil {
+				fmt.Printf("error: %v\n", err)
+				if isConnectionError(err) {
+					fmt.Println("connection lost, exiting")
+					os.Exit(1)
+				}
+			}
+
 		default:
 			fmt.Printf("unknown command: %s\n", cmd)
-			fmt.Println("commands: get <key>, put <key> <value>, quit")
+			fmt.Println("commands: get <key>, put <key> <value>, promote, quit")
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "error reading input: %v\n", err)
 	}
+}
+
+func doPromote(f *protocol.Framer, timeout time.Duration) error {
+	req := protocol.Request{Op: protocol.OpPromote}
+	payload, err := protocol.EncodeRequest(req)
+	if err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+
+	if err := f.WriteWithTimeout(payload, timeout); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	respPayload, err := f.ReadWithTimeout(timeout)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	switch resp.Status {
+	case protocol.StatusOK:
+		fmt.Println("OK (promoted)")
+	case protocol.StatusError:
+		fmt.Println("(server error)")
+	default:
+		fmt.Printf("(unexpected status: %d)\n", resp.Status)
+	}
+	return nil
 }
 
 func doGet(f *protocol.Framer, key string, timeout time.Duration) error {

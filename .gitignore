@@ -34,3 +34,5 @@ LOCK
 wal.db
 *.db
 .bench-data/
+
+.github

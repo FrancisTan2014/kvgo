@@ -80,6 +80,7 @@ type Server struct {
 	mu       sync.Mutex
 	conns    map[net.Conn]struct{}
 	replicas map[net.Conn]*replicaConn
+	primary  net.Conn
 	wg       sync.WaitGroup
 
 	seq     atomic.Uint64 // monotonic sequence number for writes (primary only)
@@ -105,10 +106,7 @@ func NewServer(opts Options) (*Server, error) {
 	}
 
 	isReplica := opts.ReplicaOf != ""
-	var replicas map[net.Conn]*replicaConn
-	if !isReplica {
-		replicas = make(map[net.Conn]*replicaConn)
-	}
+	replicas := make(map[net.Conn]*replicaConn)
 
 	return &Server{
 		opts:      opts,
@@ -291,6 +289,13 @@ func (s *Server) acceptLoop() {
 			_ = conn.Close()
 			s.logf("closed connection from %s", conn.RemoteAddr())
 		})
+	}
+}
+
+func (s *Server) promote() {
+	s.isReplica = false
+	if s.primary != nil {
+		_ = s.primary.Close()
 	}
 }
 
