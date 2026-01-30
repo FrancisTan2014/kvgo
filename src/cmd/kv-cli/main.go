@@ -92,9 +92,23 @@ func main() {
 				}
 			}
 
+		case "replicaof":
+			if len(parts) < 2 {
+				fmt.Println("usage: replicaof <host:port>")
+				continue
+			}
+			primaryAddr := parts[1]
+			if err := doReplicaOf(f, primaryAddr, *timeout); err != nil {
+				fmt.Printf("error: %v\n", err)
+				if isConnectionError(err) {
+					fmt.Println("connection lost, exiting")
+					os.Exit(1)
+				}
+			}
+
 		default:
 			fmt.Printf("unknown command: %s\n", cmd)
-			fmt.Println("commands: get <key>, put <key> <value>, promote, quit")
+			fmt.Println("commands: get <key>, put <key> <value>, promote, replicaof <host:port>, quit")
 		}
 	}
 
@@ -171,6 +185,38 @@ func doGet(f *protocol.Framer, key string, timeout time.Duration) error {
 
 func doPut(f *protocol.Framer, key, value string, timeout time.Duration) error {
 	req := protocol.Request{Op: protocol.OpPut, Key: []byte(key), Value: []byte(value)}
+	payload, err := protocol.EncodeRequest(req)
+	if err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+
+	if err := f.WriteWithTimeout(payload, timeout); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	respPayload, err := f.ReadWithTimeout(timeout)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	switch resp.Status {
+	case protocol.StatusOK:
+		fmt.Println("OK")
+	case protocol.StatusError:
+		fmt.Println("(server error)")
+	default:
+		fmt.Printf("(unexpected status: %d)\n", resp.Status)
+	}
+	return nil
+}
+
+func doReplicaOf(f *protocol.Framer, primaryAddr string, timeout time.Duration) error {
+	req := protocol.Request{Op: protocol.OpReplicaOf, Value: []byte(primaryAddr)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)

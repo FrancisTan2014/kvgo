@@ -43,6 +43,7 @@ const (
 	OpReplicate Op = 3
 	OpPing      Op = 4
 	OpPromote   Op = 5
+	OpReplicaOf Op = 6
 )
 
 type Status uint8
@@ -57,7 +58,7 @@ const (
 type Request struct {
 	Op    Op
 	Key   []byte
-	Value []byte // only for OpPut
+	Value []byte // for OpPut and some command requests like `OpReplicaOf`
 	Seq   uint64 // sequence number for replication (only for OpPut)
 }
 
@@ -152,6 +153,15 @@ func EncodeRequest(req Request) ([]byte, error) {
 		putU32LE(buf, requestVLenOff, 0)
 		return buf, nil
 
+	case OpReplicaOf:
+		// To make the protocol simple, we reuse the `Value` field here
+		buf := make([]byte, requestHeaderSize+vlen)
+		buf[requestOpOff] = byte(req.Op)
+		putU32LE(buf, requestKLenOff, 0)
+		putU32LE(buf, requestVLenOff, vlen)
+		copy(buf[requestHeaderSize:], req.Value)
+		return buf, nil
+
 	default:
 		return nil, ErrUnknownOp
 	}
@@ -209,6 +219,17 @@ func DecodeRequest(payload []byte) (Request, error) {
 		}
 		seq := binary.LittleEndian.Uint64(payload[requestKeyOff : requestKeyOff+u64Size])
 		return Request{Op: op, Seq: seq}, nil
+
+	case OpReplicaOf:
+		if klen != 0 {
+			return Request{}, ErrInvalidMessage
+		}
+		need := requestHeaderSize + vlen
+		if len(payload) != need {
+			return Request{}, ErrInvalidMessage
+		}
+		val := append([]byte(nil), payload[requestHeaderSize:need]...)
+		return Request{Op: op, Value: val}, nil
 
 	case OpPing, OpPromote:
 		// These requests carry no data

@@ -292,11 +292,36 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-func (s *Server) promote() {
+func (s *Server) promote() error {
 	s.isReplica = false
 	if s.primary != nil {
-		_ = s.primary.Close()
+		return s.primary.Close()
 	}
+
+	return nil
+}
+
+func (s *Server) relocate(primaryAddr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.logf("RELOCATE: switching primary to %s", primaryAddr)
+
+	for c, r := range s.replicas {
+		close(r.sendCh)
+		_ = r.conn.Close()
+		delete(s.replicas, c)
+	}
+
+	if s.primary != nil {
+		_ = s.primary.Close()
+		s.primary = nil
+	}
+
+	s.isReplica = true
+	s.opts.ReplicaOf = primaryAddr
+
+	return s.connectToPrimary()
 }
 
 func (s *Server) logf(format string, args ...any) {

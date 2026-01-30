@@ -155,7 +155,11 @@ func (s *Server) serveReplica(rc *replicaConn) {
 
 	for {
 		select {
-		case payload := <-rc.sendCh:
+		case payload, ok := <-rc.sendCh:
+			if !ok {
+				// Channel closed
+				return
+			}
 			if err := rc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
 				s.logf("replica %s set deadline failed: %v", rc.conn.RemoteAddr(), err)
 				return
@@ -165,6 +169,7 @@ func (s *Server) serveReplica(rc *replicaConn) {
 				return
 			}
 			rc.lastWrite = time.Now()
+
 		case <-rc.hb.C:
 			// heartbeat: ping replica if idle
 			if time.Since(rc.lastWrite) > heartbeatInterval {
