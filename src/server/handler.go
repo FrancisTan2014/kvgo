@@ -93,8 +93,20 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 			s.logf("PROMOTE rejected: this node is a primary")
 			return protocol.Response{Status: protocol.StatusError}
 		} else {
-			s.logf("PROMOTE: replica promoted to primary")
-			s.promote()
+			if err := s.promote(); err != nil {
+				s.logf("PROMOTE: failed to promote to primary: %v", err)
+				return protocol.Response{Status: protocol.StatusError}
+			} else {
+				s.logf("PROMOTE: promoted to primary")
+				return protocol.Response{Status: protocol.StatusOK}
+			}
+		}
+
+	case protocol.OpReplicaOf:
+		if err := s.relocate(string(req.Value)); err != nil {
+			s.logf("REPLICAOF failed: %v", err)
+			return protocol.Response{Status: protocol.StatusError}
+		} else {
 			return protocol.Response{Status: protocol.StatusOK}
 		}
 
