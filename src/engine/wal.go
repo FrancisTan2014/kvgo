@@ -41,6 +41,16 @@ func (w *wal) close() error {
 	return w.file.Close()
 }
 
+func (w *wal) clear() error {
+	var err error
+
+	if err = w.file.Close(); err != nil {
+		return err
+	}
+
+	return os.Remove(w.path)
+}
+
 func (w *wal) read(handler func([]byte, []byte) error) error {
 	for {
 		var header [walRecordHeaderBytes]byte
