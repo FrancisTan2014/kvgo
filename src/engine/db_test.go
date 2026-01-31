@@ -136,3 +136,52 @@ func TestPut_EdgeCases(t *testing.T) {
 		})
 	}
 }
+
+func TestClear(t *testing.T) {
+	tmpFile := "test_clear.db"
+	os.Remove(tmpFile)
+	defer os.Remove(tmpFile)
+
+	db, err := NewDB(tmpFile)
+	if err != nil {
+		t.Fatalf("Failed to create DB: %v", err)
+	}
+	defer db.Close()
+
+	// Write some data
+	if err := db.Put("key1", []byte("value1")); err != nil {
+		t.Fatalf("Put key1 failed: %v", err)
+	}
+	if err := db.Put("key2", []byte("value2")); err != nil {
+		t.Fatalf("Put key2 failed: %v", err)
+	}
+
+	// Verify data exists
+	if _, ok := db.Get("key1"); !ok {
+		t.Fatal("key1 should exist before clear")
+	}
+	if _, ok := db.Get("key2"); !ok {
+		t.Fatal("key2 should exist before clear")
+	}
+
+	// Clear the database
+	if err := db.Clear(); err != nil {
+		t.Fatalf("Clear failed: %v", err)
+	}
+
+	// Verify all data is gone
+	if _, ok := db.Get("key1"); ok {
+		t.Error("key1 should not exist after clear")
+	}
+	if _, ok := db.Get("key2"); ok {
+		t.Error("key2 should not exist after clear")
+	}
+
+	// Verify we can write new data after clear
+	if err := db.Put("key3", []byte("value3")); err != nil {
+		t.Fatalf("Put after clear failed: %v", err)
+	}
+	if val, ok := db.Get("key3"); !ok || string(val) != "value3" {
+		t.Error("key3 should exist after clear and new write")
+	}
+}

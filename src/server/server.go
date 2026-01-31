@@ -318,7 +318,10 @@ func (s *Server) relocate(primaryAddr string) error {
 		s.primary = nil
 	}
 
+	s.db.Clear()
+
 	s.isReplica = true
+	s.lastSeq.Store(0)
 	s.opts.ReplicaOf = primaryAddr
 
 	return s.connectToPrimary()

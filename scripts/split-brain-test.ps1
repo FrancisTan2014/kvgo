@@ -71,36 +71,39 @@ Write-Host "--- 6. HEAL PARTITION: Re-point R1 to P ---" -ForegroundColor Cyan
 Write-Host "R1 is now following P again."
 Start-Sleep -Seconds 1
 
-# 7. Check Data Loss
+# 7. Verify Full Resync
 Write-Host ""
-Write-Host "--- 7. Verify Data Loss ---" -ForegroundColor Cyan
+Write-Host "--- 7. Verify Full Resync (Fix Applied) ---" -ForegroundColor Cyan
+$r1Baseline = "get baseline" | & $cliExe -addr "127.0.0.1:4001" 2>&1
 $r1KeyP = "get key_p" | & $cliExe -addr "127.0.0.1:4001" 2>&1
 $r1KeyR = "get key_r" | & $cliExe -addr "127.0.0.1:4001" 2>&1
 
-if ($r1KeyP -match "100") {
-    Write-Host "R1 now sees key_p=100 (from P)." -ForegroundColor Green
+if ($r1Baseline -match "sync") {
+    Write-Host "PASS: R1 has baseline (from full snapshot)." -ForegroundColor Green
 } else {
-    Write-Host "ERROR: R1 did not sync key_p from P." -ForegroundColor Red
+    Write-Host "FAIL: R1 missing baseline (snapshot failed)." -ForegroundColor Red
+}
+
+if ($r1KeyP -match "100") {
+    Write-Host "PASS: R1 has key_p=100 (from full snapshot)." -ForegroundColor Green
+} else {
+    Write-Host "FAIL: R1 did not sync key_p from P." -ForegroundColor Red
 }
 
 if ($r1KeyR -match "not found") {
-    Write-Host "R1's own write (key_r=200) is LOST." -ForegroundColor Red
-    Write-Host "This is the Split Brain data loss." -ForegroundColor Yellow
+    Write-Host "PASS: R1's stale write (key_r=200) is LOST (expected)." -ForegroundColor Green
 } else {
-    Write-Host "UNEXPECTED: R1 still has key_r." -ForegroundColor Yellow
+    Write-Host "FAIL: R1 still has key_r (should be cleared)." -ForegroundColor Red
 }
 
 # 8. Summary
 Write-Host ""
 Write-Host "=== SUMMARY ===" -ForegroundColor Cyan
-Write-Host "Split Brain creates two independent histories."
-Write-Host "When the partition heals, the rejoining node discards its history."
-Write-Host "Data written to R1 during the split is permanently lost."
+Write-Host "FIX APPLIED: Full resync on replicaof"
+Write-Host "- When a node switches primary, it clears its DB and resets lastSeq to 0."
+Write-Host "- This ensures no stale data survives from split brain periods."
+Write-Host "- Trade-off: We retransmit the entire log (inefficient for large DBs)."
 Write-Host ""
-Write-Host "To prevent this, we would need:"
-Write-Host "  1. Epoch/Term numbers to detect stale leaders"
-Write-Host "  2. Fencing tokens to reject writes from old leaders"
-Write-Host "  3. Quorum-based writes (Raft/Paxos)"
 
 # Cleanup
 Stop-Process -Id $p.Id -ErrorAction SilentlyContinue

@@ -143,3 +143,44 @@ func (db *DB) Close() error {
 	})
 	return db.closeErr
 }
+
+// Clear deletes all keys from memory and resets the WAL file.
+func (db *DB) Clear() error {
+	db.stateMu.Lock()
+	defer db.stateMu.Unlock()
+
+	var err error
+	if err = db.wal.clear(); err != nil {
+		return err
+	}
+
+	for _, s := range db.shards {
+		s.mu.Lock()
+		s.data = make(map[string][]byte)
+		s.mu.Unlock()
+	}
+
+	db.bytesInRAM.Store(0)
+	db.bytesOnDisk.Store(0)
+
+	if db.wal, err = newWAL(db.wal.path); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Range calls fn sequentially for each key-value pair in the database.
+// If fn returns false, iteration stops.
+func (db *DB) Range(fn func(key string, value []byte) bool) {
+	for _, s := range db.shards {
+		s.mu.RLock()
+		for k, v := range s.data {
+			if !fn(k, v) {
+				s.mu.RUnlock()
+				return
+			}
+		}
+		s.mu.RUnlock()
+	}
+}

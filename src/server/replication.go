@@ -153,6 +153,10 @@ func (s *Server) serveReplica(rc *replicaConn) {
 		s.logf("replica %s disconnected", rc.conn.RemoteAddr())
 	}()
 
+	if rc.lastSeq == 0 {
+		s.syncReplica(rc)
+	}
+
 	for {
 		select {
 		case payload, ok := <-rc.sendCh:
@@ -187,4 +191,35 @@ func (s *Server) serveReplica(rc *replicaConn) {
 			}
 		}
 	}
+}
+
+func (s *Server) syncReplica(rc *replicaConn) {
+	s.logf("full sync started for replica %s", rc.conn.RemoteAddr())
+
+	// No deadline during full sync (could be large DB)
+	_ = rc.conn.SetWriteDeadline(time.Time{})
+
+	seq := s.seq.Load()
+	s.db.Range(func(key string, value []byte) bool {
+		req := protocol.Request{
+			Op:    protocol.OpPut,
+			Key:   []byte(key),
+			Value: value,
+			Seq:   seq,
+		}
+		payload, err := protocol.EncodeRequest(req)
+		if err != nil {
+			s.logf("replica %s encode failed: %v", rc.conn.RemoteAddr(), err)
+			return false
+		}
+
+		if err := rc.framer.Write(payload); err != nil {
+			s.logf("replica %s write failed: %v", rc.conn.RemoteAddr(), err)
+			return false
+		}
+
+		return true
+	})
+
+	s.logf("full sync completed for replica %s", rc.conn.RemoteAddr())
 }
