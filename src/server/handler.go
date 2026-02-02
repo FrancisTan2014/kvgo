@@ -29,6 +29,10 @@ func (s *Server) handleRequest(conn net.Conn) {
 		}
 
 		resp := s.handle(req, conn)
+		if resp.Status == protocol.StatusNoReply {
+			// Handler took over connection (e.g., replication)
+			return
+		}
 		if err := s.writeResponse(f, resp); err != nil {
 			return
 		}
@@ -60,8 +64,18 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 			return protocol.Response{Status: protocol.StatusError}
 		}
 		seq := s.seq.Add(1)
+
 		s.logf("PUT %q <- %d bytes (seq=%d)", key, len(req.Value), seq)
-		s.forwardToReplicas(req, seq)
+
+		req.Seq = seq
+		payload, err := protocol.EncodeRequest(req)
+		if err != nil {
+			s.logf("failed to encode replica request: %v", err)
+			return protocol.Response{Status: protocol.StatusError}
+		}
+
+		s.writeBacklog(payload)
+		s.forwardToReplicas(payload, seq)
 		return protocol.Response{Status: protocol.StatusOK}
 
 	case protocol.OpReplicate:
@@ -69,21 +83,15 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 			s.logf("REPLICATE rejected: this node is a replica")
 			return protocol.Response{Status: protocol.StatusError}
 		}
-		replicaLastSeq := req.Seq
-		currentSeq := s.seq.Load()
-		gap := currentSeq - replicaLastSeq
-		rc := newReplicaConn(conn, replicaLastSeq)
+		replid := string(req.Value)
+		rc := newReplicaConn(conn, req.Seq, replid)
 		s.mu.Lock()
 		s.replicas[conn] = rc
 		s.mu.Unlock()
-		s.wg.Go(func() { s.serveReplica(rc) })
-		if gap > 0 {
-			s.logf("REPLICATE registered replica %s (last_seq=%d, current=%d, gap=%d writes)",
-				conn.RemoteAddr(), replicaLastSeq, currentSeq, gap)
-		} else {
-			s.logf("REPLICATE registered replica %s (seq=%d, no gap)", conn.RemoteAddr(), currentSeq)
-		}
-		return protocol.Response{Status: protocol.StatusOK}
+		// serveReplica takes over this connection - call directly, don't return
+		s.serveReplica(rc)
+		// serveReplica returns when replica disconnects - connection will be closed by caller
+		return protocol.Response{Status: protocol.StatusNoReply}
 
 	case protocol.OpPing:
 		return protocol.Response{Status: protocol.StatusPong}

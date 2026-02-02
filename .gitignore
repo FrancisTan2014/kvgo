@@ -36,3 +36,4 @@ wal.db
 .bench-data/
 
 .github
+redis/
