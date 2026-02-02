@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"kvgo/protocol"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -13,21 +17,23 @@ const pongTimeout = 2 * time.Second
 
 // replicaConn manages a single replica connection with a dedicated write goroutine.
 type replicaConn struct {
-	conn      net.Conn
-	framer    *protocol.Framer
-	sendCh    chan []byte  // buffered channel for outgoing writes
-	lastSeq   uint64       // last seq reported by this replica on connect
-	hb        *time.Ticker // heartbeat ticker
-	lastWrite time.Time
+	conn       net.Conn
+	framer     *protocol.Framer
+	sendCh     chan []byte  // buffered channel for outgoing writes
+	lastReplid string       // primary replid this replica last followed
+	lastSeq    uint64       // last seq reported by this replica on connect
+	hb         *time.Ticker // heartbeat ticker
+	lastWrite  time.Time
 }
 
-func newReplicaConn(conn net.Conn, replicaLastSeq uint64) *replicaConn {
+func newReplicaConn(conn net.Conn, replicaLastSeq uint64, lastReplid string) *replicaConn {
 	return &replicaConn{
-		conn:    conn,
-		framer:  protocol.NewConnFramer(conn),
-		sendCh:  make(chan []byte, replicaSendBuffer),
-		lastSeq: replicaLastSeq,
-		hb:      time.NewTicker(heartbeatInterval),
+		conn:       conn,
+		framer:     protocol.NewConnFramer(conn),
+		sendCh:     make(chan []byte, replicaSendBuffer),
+		lastReplid: lastReplid,
+		lastSeq:    replicaLastSeq,
+		hb:         time.NewTicker(heartbeatInterval),
 	}
 }
 
@@ -48,7 +54,7 @@ func (s *Server) connectToPrimary() error {
 
 	// Send replicate handshake to register as a replica.
 	f := protocol.NewConnFramer(conn)
-	req := protocol.Request{Op: protocol.OpReplicate, Seq: lastSeq}
+	req := protocol.Request{Op: protocol.OpReplicate, Seq: lastSeq, Value: []byte(s.replid)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		_ = conn.Close()
@@ -73,7 +79,13 @@ func (s *Server) connectToPrimary() error {
 		return fmt.Errorf("decode replicate response: %w", err)
 	}
 
-	if resp.Status != protocol.StatusOK {
+	if resp.Status == protocol.StatusFullResync {
+		s.logf("primary requested full resync, clearing local DB")
+		s.db.Clear()
+		if len(resp.Value) > 0 {
+			s.replid = string(resp.Value)
+		}
+	} else if resp.Status != protocol.StatusOK {
 		_ = conn.Close()
 		return fmt.Errorf("primary rejected replication: status %d", resp.Status)
 	}
@@ -111,6 +123,9 @@ func (s *Server) receiveFromPrimary(f *protocol.Framer) {
 				s.logf("replication PUT %q failed: %v (seq=%d)", key, err, req.Seq)
 			} else {
 				s.lastSeq.Store(req.Seq)
+				if err = s.storeState(); err != nil {
+					s.logf("error occurred on storing replica state: %v", err)
+				}
 				s.logf("replication PUT %q <- %d bytes (seq=%d)", key, len(req.Value), req.Seq)
 			}
 		}
@@ -118,14 +133,7 @@ func (s *Server) receiveFromPrimary(f *protocol.Framer) {
 }
 
 // forwardToReplicas sends a write to all connected replicas (non-blocking).
-func (s *Server) forwardToReplicas(req protocol.Request, seq uint64) {
-	req.Seq = seq
-	payload, err := protocol.EncodeRequest(req)
-	if err != nil {
-		s.logf("failed to encode replica request: %v", err)
-		return
-	}
-
+func (s *Server) forwardToReplicas(payload []byte, seq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -153,8 +161,11 @@ func (s *Server) serveReplica(rc *replicaConn) {
 		s.logf("replica %s disconnected", rc.conn.RemoteAddr())
 	}()
 
-	if rc.lastSeq == 0 {
-		s.syncReplica(rc)
+	seqIndex := s.getSeqIndex(rc.lastSeq)
+	if rc.lastReplid != s.replid || seqIndex == SeqNotFound {
+		s.fullResync(rc)
+	} else {
+		s.partialSync(rc, seqIndex)
 	}
 
 	for {
@@ -193,11 +204,14 @@ func (s *Server) serveReplica(rc *replicaConn) {
 	}
 }
 
-func (s *Server) syncReplica(rc *replicaConn) {
+func (s *Server) fullResync(rc *replicaConn) {
 	s.logf("full sync started for replica %s", rc.conn.RemoteAddr())
 
 	// No deadline during full sync (could be large DB)
 	_ = rc.conn.SetWriteDeadline(time.Time{})
+
+	fullSyncResp, _ := protocol.EncodeResponse(protocol.Response{Status: protocol.StatusFullResync, Value: []byte(s.replid)})
+	_ = rc.framer.Write(fullSyncResp)
 
 	seq := s.seq.Load()
 	s.db.Range(func(key string, value []byte) bool {
@@ -222,4 +236,66 @@ func (s *Server) syncReplica(rc *replicaConn) {
 	})
 
 	s.logf("full sync completed for replica %s", rc.conn.RemoteAddr())
+}
+
+func (s *Server) partialSync(rc *replicaConn, seqIndex int) {
+	s.logf("partial sync started for replica %s", rc.conn.RemoteAddr())
+
+	_ = rc.conn.SetWriteDeadline(time.Time{})
+
+	psyncResp, _ := protocol.EncodeResponse(protocol.Response{Status: protocol.StatusOK})
+	_ = rc.framer.Write(psyncResp)
+	for _, payload := range s.replBacklog[seqIndex+1:] {
+		if err := rc.framer.Write(payload); err != nil {
+			s.logf("replica %s write failed: %v", rc.conn.RemoteAddr(), err)
+		}
+	}
+	s.logf("partial sync completed for replica %s", rc.conn.RemoteAddr())
+}
+
+func (s *Server) getMetaPath() string {
+	return filepath.Join(s.opts.DataDir, "replication.meta")
+}
+
+func (s *Server) restoreState() error {
+	data, err := os.ReadFile(s.getMetaPath())
+	if os.IsNotExist(err) {
+		// First run, no state to restore
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read replication.meta: %w", err)
+	}
+
+	// Parse lines: replid:xxx\nlastSeq:yyy
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if replid, ok := strings.CutPrefix(line, "replid:"); ok {
+			s.replid = replid
+		}
+		if lastSeqStr, ok := strings.CutPrefix(line, "lastSeq:"); ok {
+			seq, _ := strconv.ParseUint(lastSeqStr, 10, 64)
+			s.lastSeq.Store(seq)
+		}
+	}
+
+	s.logf("restored state: replid=%s lastSeq=%d", s.replid, s.lastSeq.Load())
+	return nil
+}
+
+func (s *Server) storeState() error {
+	var err error
+	if s.metaFile == nil {
+		s.metaFile, err = os.OpenFile(s.getMetaPath(), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+		if err != nil {
+			return err
+		}
+	}
+
+	content := fmt.Sprintf("replid:%s\nlastSeq:%d", s.replid, s.lastSeq.Load())
+	_, err = s.metaFile.Write([]byte(content))
+	if err != nil {
+		return err
+	}
+
+	return s.metaFile.Sync()
 }

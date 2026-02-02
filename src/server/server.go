@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"kvgo/engine"
 	"log"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -60,6 +62,7 @@ type Options struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	MaxFrameSize int
+	BacklogSize  int
 
 	// SyncInterval controls how often the WAL is fsynced (latency vs throughput tradeoff).
 	// Lower values reduce latency but increase fsync overhead.
@@ -83,10 +86,17 @@ type Server struct {
 	primary  net.Conn
 	wg       sync.WaitGroup
 
+	started atomic.Bool
+
 	seq     atomic.Uint64 // monotonic sequence number for writes (primary only)
 	lastSeq atomic.Uint64 // last applied sequence number (replica only)
 
-	started atomic.Bool
+	// fields maintaining for SYNC/PSYNC determinations
+
+	replid      string
+	replBacklog [][]byte
+	backlogSeqs []uint64
+	metaFile    *os.File
 }
 
 func NewServer(opts Options) (*Server, error) {
@@ -149,9 +159,12 @@ func (s *Server) Start() (err error) {
 		}
 	}()
 
-	// Primary node just skips this roughly
-	if err = s.connectToPrimary(); err != nil {
+	if err = s.restoreState(); err != nil {
 		return err
+	}
+
+	if s.replid == "" {
+		s.replid = generateReplID()
 	}
 
 	lock, err = acquireDataDirLock(s.opts.DataDir)
@@ -169,13 +182,19 @@ func (s *Server) Start() (err error) {
 	if err != nil {
 		return err
 	}
+	s.db = db // Assign now so connectToPrimary can use it
+
+	// Connect to primary after DB is ready (replica may need to clear DB on full resync)
+	if err = s.connectToPrimary(); err != nil {
+		return err
+	}
 
 	ln, err = net.Listen(s.network(), s.listenAddr())
 	if err != nil {
 		return err
 	}
 
-	s.lock, s.db, s.ln = lock, db, ln
+	s.lock, s.ln = lock, ln
 	go s.acceptLoop()
 	return nil
 }
@@ -246,6 +265,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 				err = errors.Join(err, lockErr)
 			}
 		}
+	}
+
+	if s.metaFile != nil {
+		_ = s.metaFile.Close()
 	}
 
 	s.started.Store(false)
@@ -321,10 +344,15 @@ func (s *Server) relocate(primaryAddr string) error {
 	s.db.Clear()
 
 	s.isReplica = true
-	s.lastSeq.Store(0)
 	s.opts.ReplicaOf = primaryAddr
 
 	return s.connectToPrimary()
+}
+
+func generateReplID() string {
+	b := make([]byte, 20) // 20 bytes = 40 hex chars
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
 }
 
 func (s *Server) logf(format string, args ...any) {

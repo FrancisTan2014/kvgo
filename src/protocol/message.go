@@ -49,16 +49,32 @@ const (
 type Status uint8
 
 const (
-	StatusOK       Status = 0
-	StatusNotFound Status = 1
-	StatusError    Status = 2
-	StatusPong     Status = 4
+	StatusOK         Status = 0
+	StatusNotFound   Status = 1
+	StatusError      Status = 2
+	StatusPong       Status = 4
+	StatusFullResync Status = 5   // primary requires full resync
+	StatusNoReply    Status = 255 // internal: handler should not send response
 )
 
 type Request struct {
-	Op    Op
-	Key   []byte
-	Value []byte // for OpPut and some command requests like `OpReplicaOf`
+	Op Op
+	// Key contains the indicator.
+	//
+	// - OpPut: the key to store in the database.
+	//
+	// - OpGet: the key to retrieve from the database.
+	//
+	// - OpReplicaOf: the current replid of the replica
+	Key []byte
+	// Value contains the payload data.
+	//
+	// - OpPut: the value to store in the database.
+	//
+	// - OpReplicaOf: the target primary address (host:port format).
+	//
+	// - Others: unused (must be empty).
+	Value []byte
 	Seq   uint64 // sequence number for replication (only for OpPut)
 }
 
@@ -135,15 +151,16 @@ func EncodeRequest(req Request) ([]byte, error) {
 		return buf, nil
 
 	case OpReplicate:
-		// Replicate carries seq (replica's last applied seq) but no key/value.
-		if klen != 0 || vlen != 0 {
+		// Replicate carries seq (replica's last applied seq) and optionally replid in Value.
+		if klen != 0 {
 			return nil, ErrInvalidMessage
 		}
-		buf := make([]byte, requestHeaderSize+u64Size)
+		buf := make([]byte, requestHeaderSize+u64Size+vlen)
 		buf[requestOpOff] = byte(req.Op)
 		putU32LE(buf, requestKLenOff, 0)
-		putU32LE(buf, requestVLenOff, 0)
-		putU64LE(buf, requestKeyOff, req.Seq) // seq follows header since no key/value
+		putU32LE(buf, requestVLenOff, vlen)
+		putU64LE(buf, requestKeyOff, req.Seq)        // seq follows header
+		copy(buf[requestKeyOff+u64Size:], req.Value) // replid follows seq
 		return buf, nil
 
 	case OpPing, OpPromote:
@@ -157,9 +174,10 @@ func EncodeRequest(req Request) ([]byte, error) {
 		// To make the protocol simple, we reuse the `Value` field here
 		buf := make([]byte, requestHeaderSize+vlen)
 		buf[requestOpOff] = byte(req.Op)
-		putU32LE(buf, requestKLenOff, 0)
+		putU32LE(buf, requestKLenOff, klen)
 		putU32LE(buf, requestVLenOff, vlen)
-		copy(buf[requestHeaderSize:], req.Value)
+		copy(buf[requestKeyOff:], req.Key)
+		copy(buf[requestHeaderSize+klen:], req.Value)
 		return buf, nil
 
 	default:
@@ -209,16 +227,17 @@ func DecodeRequest(payload []byte) (Request, error) {
 		return Request{Op: op, Key: key, Value: val, Seq: seq}, nil
 
 	case OpReplicate:
-		// Replicate carries seq (replica's last applied seq) but no key/value.
-		if klen != 0 || vlen != 0 {
+		// Replicate carries seq and optionally replid in Value.
+		if klen != 0 {
 			return Request{}, ErrInvalidMessage
 		}
-		need := requestHeaderSize + u64Size
+		need := requestHeaderSize + u64Size + vlen
 		if len(payload) != need {
 			return Request{}, ErrInvalidMessage
 		}
 		seq := binary.LittleEndian.Uint64(payload[requestKeyOff : requestKeyOff+u64Size])
-		return Request{Op: op, Seq: seq}, nil
+		val := append([]byte(nil), payload[requestKeyOff+u64Size:need]...)
+		return Request{Op: op, Value: val, Seq: seq}, nil
 
 	case OpReplicaOf:
 		if klen != 0 {
@@ -258,14 +277,14 @@ func EncodeResponse(resp Response) ([]byte, error) {
 	}
 
 	switch resp.Status {
-	case StatusOK, StatusNotFound, StatusError, StatusPong:
+	case StatusOK, StatusNotFound, StatusError, StatusPong, StatusFullResync:
 		// ok
 	default:
 		return nil, ErrUnknownStatus
 	}
 
-	// Minimal format from 007: only OK responses may carry a value.
-	if resp.Status != StatusOK && vlen != 0 {
+	// Minimal format from 007: OK and FullResync responses may carry a value.
+	if resp.Status != StatusOK && resp.Status != StatusFullResync && vlen != 0 {
 		return nil, ErrInvalidMessage
 	}
 
@@ -294,14 +313,14 @@ func DecodeResponse(payload []byte) (Response, error) {
 	}
 
 	switch st {
-	case StatusOK, StatusNotFound, StatusError, StatusPong:
+	case StatusOK, StatusNotFound, StatusError, StatusPong, StatusFullResync:
 		// ok
 	default:
 		return Response{}, ErrUnknownStatus
 	}
 
-	// Minimal format from 007: only OK responses may carry a value.
-	if st != StatusOK && vlen != 0 {
+	// Minimal format from 007: OK and FullResync responses may carry a value.
+	if st != StatusOK && st != StatusFullResync && vlen != 0 {
 		return Response{}, ErrInvalidMessage
 	}
 
