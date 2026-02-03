@@ -53,8 +53,7 @@ const (
 	StatusNotFound   Status = 1
 	StatusError      Status = 2
 	StatusPong       Status = 4
-	StatusFullResync Status = 5   // primary requires full resync
-	StatusNoReply    Status = 255 // internal: handler should not send response
+	StatusFullResync Status = 5 // primary requires full resync
 )
 
 type Request struct {
