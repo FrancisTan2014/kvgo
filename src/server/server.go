@@ -77,31 +77,42 @@ type Options struct {
 }
 
 type Server struct {
-	opts      Options
-	isReplica bool
+	opts    Options
+	started atomic.Bool
 
+	// Core infrastructure
 	ln   net.Listener
 	db   *engine.DB
 	lock *dataDirLock
 
-	mu       sync.Mutex
-	conns    map[net.Conn]struct{}
-	replicas map[net.Conn]*replicaConn
-	primary  net.Conn
-	wg       sync.WaitGroup
+	// Connection management
+	mu    sync.Mutex
+	wg    sync.WaitGroup
+	conns map[net.Conn]struct{}
 
-	started         atomic.Bool
+	// Request dispatch
 	requestHandlers map[protocol.Cmd]HandlerFunc
 
-	seq     atomic.Uint64 // monotonic sequence number for writes (primary only)
-	lastSeq atomic.Uint64 // last applied sequence number (replica only)
+	// Replication state (primary role)
+	seq      atomic.Uint64 // monotonic sequence number for writes
+	replicas map[net.Conn]*replicaConn
+	replid   string
 
-	// fields maintaining for SYNC/PSYNC determinations
+	// Replication state (replica role)
+	isReplica bool
+	primary   net.Conn
+	lastSeq   atomic.Uint64 // last applied sequence number
 
-	replid      string
+	// Replication loop control
+	replCtx    context.Context
+	replCancel context.CancelFunc
+
+	// Partial resync backlog
 	replBacklog [][]byte
 	backlogSeqs []uint64
-	metaFile    *os.File
+
+	// Persistence
+	metaFile *os.File
 }
 
 func NewServer(opts Options) (*Server, error) {
@@ -155,6 +166,10 @@ func (s *Server) Start() (err error) {
 
 	defer func() {
 		if err != nil {
+			// Cancel replication loop if started
+			if s.replCancel != nil {
+				s.replCancel()
+			}
 			if ln != nil {
 				_ = ln.Close()
 			}
@@ -191,11 +206,11 @@ func (s *Server) Start() (err error) {
 	if err != nil {
 		return err
 	}
-	s.db = db // Assign now so connectToPrimary can use it
+	s.db = db // Assign now so startReplicationLoop can use it
 
-	// Connect to primary after DB is ready (replica may need to clear DB on full resync)
-	if err = s.connectToPrimary(); err != nil {
-		return err
+	// Start replication loop only for replicas
+	if s.isReplica {
+		s.startReplicationLoop()
 	}
 
 	ln, err = net.Listen(s.network(), s.listenAddr())
@@ -243,6 +258,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Stop accepting new connections.
 	if s.ln != nil {
 		_ = s.ln.Close()
+	}
+
+	// Cancel replication loop
+	if s.replCancel != nil {
+		s.replCancel()
+	}
+	if s.primary != nil {
+		_ = s.primary.Close()
 	}
 
 	// Wait for in-flight requests to finish, or context to cancel.
@@ -327,6 +350,11 @@ func (s *Server) relocate(primaryAddr string) error {
 
 	s.log().Info("switching primary", "address", primaryAddr)
 
+	// Cancel old replication loop first
+	if s.replCancel != nil {
+		s.replCancel()
+	}
+
 	for c, r := range s.replicas {
 		close(r.sendCh)
 		_ = r.conn.Close()
@@ -343,7 +371,8 @@ func (s *Server) relocate(primaryAddr string) error {
 	s.isReplica = true
 	s.opts.ReplicaOf = primaryAddr
 
-	return s.connectToPrimary()
+	s.startReplicationLoop()
+	return nil
 }
 
 func generateReplID() string {

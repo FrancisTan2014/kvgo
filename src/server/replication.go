@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"kvgo/protocol"
 	"net"
@@ -14,6 +15,7 @@ import (
 const replicaSendBuffer = 1024 // max queued writes per replica
 const heartbeatInterval = 5 * time.Second
 const pongTimeout = 2 * time.Second
+const retryInterval = 100 * time.Millisecond
 
 // replicaConn manages a single replica connection with a dedicated write goroutine.
 type replicaConn struct {
@@ -37,16 +39,57 @@ func newReplicaConn(conn net.Conn, replicaLastSeq uint64, lastReplid string) *re
 	}
 }
 
-func (s *Server) connectToPrimary() error {
-	if s.opts.ReplicaOf == "" {
-		return nil
+func (s *Server) startReplicationLoop() {
+	// Cancel any existing loop
+	if s.replCancel != nil {
+		s.replCancel()
 	}
 
+	// Create new context for this loop
+	s.replCtx, s.replCancel = context.WithCancel(context.Background())
+	ctx := s.replCtx
+
+	s.wg.Go(func() {
+		s.replicationLoop(ctx)
+	})
+}
+
+func (s *Server) replicationLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			s.log().Info("replication loop cancelled")
+			return
+		default:
+		}
+
+		if !s.isReplica {
+			return // promoted
+		}
+
+		f, err := s.connectToPrimary()
+		if err != nil {
+			s.log().Warn("connect failed", "error", err)
+
+			// Backoff with cancellation support
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		s.receiveFromPrimary(ctx, f) // blocks until disconnect or cancel
+	}
+}
+
+func (s *Server) connectToPrimary() (*protocol.Framer, error) {
 	s.log().Info("connecting to primary", "address", s.opts.ReplicaOf)
 
 	conn, err := net.DialTimeout(s.network(), s.opts.ReplicaOf, 10*time.Second)
 	if err != nil {
-		return fmt.Errorf("connect to primary %s: %w", s.opts.ReplicaOf, err)
+		return nil, fmt.Errorf("connect to primary %s: %w", s.opts.ReplicaOf, err)
 	}
 
 	lastSeq := s.lastSeq.Load()
@@ -58,25 +101,25 @@ func (s *Server) connectToPrimary() error {
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("encode replicate request: %w", err)
+		return nil, fmt.Errorf("encode replicate request: %w", err)
 	}
 
 	if err := f.Write(payload); err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("send replicate request: %w", err)
+		return nil, fmt.Errorf("send replicate request: %w", err)
 	}
 
 	// Wait for ack from primary.
 	respPayload, err := f.Read()
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("read replicate response: %w", err)
+		return nil, fmt.Errorf("read replicate response: %w", err)
 	}
 
 	resp, err := protocol.DecodeResponse(respPayload)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("decode replicate response: %w", err)
+		return nil, fmt.Errorf("decode replicate response: %w", err)
 	}
 
 	if resp.Status == protocol.StatusFullResync {
@@ -87,23 +130,31 @@ func (s *Server) connectToPrimary() error {
 		}
 	} else if resp.Status != protocol.StatusOK {
 		_ = conn.Close()
-		return fmt.Errorf("primary rejected replication: status %d", resp.Status)
+		return nil, fmt.Errorf("primary rejected replication: status %d", resp.Status)
 	}
 
 	s.log().Info("replication handshake complete")
 
-	// Receive forwarded writes from primary in background.
-	s.wg.Go(func() {
-		defer conn.Close()
-		s.receiveFromPrimary(f)
-	})
-
 	s.primary = conn
-	return nil
+	return f, nil
 }
 
-func (s *Server) receiveFromPrimary(f *protocol.Framer) {
+func (s *Server) receiveFromPrimary(ctx context.Context, f *protocol.Framer) {
+	defer func() {
+		if s.primary != nil {
+			_ = s.primary.Close()
+			s.primary = nil
+		}
+	}()
+
 	for {
+		select {
+		case <-ctx.Done():
+			s.log().Info("replication receive cancelled")
+			return
+		default:
+		}
+
 		payload, err := f.Read()
 		if err != nil {
 			s.log().Info("replication stream closed", "error", err)
