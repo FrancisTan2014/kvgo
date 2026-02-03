@@ -5,7 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"kvgo/server"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -43,9 +43,11 @@ func main() {
 		os.Exit(2)
 	}
 
-	var logger *log.Logger
+	var logger *slog.Logger
 	if *debug {
-		logger = log.New(os.Stderr, "[kv-server] ", log.LstdFlags|log.Lmicroseconds)
+		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		}))
 	}
 
 	opts := server.Options{

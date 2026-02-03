@@ -45,10 +45,8 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 	case protocol.OpGet:
 		val, ok := s.db.Get(key)
 		if !ok {
-			s.logf("GET %q -> not found", key)
 			return protocol.Response{Status: protocol.StatusNotFound}
 		}
-		s.logf("GET %q -> %d bytes", key, len(val))
 		// Avoid aliasing engine memory.
 		copyVal := append([]byte(nil), val...)
 		return protocol.Response{Status: protocol.StatusOK, Value: copyVal}
@@ -56,21 +54,19 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 	case protocol.OpPut:
 		if s.isReplica {
 			// Replicas reject direct writes from clients.
-			s.logf("PUT %q rejected: replica is read-only", key)
+			s.log().Warn("PUT rejected on replica", "key", key)
 			return protocol.Response{Status: protocol.StatusError}
 		}
 		if err := s.db.Put(key, req.Value); err != nil {
-			s.logf("PUT %q -> error: %v", key, err)
+			s.log().Error("PUT failed", "key", key, "error", err)
 			return protocol.Response{Status: protocol.StatusError}
 		}
 		seq := s.seq.Add(1)
 
-		s.logf("PUT %q <- %d bytes (seq=%d)", key, len(req.Value), seq)
-
 		req.Seq = seq
 		payload, err := protocol.EncodeRequest(req)
 		if err != nil {
-			s.logf("failed to encode replica request: %v", err)
+			s.log().Error("failed to encode replica request", "error", err)
 			return protocol.Response{Status: protocol.StatusError}
 		}
 
@@ -80,7 +76,7 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 
 	case protocol.OpReplicate:
 		if s.isReplica {
-			s.logf("REPLICATE rejected: this node is a replica")
+			s.log().Warn("REPLICATE rejected: node is replica")
 			return protocol.Response{Status: protocol.StatusError}
 		}
 		replid := string(req.Value)
@@ -98,28 +94,28 @@ func (s *Server) handle(req protocol.Request, conn net.Conn) protocol.Response {
 
 	case protocol.OpPromote:
 		if !s.isReplica {
-			s.logf("PROMOTE rejected: this node is a primary")
+			s.log().Warn("PROMOTE rejected: already primary")
 			return protocol.Response{Status: protocol.StatusError}
 		} else {
 			if err := s.promote(); err != nil {
-				s.logf("PROMOTE: failed to promote to primary: %v", err)
+				s.log().Error("PROMOTE failed", "error", err)
 				return protocol.Response{Status: protocol.StatusError}
 			} else {
-				s.logf("PROMOTE: promoted to primary")
+				s.log().Info("promoted to primary")
 				return protocol.Response{Status: protocol.StatusOK}
 			}
 		}
 
 	case protocol.OpReplicaOf:
 		if err := s.relocate(string(req.Value)); err != nil {
-			s.logf("REPLICAOF failed: %v", err)
+			s.log().Error("REPLICAOF failed", "error", err)
 			return protocol.Response{Status: protocol.StatusError}
 		} else {
 			return protocol.Response{Status: protocol.StatusOK}
 		}
 
 	default:
-		s.logf("unknown op %d", req.Op)
+		s.log().Error("unknown operation", "op", req.Op)
 		return protocol.Response{Status: protocol.StatusError}
 	}
 }
