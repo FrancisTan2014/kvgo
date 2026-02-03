@@ -58,11 +58,11 @@ This mirrors ASP.NET Core's WebSocket upgrade pattern: middleware can write a re
 [4 bytes frameLen LE][1 byte messageType][frameLen-1 bytes payload]
 ```
 
-**Handler interface:**
+**Handler function type (delegate pattern):**
 ```go
-type RequestHandler interface {
-    Process(ctx *RequestContext) error
-}
+// Using a function type instead of interface - more idiomatic Go for simple callbacks.
+// This mirrors C# delegates: single-method contracts don't need interface ceremony.
+type HandlerFunc func(*Server, *RequestContext) error
 
 type RequestContext struct {
     Conn      net.Conn
@@ -70,30 +70,27 @@ type RequestContext struct {
     Payload   []byte
     takenOver bool
 }
-
-func (ctx *RequestContext) WriteResponse(resp []byte) error {
-    return ctx.Framer.Write(resp)
-}
-
-func (ctx *RequestContext) TakeOver() {
-    ctx.takenOver = true
-}
 ```
 
 **Dispatch loop:**
 ```go
 for {
     payload := f.Read()
-    messageType := payload[0]
+    op := payload[0]
+    
+    handler := s.requestHandlers[protocol.Op(op)]
+    if handler == nil {
+        s.log().Error("unsupported request", "op", op)
+        return
+    }
     
     ctx := &RequestContext{
         Conn:    conn,
         Framer:  f,
-        Payload: payload[1:],
+        Payload: payload,  // Full payload - handlers use DecodeRequest()
     }
     
-    handler := handlers[messageType]
-    if err := handler.Process(ctx); err != nil {
+    if err := handler(s, ctx); err != nil {
         return err
     }
     
@@ -107,34 +104,37 @@ for {
 
 **Normal handler (GET):**
 ```go
-func (h *GetHandler) Process(ctx *RequestContext) error {
-    key := string(ctx.Payload)
-    val, ok := h.db.Get(key)
+// Handlers are methods on *Server, registered as function values.
+func (s *Server) handleGet(ctx *RequestContext) error {
+    req, err := protocol.DecodeRequest(ctx.Payload)
+    if err != nil {
+        return err
+    }
     
-    resp := encodeGetResponse(ok, val)
-    return ctx.WriteResponse(resp)
+    key := string(req.Key)
+    val, ok := s.db.Get(key)
+    
+    // ... build response ...
+    return s.writeResponse(ctx.Framer, resp)
     // takenOver = false, dispatch loop continues
 }
 ```
 
-**Takeover handler (PSYNC):**
+**Takeover handler (replication - future PSYNC):**
 ```go
-func (h *PSYNCHandler) Process(ctx *RequestContext) error {
-    req := decodePSYNCRequest(ctx.Payload)
+func (s *Server) handleReplicate(ctx *RequestContext) error {
+    // ... decode and validate ...
     
-    if canPartialResync(req.Replid, req.Offset) {
-        ctx.WriteResponse(encodePSYNCResponse(StatusContinue))
-    } else {
-        ctx.WriteResponse(encodePSYNCResponse(StatusFullResync, h.replid))
-    }
+    rc := newReplicaConn(ctx.Conn, req.Seq, replid)
+    s.mu.Lock()
+    s.replicas[ctx.Conn] = rc
+    s.mu.Unlock()
     
-    ctx.TakeOver()  // Signal: I'm transferring ownership
+    // serveReplica takes over - blocks until replica disconnects
+    s.serveReplica(rc)
     
-    // Launch replication stream in background
-    // This goroutine will own the connection until it dies
-    go h.serveReplicaStream(ctx.Conn, ctx.Framer)
-    
-    return nil  // Return immediately, loop exits without closing conn
+    ctx.takenOver = true  // Signal: don't try to read next request
+    return nil
 }
 ```
 
@@ -161,11 +161,11 @@ const (
 
 ## Implementation Plan
 
-**Phase 1: Handler registry (no behavior change)**
-- Define `RequestHandler` interface and `RequestContext`
-- Create handlers for existing ops (Get, Put, Ping, etc.)
+**Phase 1: Handler registry (no behavior change)** ✅
+- Define `HandlerFunc` type and `RequestContext` (delegate over interface)
+- Create handlers as `*Server` methods for existing ops
 - Replace `handle()` switch with registry lookup
-- **Validate**: All existing tests pass
+- **Validated**: All unit tests + partial-resync-test pass
 
 **Phase 2: PSYNC message**
 - Define `MsgPSYNC` with dedicated encode/decode
