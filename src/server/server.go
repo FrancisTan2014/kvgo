@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"kvgo/engine"
+	"kvgo/protocol"
 	"log/slog"
 	"net"
 	"os"
@@ -89,7 +90,8 @@ type Server struct {
 	primary  net.Conn
 	wg       sync.WaitGroup
 
-	started atomic.Bool
+	started         atomic.Bool
+	requestHandlers map[protocol.Op]HandlerFunc
 
 	seq     atomic.Uint64 // monotonic sequence number for writes (primary only)
 	lastSeq atomic.Uint64 // last applied sequence number (replica only)
@@ -121,12 +123,16 @@ func NewServer(opts Options) (*Server, error) {
 	isReplica := opts.ReplicaOf != ""
 	replicas := make(map[net.Conn]*replicaConn)
 
-	return &Server{
-		opts:      opts,
-		conns:     make(map[net.Conn]struct{}),
-		isReplica: isReplica,
-		replicas:  replicas,
-	}, nil
+	s := &Server{
+		opts:            opts,
+		conns:           make(map[net.Conn]struct{}),
+		requestHandlers: make(map[protocol.Op]HandlerFunc),
+		isReplica:       isReplica,
+		replicas:        replicas,
+	}
+
+	s.registerRequestHandlers()
+	return s, nil
 }
 
 func (s *Server) Addr() string {
@@ -313,15 +319,6 @@ func (s *Server) acceptLoop() {
 			_ = conn.Close()
 		})
 	}
-}
-
-func (s *Server) promote() error {
-	s.isReplica = false
-	if s.primary != nil {
-		return s.primary.Close()
-	}
-
-	return nil
 }
 
 func (s *Server) relocate(primaryAddr string) error {
