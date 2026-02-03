@@ -146,16 +146,16 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 5. Loop checks `takenOver`, exits
 6. Connection stays open, owned by the goroutine
 
-## Message Types
+## Command Types
 
 ```go
 const (
-    MsgGet       = 1
-    MsgPut       = 2
-    MsgPSYNC     = 3  // Replication handshake
-    MsgPing      = 4
-    MsgPromote   = 5
-    MsgReplicaOf = 6
+    CmdGet       Cmd = 1
+    CmdPut       Cmd = 2
+    CmdReplicate Cmd = 3  // Replication handshake
+    CmdPing      Cmd = 4
+    CmdPromote   Cmd = 5
+    CmdReplicaOf Cmd = 6
 )
 ```
 
@@ -167,19 +167,15 @@ const (
 - Replace `handle()` switch with registry lookup
 - **Validated**: All unit tests + partial-resync-test pass
 
-**Phase 2: PSYNC message**
-- Define `MsgPSYNC` with dedicated encode/decode
-- Implement `PSYNCHandler` with `TakeOver()`
-- Update `connectToPrimary()` to send MsgPSYNC
-- Update `serveReplica` to use new flow
-- Remove OpReplicate overloading
-- **Validate**: `partial-resync-test.ps1` passes
+**Phase 2: Protocol cleanup** ✅
+- Renamed `Op` → `Cmd` (Redis-like terminology)
+- Merged replication handlers into `replication.go`
+- Fixed `takenOver` bug in `handleReplicate` (was writing response after takeover)
+- Removed dead `StatusNoReply` constant
 
-**Phase 3: Cleanup**
-- Remove StatusNoReply, StatusFullResync hacks
-- Remove OpReplicate from message.go
-- Simplify response validation
-- **Commit**: "refactor(017): IoC protocol with connection takeover"
+**Phase 2/3 original plan (descoped)**: PSYNC message type was planned to replace `CmdReplicate`, but analysis showed it's syntactic sugar with no failure-mode benefit. Current protocol works. Moving on.
+
+**Next**: 018 - Replica reconnection after primary failure (the actual distributed systems problem).
 
 ## Why This Works
 
