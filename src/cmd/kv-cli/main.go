@@ -118,7 +118,7 @@ func main() {
 }
 
 func doPromote(f *protocol.Framer, timeout time.Duration) error {
-	req := protocol.Request{Op: protocol.OpPromote}
+	req := protocol.Request{Cmd: protocol.CmdPromote}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -150,7 +150,7 @@ func doPromote(f *protocol.Framer, timeout time.Duration) error {
 }
 
 func doGet(f *protocol.Framer, key string, timeout time.Duration) error {
-	req := protocol.Request{Op: protocol.OpGet, Key: []byte(key)}
+	req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -184,7 +184,7 @@ func doGet(f *protocol.Framer, key string, timeout time.Duration) error {
 }
 
 func doPut(f *protocol.Framer, key, value string, timeout time.Duration) error {
-	req := protocol.Request{Op: protocol.OpPut, Key: []byte(key), Value: []byte(value)}
+	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -216,7 +216,7 @@ func doPut(f *protocol.Framer, key, value string, timeout time.Duration) error {
 }
 
 func doReplicaOf(f *protocol.Framer, primaryAddr string, timeout time.Duration) error {
-	req := protocol.Request{Op: protocol.OpReplicaOf, Value: []byte(primaryAddr)}
+	req := protocol.Request{Cmd: protocol.CmdReplicaOf, Value: []byte(primaryAddr)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)

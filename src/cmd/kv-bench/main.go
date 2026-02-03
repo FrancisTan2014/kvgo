@@ -92,9 +92,9 @@ func runWorker(id int, keys []string, values [][]byte, st *stats) {
 		// Decide operation based on getRatio
 		var req protocol.Request
 		if rand.Float64() < *getRatio {
-			req = protocol.Request{Op: protocol.OpGet, Key: []byte(key)}
+			req = protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key)}
 		} else {
-			req = protocol.Request{Op: protocol.OpPut, Key: []byte(key), Value: val}
+			req = protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: val}
 		}
 
 		t0 := time.Now()

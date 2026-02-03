@@ -91,7 +91,7 @@ type Server struct {
 	wg       sync.WaitGroup
 
 	started         atomic.Bool
-	requestHandlers map[protocol.Op]HandlerFunc
+	requestHandlers map[protocol.Cmd]HandlerFunc
 
 	seq     atomic.Uint64 // monotonic sequence number for writes (primary only)
 	lastSeq atomic.Uint64 // last applied sequence number (replica only)
@@ -126,7 +126,7 @@ func NewServer(opts Options) (*Server, error) {
 	s := &Server{
 		opts:            opts,
 		conns:           make(map[net.Conn]struct{}),
-		requestHandlers: make(map[protocol.Op]HandlerFunc),
+		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
 		isReplica:       isReplica,
 		replicas:        replicas,
 	}

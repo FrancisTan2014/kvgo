@@ -54,7 +54,7 @@ func (s *Server) connectToPrimary() error {
 
 	// Send replicate handshake to register as a replica.
 	f := protocol.NewConnFramer(conn)
-	req := protocol.Request{Op: protocol.OpReplicate, Seq: lastSeq, Value: []byte(s.replid)}
+	req := protocol.Request{Cmd: protocol.CmdReplicate, Seq: lastSeq, Value: []byte(s.replid)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		_ = conn.Close()
@@ -117,7 +117,7 @@ func (s *Server) receiveFromPrimary(f *protocol.Framer) {
 		}
 
 		// Apply write locally (fire-and-forget from primary's perspective).
-		if req.Op == protocol.OpPut {
+		if req.Cmd == protocol.CmdPut {
 			key := string(req.Key)
 			if err := s.db.Put(key, req.Value); err != nil {
 				s.log().Error("replication PUT failed", "key", key, "seq", req.Seq, "error", err)
@@ -187,7 +187,7 @@ func (s *Server) serveReplica(rc *replicaConn) {
 		case <-rc.hb.C:
 			// heartbeat: ping replica if idle
 			if time.Since(rc.lastWrite) > heartbeatInterval {
-				ping, _ := protocol.EncodeRequest(protocol.Request{Op: protocol.OpPing})
+				ping, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing})
 				if err := rc.framer.Write(ping); err != nil {
 					s.log().Error("replica ping failed", "replica", rc.conn.RemoteAddr(), "error", err)
 					return
@@ -215,7 +215,7 @@ func (s *Server) fullResync(rc *replicaConn) {
 	seq := s.seq.Load()
 	s.db.Range(func(key string, value []byte) bool {
 		req := protocol.Request{
-			Op:    protocol.OpPut,
+			Cmd:   protocol.CmdPut,
 			Key:   []byte(key),
 			Value: value,
 			Seq:   seq,
@@ -297,4 +297,53 @@ func (s *Server) storeState() error {
 	}
 
 	return s.metaFile.Sync()
+}
+
+// ---------------------------------------------------------------------------
+// Replication Command Handlers
+// ---------------------------------------------------------------------------
+
+// handleReplicate handles the REPLICATE command from a replica wanting to sync.
+// This handler takes over the connection - serveReplica blocks until disconnection.
+func (s *Server) handleReplicate(ctx *RequestContext) error {
+	if s.isReplica {
+		s.log().Warn("REPLICATE rejected: node is replica")
+		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+	}
+
+	req, err := protocol.DecodeRequest(ctx.Payload)
+	if err != nil {
+		s.log().Error("failed to decode replicate request", "replica", ctx.Conn.RemoteAddr())
+		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+	}
+
+	replid := string(req.Value)
+	rc := newReplicaConn(ctx.Conn, req.Seq, replid)
+	s.mu.Lock()
+	s.replicas[ctx.Conn] = rc
+	s.mu.Unlock()
+
+	// Mark connection as taken over BEFORE blocking call.
+	// serveReplica will handle all communication until replica disconnects.
+	ctx.takenOver = true
+
+	// serveReplica blocks until replica disconnects.
+	// Connection cleanup happens inside serveReplica's defer.
+	s.serveReplica(rc)
+
+	return nil
+}
+
+// handleReplicaOf handles the REPLICAOF command to dynamically change replication target.
+func (s *Server) handleReplicaOf(ctx *RequestContext) error {
+	req, err := protocol.DecodeRequest(ctx.Payload)
+	if err != nil {
+		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+	}
+
+	if err := s.relocate(string(req.Value)); err != nil {
+		s.log().Error("REPLICAOF failed", "error", err)
+		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+	}
+	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK})
 }
