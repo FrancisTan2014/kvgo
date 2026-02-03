@@ -15,12 +15,12 @@ type RequestContext struct {
 }
 
 func (s *Server) registerRequestHandlers() {
-	s.requestHandlers[protocol.OpGet] = (*Server).handleGet
-	s.requestHandlers[protocol.OpPut] = (*Server).handlePut
-	s.requestHandlers[protocol.OpReplicate] = (*Server).handleReplicate
-	s.requestHandlers[protocol.OpPing] = (*Server).handlePing
-	s.requestHandlers[protocol.OpPromote] = (*Server).handlePromote
-	s.requestHandlers[protocol.OpReplicaOf] = (*Server).handleReplicaOf
+	s.requestHandlers[protocol.CmdGet] = (*Server).handleGet
+	s.requestHandlers[protocol.CmdPut] = (*Server).handlePut
+	s.requestHandlers[protocol.CmdReplicate] = (*Server).handleReplicate
+	s.requestHandlers[protocol.CmdPing] = (*Server).handlePing
+	s.requestHandlers[protocol.CmdPromote] = (*Server).handlePromote
+	s.requestHandlers[protocol.CmdReplicaOf] = (*Server).handleReplicaOf
 }
 
 func (s *Server) handleRequest(conn net.Conn) {
@@ -39,10 +39,10 @@ func (s *Server) handleRequest(conn net.Conn) {
 			return
 		}
 
-		op := payload[0]
-		handler := s.requestHandlers[protocol.Op(op)]
+		cmd := payload[0]
+		handler := s.requestHandlers[protocol.Cmd(cmd)]
 		if handler == nil {
-			s.log().Error("unsupported request detected", "op", op)
+			s.log().Error("unsupported request detected", "cmd", cmd)
 			return
 		}
 
@@ -53,7 +53,7 @@ func (s *Server) handleRequest(conn net.Conn) {
 		}
 
 		if err := handler(s, ctx); err != nil {
-			s.log().Error("failed to process the request", "op", op, "error", err)
+			s.log().Error("failed to process the request", "cmd", cmd, "error", err)
 			return
 		}
 

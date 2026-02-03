@@ -8,7 +8,7 @@ import (
 
 var (
 	ErrInvalidMessage = errors.New("protocol: invalid message")
-	ErrUnknownOp      = errors.New("protocol: unknown op")
+	ErrUnknownCmd     = errors.New("protocol: unknown cmd")
 	ErrUnknownStatus  = errors.New("protocol: unknown status")
 )
 
@@ -17,12 +17,12 @@ const (
 	u32Size = 4
 	u64Size = 8
 
-	// Request payload: [op u8][klen u32][vlen u32][key][value]
-	// For OpPut: [op u8][klen u32][vlen u32][seq u64][key][value]
+	// Request payload: [cmd u8][klen u32][vlen u32][key][value]
+	// For CmdPut: [cmd u8][klen u32][vlen u32][seq u64][key][value]
 	requestHeaderSize    = u8Size + u32Size + u32Size
 	requestHeaderSizePut = requestHeaderSize + u64Size // includes seq
-	requestOpOff         = 0
-	requestKLenOff       = requestOpOff + u8Size
+	requestCmdOff        = 0
+	requestKLenOff       = requestCmdOff + u8Size
 	requestVLenOff       = requestKLenOff + u32Size
 	requestSeqOff        = requestVLenOff + u32Size // only for OpPut
 	requestKeyOff        = requestHeaderSize
@@ -35,15 +35,15 @@ const (
 	responseValueOff   = responseHeaderSize
 )
 
-type Op uint8
+type Cmd uint8
 
 const (
-	OpGet       Op = 1
-	OpPut       Op = 2
-	OpReplicate Op = 3
-	OpPing      Op = 4
-	OpPromote   Op = 5
-	OpReplicaOf Op = 6
+	CmdGet       Cmd = 1
+	CmdPut       Cmd = 2
+	CmdReplicate Cmd = 3
+	CmdPing      Cmd = 4
+	CmdPromote   Cmd = 5
+	CmdReplicaOf Cmd = 6
 )
 
 type Status uint8
@@ -58,24 +58,24 @@ const (
 )
 
 type Request struct {
-	Op Op
+	Cmd Cmd
 	// Key contains the indicator.
 	//
-	// - OpPut: the key to store in the database.
+	// - CmdPut: the key to store in the database.
 	//
-	// - OpGet: the key to retrieve from the database.
+	// - CmdGet: the key to retrieve from the database.
 	//
-	// - OpReplicaOf: the current replid of the replica
+	// - CmdReplicaOf: the current replid of the replica
 	Key []byte
 	// Value contains the payload data.
 	//
-	// - OpPut: the value to store in the database.
+	// - CmdPut: the value to store in the database.
 	//
-	// - OpReplicaOf: the target primary address (host:port format).
+	// - CmdReplicaOf: the target primary address (host:port format).
 	//
 	// - Others: unused (must be empty).
 	Value []byte
-	Seq   uint64 // sequence number for replication (only for OpPut)
+	Seq   uint64 // sequence number for replication (only for CmdPut)
 }
 
 type Response struct {
@@ -111,13 +111,13 @@ func putU64LE(buf []byte, off int, v uint64) {
 //
 // Request payload format:
 //
-//	[op uint8][klen uint32 LE][vlen uint32 LE][key bytes][value bytes]
+//	[cmd uint8][klen uint32 LE][vlen uint32 LE][key bytes][value bytes]
 //
-// For OpPut, includes seq for replication:
+// For CmdPut, includes seq for replication:
 //
-//	[op uint8][klen uint32 LE][vlen uint32 LE][seq uint64 LE][key bytes][value bytes]
+//	[cmd uint8][klen uint32 LE][vlen uint32 LE][seq uint64 LE][key bytes][value bytes]
 //
-// For OpGet, vlen must be 0 and value bytes must be omitted.
+// For CmdGet, vlen must be 0 and value bytes must be omitted.
 func EncodeRequest(req Request) ([]byte, error) {
 	klen := len(req.Key)
 	if err := ensureU32Len(klen); err != nil {
@@ -128,21 +128,21 @@ func EncodeRequest(req Request) ([]byte, error) {
 		return nil, err
 	}
 
-	switch req.Op {
-	case OpGet:
+	switch req.Cmd {
+	case CmdGet:
 		if vlen != 0 {
 			return nil, ErrInvalidMessage
 		}
 		buf := make([]byte, requestHeaderSize+klen)
-		buf[requestOpOff] = byte(req.Op)
+		buf[requestCmdOff] = byte(req.Cmd)
 		putU32LE(buf, requestKLenOff, klen)
 		putU32LE(buf, requestVLenOff, 0)
 		copy(buf[requestKeyOff:], req.Key)
 		return buf, nil
 
-	case OpPut:
+	case CmdPut:
 		buf := make([]byte, requestHeaderSizePut+klen+vlen)
-		buf[requestOpOff] = byte(req.Op)
+		buf[requestCmdOff] = byte(req.Cmd)
 		putU32LE(buf, requestKLenOff, klen)
 		putU32LE(buf, requestVLenOff, vlen)
 		putU64LE(buf, requestSeqOff, req.Seq)
@@ -150,30 +150,30 @@ func EncodeRequest(req Request) ([]byte, error) {
 		copy(buf[requestKeyOffPut+klen:], req.Value)
 		return buf, nil
 
-	case OpReplicate:
+	case CmdReplicate:
 		// Replicate carries seq (replica's last applied seq) and optionally replid in Value.
 		if klen != 0 {
 			return nil, ErrInvalidMessage
 		}
 		buf := make([]byte, requestHeaderSize+u64Size+vlen)
-		buf[requestOpOff] = byte(req.Op)
+		buf[requestCmdOff] = byte(req.Cmd)
 		putU32LE(buf, requestKLenOff, 0)
 		putU32LE(buf, requestVLenOff, vlen)
 		putU64LE(buf, requestKeyOff, req.Seq)        // seq follows header
 		copy(buf[requestKeyOff+u64Size:], req.Value) // replid follows seq
 		return buf, nil
 
-	case OpPing, OpPromote:
+	case CmdPing, CmdPromote:
 		buf := make([]byte, requestHeaderSize)
-		buf[requestOpOff] = byte(req.Op)
+		buf[requestCmdOff] = byte(req.Cmd)
 		putU32LE(buf, requestKLenOff, 0)
 		putU32LE(buf, requestVLenOff, 0)
 		return buf, nil
 
-	case OpReplicaOf:
+	case CmdReplicaOf:
 		// To make the protocol simple, we reuse the `Value` field here
 		buf := make([]byte, requestHeaderSize+vlen)
-		buf[requestOpOff] = byte(req.Op)
+		buf[requestCmdOff] = byte(req.Cmd)
 		putU32LE(buf, requestKLenOff, klen)
 		putU32LE(buf, requestVLenOff, vlen)
 		copy(buf[requestKeyOff:], req.Key)
@@ -181,7 +181,7 @@ func EncodeRequest(req Request) ([]byte, error) {
 		return buf, nil
 
 	default:
-		return nil, ErrUnknownOp
+		return nil, ErrUnknownCmd
 	}
 }
 
@@ -192,7 +192,7 @@ func DecodeRequest(payload []byte) (Request, error) {
 		return Request{}, ErrInvalidMessage
 	}
 
-	op := Op(payload[requestOpOff])
+	cmd := Cmd(payload[requestCmdOff])
 	kU32 := binary.LittleEndian.Uint32(payload[requestKLenOff : requestKLenOff+u32Size])
 	vU32 := binary.LittleEndian.Uint32(payload[requestVLenOff : requestVLenOff+u32Size])
 	klen, ok := lenFromU32(kU32)
@@ -204,8 +204,8 @@ func DecodeRequest(payload []byte) (Request, error) {
 		return Request{}, ErrInvalidMessage
 	}
 
-	switch op {
-	case OpGet:
+	switch cmd {
+	case CmdGet:
 		if vlen != 0 {
 			return Request{}, ErrInvalidMessage
 		}
@@ -214,9 +214,9 @@ func DecodeRequest(payload []byte) (Request, error) {
 			return Request{}, ErrInvalidMessage
 		}
 		key := append([]byte(nil), payload[requestKeyOff:requestKeyOff+klen]...)
-		return Request{Op: op, Key: key}, nil
+		return Request{Cmd: cmd, Key: key}, nil
 
-	case OpPut:
+	case CmdPut:
 		need := requestHeaderSizePut + klen + vlen
 		if len(payload) != need {
 			return Request{}, ErrInvalidMessage
@@ -224,9 +224,9 @@ func DecodeRequest(payload []byte) (Request, error) {
 		seq := binary.LittleEndian.Uint64(payload[requestSeqOff : requestSeqOff+u64Size])
 		key := append([]byte(nil), payload[requestKeyOffPut:requestKeyOffPut+klen]...)
 		val := append([]byte(nil), payload[requestKeyOffPut+klen:need]...)
-		return Request{Op: op, Key: key, Value: val, Seq: seq}, nil
+		return Request{Cmd: cmd, Key: key, Value: val, Seq: seq}, nil
 
-	case OpReplicate:
+	case CmdReplicate:
 		// Replicate carries seq and optionally replid in Value.
 		if klen != 0 {
 			return Request{}, ErrInvalidMessage
@@ -237,9 +237,9 @@ func DecodeRequest(payload []byte) (Request, error) {
 		}
 		seq := binary.LittleEndian.Uint64(payload[requestKeyOff : requestKeyOff+u64Size])
 		val := append([]byte(nil), payload[requestKeyOff+u64Size:need]...)
-		return Request{Op: op, Value: val, Seq: seq}, nil
+		return Request{Cmd: cmd, Value: val, Seq: seq}, nil
 
-	case OpReplicaOf:
+	case CmdReplicaOf:
 		if klen != 0 {
 			return Request{}, ErrInvalidMessage
 		}
@@ -248,9 +248,9 @@ func DecodeRequest(payload []byte) (Request, error) {
 			return Request{}, ErrInvalidMessage
 		}
 		val := append([]byte(nil), payload[requestHeaderSize:need]...)
-		return Request{Op: op, Value: val}, nil
+		return Request{Cmd: cmd, Value: val}, nil
 
-	case OpPing, OpPromote:
+	case CmdPing, CmdPromote:
 		// These requests carry no data
 		if klen != 0 || vlen != 0 {
 			return Request{}, ErrInvalidMessage
@@ -258,10 +258,10 @@ func DecodeRequest(payload []byte) (Request, error) {
 		if len(payload) != requestHeaderSize {
 			return Request{}, ErrInvalidMessage
 		}
-		return Request{Op: op}, nil
+		return Request{Cmd: cmd}, nil
 
 	default:
-		return Request{}, ErrUnknownOp
+		return Request{}, ErrUnknownCmd
 	}
 }
 

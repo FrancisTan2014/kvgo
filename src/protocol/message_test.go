@@ -7,7 +7,7 @@ import (
 )
 
 func TestRequest_Get_RoundTrip(t *testing.T) {
-	req := Request{Op: OpGet, Key: []byte("k")}
+	req := Request{Cmd: CmdGet, Key: []byte("k")}
 	payload, err := EncodeRequest(req)
 	if err != nil {
 		t.Fatalf("EncodeRequest: %v", err)
@@ -16,13 +16,13 @@ func TestRequest_Get_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeRequest: %v", err)
 	}
-	if got.Op != OpGet || !bytes.Equal(got.Key, req.Key) || len(got.Value) != 0 {
+	if got.Cmd != CmdGet || !bytes.Equal(got.Key, req.Key) || len(got.Value) != 0 {
 		t.Fatalf("decoded mismatch: %+v", got)
 	}
 }
 
 func TestRequest_Put_RoundTrip(t *testing.T) {
-	req := Request{Op: OpPut, Key: []byte("k"), Value: []byte("v")}
+	req := Request{Cmd: CmdPut, Key: []byte("k"), Value: []byte("v")}
 	payload, err := EncodeRequest(req)
 	if err != nil {
 		t.Fatalf("EncodeRequest: %v", err)
@@ -31,13 +31,13 @@ func TestRequest_Put_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeRequest: %v", err)
 	}
-	if got.Op != OpPut || !bytes.Equal(got.Key, req.Key) || !bytes.Equal(got.Value, req.Value) {
+	if got.Cmd != CmdPut || !bytes.Equal(got.Key, req.Key) || !bytes.Equal(got.Value, req.Value) {
 		t.Fatalf("decoded mismatch: %+v", got)
 	}
 }
 
 func TestRequest_GetRejectsValue(t *testing.T) {
-	_, err := EncodeRequest(Request{Op: OpGet, Key: []byte("k"), Value: []byte("v")})
+	_, err := EncodeRequest(Request{Cmd: CmdGet, Key: []byte("k"), Value: []byte("v")})
 	if !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("expected ErrInvalidMessage, got %v", err)
 	}

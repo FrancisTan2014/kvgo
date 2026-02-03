@@ -30,7 +30,7 @@ func TestServer_PutGet(t *testing.T) {
 
 	f := protocol.NewConnFramer(conn)
 
-	putPayload, err := protocol.EncodeRequest(protocol.Request{Op: protocol.OpPut, Key: []byte("k"), Value: []byte("v")})
+	putPayload, err := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPut, Key: []byte("k"), Value: []byte("v")})
 	if err != nil {
 		t.Fatalf("EncodeRequest put: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestServer_PutGet(t *testing.T) {
 		t.Fatalf("put status: got %v", resp.Status)
 	}
 
-	getPayload, err := protocol.EncodeRequest(protocol.Request{Op: protocol.OpGet, Key: []byte("k")})
+	getPayload, err := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdGet, Key: []byte("k")})
 	if err != nil {
 		t.Fatalf("EncodeRequest get: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestServer_Networks(t *testing.T) {
 			// Simple Put/Get round-trip.
 			f := protocol.NewConnFramer(conn)
 
-			putPayload, _ := protocol.EncodeRequest(protocol.Request{Op: protocol.OpPut, Key: []byte("net-test"), Value: []byte("ok")})
+			putPayload, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPut, Key: []byte("net-test"), Value: []byte("ok")})
 			if err := f.WriteWithTimeout(putPayload, 200*time.Millisecond); err != nil {
 				t.Fatalf("write put: %v", err)
 			}
@@ -180,7 +180,7 @@ func TestServer_Networks(t *testing.T) {
 				t.Fatalf("put status: %v", resp.Status)
 			}
 
-			getPayload, _ := protocol.EncodeRequest(protocol.Request{Op: protocol.OpGet, Key: []byte("net-test")})
+			getPayload, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdGet, Key: []byte("net-test")})
 			if err := f.WriteWithTimeout(getPayload, 200*time.Millisecond); err != nil {
 				t.Fatalf("write get: %v", err)
 			}
@@ -246,7 +246,7 @@ func TestServer_PingPong(t *testing.T) {
 	f := protocol.NewConnFramer(conn)
 
 	// Send ping request
-	pingPayload, err := protocol.EncodeRequest(protocol.Request{Op: protocol.OpPing})
+	pingPayload, err := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing})
 	if err != nil {
 		t.Fatalf("EncodeRequest ping: %v", err)
 	}
