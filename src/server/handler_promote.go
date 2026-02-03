@@ -19,9 +19,11 @@ func (s *Server) handlePromote(ctx *RequestContext) error {
 
 func (s *Server) promote() error {
 	s.isReplica = false
+	if s.replCancel != nil {
+		s.replCancel() // signal loop to exit
+	}
 	if s.primary != nil {
 		return s.primary.Close()
 	}
-
 	return nil
 }
