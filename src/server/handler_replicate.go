@@ -21,6 +21,9 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 	s.mu.Unlock()
 	// serveReplica takes over this connection - call directly, don't return
 	s.serveReplica(rc)
+
+	ctx.takenOver = true
+
 	// serveReplica returns when replica disconnects - connection will be closed by caller
 	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusNoReply})
 }
