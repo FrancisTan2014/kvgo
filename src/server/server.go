@@ -5,8 +5,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"kvgo/engine"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -50,6 +51,8 @@ var (
 	ErrAlreadyStarted = errors.New("server: already started")
 	ErrNotStarted     = errors.New("server: not started")
 	ErrDBInUse        = errors.New("server: database is already in use")
+
+	noopLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 )
 
 type Options struct {
@@ -69,7 +72,7 @@ type Options struct {
 	// Zero means use engine.DefaultSyncInterval (100ms).
 	SyncInterval time.Duration
 
-	Logger *log.Logger // optional debug logger; nil disables logging
+	Logger *slog.Logger // optional debug logger; nil disables logging
 }
 
 type Server struct {
@@ -229,7 +232,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return ErrNotStarted
 	}
 
-	s.logf("shutdown: stopping listener")
+	s.log().Info("stopping listener")
 
 	// Stop accepting new connections.
 	if s.ln != nil {
@@ -245,16 +248,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
-		s.logf("shutdown: all connections drained")
+		s.log().Info("all connections drained")
 	case <-ctx.Done():
-		s.logf("shutdown: context canceled, forcing close")
+		s.log().Warn("context canceled, forcing close")
 		s.closeConnections()
 		<-done // wait for handlers to exit after force close
 	}
 
 	var err error
 	if s.db != nil {
-		s.logf("shutdown: closing database")
+		s.log().Info("closing database")
 		err = s.db.Close()
 	}
 	if s.lock != nil {
@@ -272,7 +275,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	s.started.Store(false)
-	s.logf("shutdown: complete")
+	s.log().Info("shutdown complete")
 	return err
 }
 
@@ -298,8 +301,6 @@ func (s *Server) acceptLoop() {
 			return
 		}
 
-		s.logf("accepted connection from %s", conn.RemoteAddr())
-
 		s.mu.Lock()
 		s.conns[conn] = struct{}{}
 		s.mu.Unlock()
@@ -310,7 +311,6 @@ func (s *Server) acceptLoop() {
 			delete(s.conns, conn)
 			s.mu.Unlock()
 			_ = conn.Close()
-			s.logf("closed connection from %s", conn.RemoteAddr())
 		})
 	}
 }
@@ -328,7 +328,7 @@ func (s *Server) relocate(primaryAddr string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.logf("RELOCATE: switching primary to %s", primaryAddr)
+	s.log().Info("switching primary", "address", primaryAddr)
 
 	for c, r := range s.replicas {
 		close(r.sendCh)
@@ -355,8 +355,9 @@ func generateReplID() string {
 	return fmt.Sprintf("%x", b)
 }
 
-func (s *Server) logf(format string, args ...any) {
+func (s *Server) log() *slog.Logger {
 	if s.opts.Logger != nil {
-		s.opts.Logger.Printf(format, args...)
+		return s.opts.Logger
 	}
+	return noopLogger
 }
