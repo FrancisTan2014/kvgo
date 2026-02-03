@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -265,5 +266,98 @@ func TestServer_PingPong(t *testing.T) {
 	}
 	if resp.Status != protocol.StatusPong {
 		t.Fatalf("expected StatusPong (%d), got %d", protocol.StatusPong, resp.Status)
+	}
+}
+
+// TestServer_ReplicaOfRace tests that rapidly switching primaries doesn't leak goroutines.
+// This exercises the context cancellation path in replicationLoop.
+func TestServer_ReplicaOfRace(t *testing.T) {
+	goroutinesBefore := runtime.NumGoroutine()
+	// Start two primaries
+	dir1 := t.TempDir()
+	p1, err := NewServer(Options{Port: 0, DataDir: dir1})
+	if err != nil {
+		t.Fatalf("NewServer p1: %v", err)
+	}
+	if err := p1.Start(); err != nil {
+		t.Fatalf("Start p1: %v", err)
+	}
+	defer p1.Shutdown(context.Background())
+
+	dir2 := t.TempDir()
+	p2, err := NewServer(Options{Port: 0, DataDir: dir2})
+	if err != nil {
+		t.Fatalf("NewServer p2: %v", err)
+	}
+	if err := p2.Start(); err != nil {
+		t.Fatalf("Start p2: %v", err)
+	}
+	defer p2.Shutdown(context.Background())
+
+	// Start a replica following p1
+	dirR := t.TempDir()
+	r, err := NewServer(Options{Port: 0, DataDir: dirR, ReplicaOf: p1.Addr()})
+	if err != nil {
+		t.Fatalf("NewServer replica: %v", err)
+	}
+	if err := r.Start(); err != nil {
+		t.Fatalf("Start replica: %v", err)
+	}
+	defer r.Shutdown(context.Background())
+
+	// Give it a moment to connect
+	time.Sleep(50 * time.Millisecond)
+
+	// Rapidly switch between primaries
+	conn, err := net.Dial("tcp", r.Addr())
+	if err != nil {
+		t.Fatalf("Dial replica: %v", err)
+	}
+	defer conn.Close()
+	f := protocol.NewConnFramer(conn)
+
+	for i := 0; i < 50; i++ {
+		var target string
+		if i%2 == 0 {
+			target = p2.Addr()
+		} else {
+			target = p1.Addr()
+		}
+
+		req := protocol.Request{Cmd: protocol.CmdReplicaOf, Value: []byte(target)}
+		payload, _ := protocol.EncodeRequest(req)
+		if err := f.WriteWithTimeout(payload, 200*time.Millisecond); err != nil {
+			t.Fatalf("write replicaof: %v", err)
+		}
+		resp, err := f.ReadWithTimeout(200 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("read replicaof resp: %v", err)
+		}
+		r, _ := protocol.DecodeResponse(resp)
+		if r.Status != protocol.StatusOK {
+			t.Fatalf("replicaof failed: status=%d", r.Status)
+		}
+	}
+
+	// If we get here without hanging, the context cancellation is working.
+	// The real test is that Shutdown completes without hanging.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := r.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// Also shutdown primaries before checking goroutine count
+	p1.Shutdown(context.Background())
+	p2.Shutdown(context.Background())
+
+	// Give goroutines time to exit
+	time.Sleep(100 * time.Millisecond)
+
+	goroutinesAfter := runtime.NumGoroutine()
+	// Allow some slack for runtime goroutines, but detect significant leaks
+	if goroutinesAfter > goroutinesBefore+5 {
+		t.Errorf("goroutine leak: before=%d after=%d (delta=%d)",
+			goroutinesBefore, goroutinesAfter, goroutinesAfter-goroutinesBefore)
 	}
 }
