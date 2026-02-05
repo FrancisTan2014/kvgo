@@ -343,10 +343,18 @@ func (s *Server) restoreState() error {
 func (s *Server) storeState() error {
 	var err error
 	if s.metaFile == nil {
-		s.metaFile, err = os.OpenFile(s.getMetaPath(), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+		s.metaFile, err = os.OpenFile(s.getMetaPath(), os.O_CREATE|os.O_RDWR, 0644)
 		if err != nil {
 			return err
 		}
+	}
+
+	// Seek to start and truncate before writing
+	if _, err = s.metaFile.Seek(0, 0); err != nil {
+		return err
+	}
+	if err = s.metaFile.Truncate(0); err != nil {
+		return err
 	}
 
 	content := fmt.Sprintf("replid:%s\nlastSeq:%d", s.replid, s.lastSeq.Load())
