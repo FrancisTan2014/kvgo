@@ -19,11 +19,24 @@ func (s *Server) handlePromote(ctx *RequestContext) error {
 
 func (s *Server) promote() error {
 	s.isReplica = false
+
+	// Generate new replid — this node is starting a new timeline
+	s.replid = generateReplID()
+	s.seq.Store(0)
+
 	if s.replCancel != nil {
 		s.replCancel() // signal loop to exit
 	}
 	if s.primary != nil {
-		return s.primary.Close()
+		_ = s.primary.Close()
 	}
+
+	// Start backlog trimmer for new primary role
+	s.startBacklogTrimmer()
+
+	if err := s.storeState(); err != nil {
+		s.log().Error("failed to store new replid after promotion", "error", err)
+	}
+
 	return nil
 }
