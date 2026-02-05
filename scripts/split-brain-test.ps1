@@ -2,7 +2,7 @@
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $srcDir = Join-Path $scriptDir "..\src"
-$dataDir = Join-Path $scriptDir "..\.bench-data"
+$dataDir = Join-Path $scriptDir "..\.test\split-brain"
 
 # Clean up
 if (Test-Path $dataDir) { Remove-Item -Recurse -Force $dataDir }

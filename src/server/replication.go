@@ -46,7 +46,7 @@ func (s *Server) startReplicationLoop() {
 	}
 
 	// Create new context for this loop
-	s.replCtx, s.replCancel = context.WithCancel(context.Background())
+	s.replCtx, s.replCancel = context.WithCancel(s.ctx)
 	ctx := s.replCtx
 
 	s.wg.Go(func() {
@@ -211,11 +211,11 @@ func (s *Server) serveReplica(rc *replicaConn) {
 		s.log().Info("replica disconnected", "replica", rc.conn.RemoteAddr())
 	}()
 
-	seqIndex := s.getSeqIndex(rc.lastSeq)
-	if rc.lastReplid != s.replid || seqIndex == SeqNotFound {
+	exists := s.existsInBacklog(rc.lastSeq)
+	if rc.lastReplid != s.replid || !exists {
 		s.fullResync(rc)
 	} else {
-		s.partialSync(rc, seqIndex)
+		s.partialSync(rc)
 	}
 
 	for {
@@ -288,19 +288,27 @@ func (s *Server) fullResync(rc *replicaConn) {
 	s.log().Info("full sync completed", "replica", rc.conn.RemoteAddr())
 }
 
-func (s *Server) partialSync(rc *replicaConn, seqIndex int) {
+func (s *Server) partialSync(rc *replicaConn) {
 	s.log().Info("partial sync started", "replica", rc.conn.RemoteAddr())
 
 	_ = rc.conn.SetWriteDeadline(time.Time{})
 
 	psyncResp, _ := protocol.EncodeResponse(protocol.Response{Status: protocol.StatusOK})
 	_ = rc.framer.Write(psyncResp)
-	for _, payload := range s.replBacklog[seqIndex+1:] {
-		if err := rc.framer.Write(payload); err != nil {
+
+	err := s.forwardBacklog(rc.lastSeq, func(e backlogEntry) error {
+		if err := rc.framer.Write(e.payload); err != nil {
 			s.log().Error("replica write failed", "replica", rc.conn.RemoteAddr(), "error", err)
+			return err
 		}
+		return nil
+	})
+
+	if err == nil {
+		s.log().Info("partial sync completed", "replica", rc.conn.RemoteAddr())
+	} else {
+		s.log().Error("partial sync failed", "replica", rc.conn.RemoteAddr())
 	}
-	s.log().Info("partial sync completed", "replica", rc.conn.RemoteAddr())
 }
 
 func (s *Server) getMetaPath() string {

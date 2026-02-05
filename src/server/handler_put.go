@@ -28,7 +28,7 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
 	}
 
-	s.writeBacklog(payload)
+	s.appendBacklog(backlogEntry{size: len(payload), payload: payload, seq: seq})
 	s.forwardToReplicas(payload, seq)
 	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK})
 }

@@ -47,7 +47,7 @@ $ErrorActionPreference = "Stop"
 # Paths
 $root = Split-Path -Parent $PSScriptRoot
 $srcDir = Join-Path $root "src"
-$dataRoot = Join-Path $root ".bench-data"
+$dataRoot = Join-Path $root ".test\bench"
 $primaryPort = 4000
 $replicaBasePort = 4001
 
