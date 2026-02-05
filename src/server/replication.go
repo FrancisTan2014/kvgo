@@ -211,6 +211,16 @@ func (s *Server) serveReplica(rc *replicaConn) {
 		s.log().Info("replica disconnected", "replica", rc.conn.RemoteAddr())
 	}()
 
+	// Check timeline compatibility
+	if rc.lastReplid != "" && rc.lastReplid != s.replid {
+		s.log().Error("incompatible replid detected — replica was following different primary",
+			"replica", rc.conn.RemoteAddr(),
+			"replica_replid", rc.lastReplid,
+			"primary_replid", s.replid,
+			"replica_lastSeq", rc.lastSeq)
+		// For now, force full resync on incompatible timeline
+	}
+
 	exists := s.existsInBacklog(rc.lastSeq)
 	if rc.lastReplid != s.replid || !exists {
 		s.fullResync(rc)
