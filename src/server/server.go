@@ -1,6 +1,7 @@
 package server
 
 import (
+	"container/list"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -63,10 +64,11 @@ type Options struct {
 	ReplicaOf string // non-empty value indicates that it is a follower
 	DataDir   string
 
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	MaxFrameSize int
-	BacklogSize  int
+	ReadTimeout         time.Duration
+	WriteTimeout        time.Duration
+	MaxFrameSize        int
+	BacklogSizeLimit    int64         // default 16MB
+	BacklogTrimDuration time.Duration // default 100ms
 
 	// SyncInterval controls how often the WAL is fsynced (latency vs throughput tradeoff).
 	// Lower values reduce latency but increase fsync overhead.
@@ -79,6 +81,8 @@ type Options struct {
 type Server struct {
 	opts    Options
 	started atomic.Bool
+	ctx     context.Context // Server lifetime
+	cancel  context.CancelFunc
 
 	// Core infrastructure
 	ln   net.Listener
@@ -108,8 +112,11 @@ type Server struct {
 	replCancel context.CancelFunc
 
 	// Partial resync backlog
-	replBacklog [][]byte
-	backlogSeqs []uint64
+	backlog       list.List
+	backlogSize   atomic.Int64 // Int64 for direct subtraction; always non-negative
+	backlogMu     sync.RWMutex
+	backlogCtx    context.Context
+	backlogCancel context.CancelFunc
 
 	// Persistence
 	metaFile *os.File
@@ -208,9 +215,13 @@ func (s *Server) Start() (err error) {
 	}
 	s.db = db // Assign now so startReplicationLoop can use it
 
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+
 	// Start replication loop only for replicas
 	if s.isReplica {
 		s.startReplicationLoop()
+	} else {
+		s.startBacklogTrimmer()
 	}
 
 	ln, err = net.Listen(s.network(), s.listenAddr())
@@ -260,9 +271,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		_ = s.ln.Close()
 	}
 
-	// Cancel replication loop
-	if s.replCancel != nil {
-		s.replCancel()
+	// Cancel all subsystem contexts (replication loop, backlog trimmer, etc.)
+	if s.cancel != nil {
+		s.cancel()
 	}
 	if s.primary != nil {
 		_ = s.primary.Close()
@@ -364,6 +375,10 @@ func (s *Server) relocate(primaryAddr string) error {
 	if s.primary != nil {
 		_ = s.primary.Close()
 		s.primary = nil
+	}
+
+	if s.backlogCancel != nil {
+		s.backlogCancel()
 	}
 
 	s.db.Clear()
