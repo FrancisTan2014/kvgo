@@ -89,7 +89,7 @@ func (db *DB) replay() error {
 		wg.Go(func() {
 			if err := s.replay(); err != nil {
 				mu.Lock()
-				errors.Join(compoundErr, err)
+				compoundErr = errors.Join(compoundErr, err)
 				mu.Unlock()
 				db.log().Error("Error occurred on replaying %s: %v", s.wal.indexFilename, err)
 			}
@@ -137,7 +137,7 @@ func (db *DB) Clear() error {
 		wg.Go(func() {
 			if err := s.clear(); err != nil {
 				mu.Lock()
-				errors.Join(compoundErr, err)
+				compoundErr = errors.Join(compoundErr, err)
 				mu.Unlock()
 			}
 		})
