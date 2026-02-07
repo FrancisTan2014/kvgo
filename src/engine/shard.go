@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,9 +29,12 @@ type shard struct {
 	numKeys          atomic.Int64 // number of unique keys
 	indexBytesOnDisk atomic.Int64
 	valueOffset      atomic.Int64
+
+	fatalErrCh chan struct{} // closed on critical failure
+	logger     *slog.Logger  // for structured logging
 }
 
-func newShard(path string, index int, syncInterval time.Duration, ctx context.Context) (*shard, error) {
+func newShard(path string, index int, syncInterval time.Duration, ctx context.Context, fatalErrCh chan struct{}, logger *slog.Logger) (*shard, error) {
 	indexFile := fmt.Sprintf("shar%d.index", index)
 	valueFile := fmt.Sprintf("shar%d.value", index)
 
@@ -50,6 +54,8 @@ func newShard(path string, index int, syncInterval time.Duration, ctx context.Co
 		wal:              w,
 		committer:        committer,
 		compactionWorker: compactionWorker,
+		fatalErrCh:       fatalErrCh,
+		logger:           logger,
 	}
 
 	if f, err := s.wal.valueFile.Stat(); err != nil {

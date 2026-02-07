@@ -229,6 +229,7 @@ func (s *Server) Start() (err error) {
 
 	s.lock, s.ln = lock, ln
 	go s.acceptLoop()
+	go s.monitorDBHealth()
 	return nil
 }
 
@@ -237,6 +238,27 @@ func (s *Server) network() string {
 		return defaultNetwork
 	}
 	return s.opts.Network
+}
+
+func (s *Server) monitorDBHealth() {
+	<-s.db.FatalErr // blocks until critical error occurs
+
+	s.log().Error("FATAL: database encountered critical error, initiating shutdown",
+		"data_dir", s.opts.DataDir,
+		"action", "graceful_shutdown",
+		"recovery", "process_will_restart_and_replay_wal",
+	)
+
+	// Initiate graceful shutdown (with timeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s.Shutdown(shutdownCtx); err != nil {
+		s.log().Error("shutdown after fatal error failed", "error", err)
+	}
+
+	// Exit process after shutdown attempt
+	os.Exit(1)
 }
 
 func (s *Server) listenAddr() string {
