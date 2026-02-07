@@ -106,6 +106,7 @@ func BenchmarkReplayPerformance(b *testing.B) {
 // TestReplayTimeIsIndependentOfValueSize verifies the core lazy loading property:
 // Replay time depends on key count, NOT value size.
 func TestReplayTimeIsIndependentOfValueSize(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("Skipping replay performance test in short mode")
 	}

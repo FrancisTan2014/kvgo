@@ -204,6 +204,21 @@ func (db *DB) Range(fn func(key string, value []byte) bool) error {
 	return nil
 }
 
+func (db *DB) Clean() error {
+	for _, s := range db.shards {
+		select {
+		case <-db.ctx.Done():
+			return ErrClosed
+		default:
+			if err := s.clean(); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func (db *DB) getShard(key string) *shard {
 	return db.shards[hash(key)%numShards]
 }
