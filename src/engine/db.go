@@ -29,6 +29,9 @@ type Options struct {
 type DB struct {
 	shards []*shard
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	stateMu sync.RWMutex // shutdown gate: prevents Put/Close race (no enqueue after drain)
 	closed  bool         // protected by stateMu
 
@@ -47,15 +50,24 @@ func NewDB(path string, ctx context.Context) (*DB, error) {
 func NewDBWithOptions(path string, opts Options, ctx context.Context) (*DB, error) {
 	var err error
 
+	// Create root context for all shards - canceling this cancels all shard contexts
+	rootCtx, rootCancel := context.WithCancel(ctx)
+
 	shards := make([]*shard, numShards)
 	for i := range shards {
-		shards[i], err = newShard(path, i, opts.SyncInterval, ctx)
+		shards[i], err = newShard(path, i, opts.SyncInterval, rootCtx)
 		if err != nil {
+			rootCancel()
 			return nil, err
 		}
 	}
 
-	db := &DB{shards: shards}
+	db := &DB{
+		shards: shards,
+		ctx:    rootCtx,
+		cancel: rootCancel,
+		opts:   opts,
+	}
 
 	if err := db.replay(); err != nil {
 		return nil, err
@@ -146,11 +158,9 @@ func (db *DB) Close() error {
 		db.closed = true
 		db.stateMu.Unlock()
 
-		// Cancel all shard contexts to signal background workers
-		for _, s := range db.shards {
-			if s.cancel != nil {
-				s.cancel()
-			}
+		// Cancel root context - automatically cancels all shard contexts
+		if db.cancel != nil {
+			db.cancel()
 		}
 
 		// Stop all shards' background workers and close WAL files
