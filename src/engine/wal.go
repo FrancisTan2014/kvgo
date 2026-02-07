@@ -2,62 +2,116 @@ package engine
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
-const walRecordHeaderBytes = 8
+// Index entry: [klen : 4bytes][vlen : 4bytes][vOffset : 8bytes][key bytes]
+const walIndexHeaderBytes = 16
+
+var ErrCorruption = errors.New("corrupted at end")
+var ErrTruncate = errors.New("failed to truncate tail corruption")
+var ErrInvalidRead = errors.New("invalid offset or size")
 
 // wal is a private write-ahead log implementation.
 type wal struct {
-	path string
-	file *os.File
+	path          string
+	indexFilename string
+	valueFilename string
+	indexFile     *os.File
+	valueFile     *os.File
 }
 
-func newWAL(path string) (*wal, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
-	if file == nil {
+type indexEntry struct {
+	Key         string
+	ValueSize   int
+	ValueOffset int64
+}
+
+func newWAL(path string, indexFilename string, valueFilename string) (*wal, error) {
+	indexFile, err := openFile(filepath.Join(path, indexFilename))
+	if indexFile == nil {
 		return nil, err
 	}
 
-	return &wal{path: path, file: file}, nil
-}
-
-func walRecordLen(keyLen int, valueLen int) int {
-	return walRecordHeaderBytes + keyLen + valueLen
-}
-
-func (w *wal) writeAndSync(buf []byte) error {
-	_, err := w.file.Write(buf)
-	if err != nil {
-		return err
+	valueFile, err := openFile(filepath.Join(path, valueFilename))
+	if valueFile == nil {
+		return nil, err
 	}
 
-	return w.file.Sync()
+	return &wal{
+		path:          path,
+		indexFilename: indexFilename,
+		valueFilename: valueFilename,
+		indexFile:     indexFile,
+		valueFile:     valueFile,
+	}, nil
+}
+
+func openFile(path string) (*os.File, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
 }
 
 func (w *wal) close() error {
-	return w.file.Close()
+	err1 := w.indexFile.Close()
+	err2 := w.valueFile.Close()
+	return errors.Join(err1, err2)
 }
 
 func (w *wal) clear() error {
-	var err error
-
-	if err = w.file.Close(); err != nil {
+	if err := w.close(); err != nil {
 		return err
 	}
 
-	return os.Remove(w.path)
+	e1 := os.Remove(filepath.Join(w.path, w.indexFilename))
+	e2 := os.Remove(filepath.Join(w.path, w.valueFilename))
+	return errors.Join(e1, e2)
 }
 
-func (w *wal) read(handler func([]byte, []byte) error) error {
+func walIndexLen(klen int) int {
+	return walIndexHeaderBytes + klen
+}
+
+func encodeInto(dst []byte, key string, vsize int, voffset int64) int {
+	klen := len(key)
+	total := walIndexLen(klen)
+
+	binary.LittleEndian.PutUint32(dst[0:4], uint32(klen))
+	binary.LittleEndian.PutUint32(dst[4:8], uint32(vsize))
+	binary.LittleEndian.PutUint64(dst[8:16], uint64(voffset))
+	copy(dst[walIndexHeaderBytes:total], []byte(key))
+
+	return total
+}
+
+func (w *wal) readIndex(handler func(indexEntry) error) (err error) {
+	var currupted bool
+	var position int64
+	defer func() {
+		if currupted {
+			if truncErr := w.indexFile.Truncate(position); truncErr != nil {
+				e := fmt.Errorf("truncation failed after corruption: %w", truncErr)
+				err = errors.Join(ErrCorruption, e)
+			}
+		}
+	}()
+
 	for {
-		var header [walRecordHeaderBytes]byte
-		_, err := io.ReadFull(w.file, header[:])
+		var header [walIndexHeaderBytes]byte
+		_, err := io.ReadFull(w.indexFile, header[:])
 		if err == io.ErrUnexpectedEOF {
-			fmt.Printf("Warning: WAL corrupted at end, truncating.\n")
-			return io.EOF
+			currupted = true
+			return ErrCorruption
+		}
+		if err == io.EOF {
+			return nil
 		}
 		if err != nil {
 			return err
@@ -65,31 +119,75 @@ func (w *wal) read(handler func([]byte, []byte) error) error {
 
 		klen := binary.LittleEndian.Uint32(header[0:4])
 		vlen := binary.LittleEndian.Uint32(header[4:8])
+		offset := binary.LittleEndian.Uint64(header[8:16])
 
-		buf := make([]byte, int(klen+vlen))
-		_, err = io.ReadFull(w.file, buf)
-		if err == io.ErrUnexpectedEOF {
-			// Ignore trailing partial record instead of failing startup.
-			fmt.Printf("Warning: WAL corrupted at end, truncating.\n")
-			return io.EOF
+		buf := make([]byte, int(klen))
+		_, err = io.ReadFull(w.indexFile, buf)
+		if err == io.ErrUnexpectedEOF || err == io.EOF {
+			currupted = true
+			return ErrCorruption
 		}
 		if err != nil {
 			return err
 		}
 
-		err = handler(buf[:klen], buf[klen:])
+		position += int64(walIndexHeaderBytes + klen)
+
+		entry := indexEntry{
+			Key:         string(buf),
+			ValueSize:   int(vlen),
+			ValueOffset: int64(offset),
+		}
+		err = handler(entry)
 		if err != nil {
 			return err
 		}
 	}
 }
 
-func encodeInto(dst []byte, key string, value []byte) int {
-	klen := len(key)
-	vlen := len(value)
-	binary.LittleEndian.PutUint32(dst[0:4], uint32(klen))
-	binary.LittleEndian.PutUint32(dst[4:8], uint32(vlen))
-	copy(dst[walRecordHeaderBytes:walRecordHeaderBytes+klen], key)
-	copy(dst[walRecordHeaderBytes+klen:walRecordHeaderBytes+klen+vlen], value)
-	return walRecordLen(klen, vlen)
+func (w *wal) readValue(offset int64, size int) ([]byte, error) {
+	if offset < 0 || size <= 0 {
+		return nil, ErrInvalidRead
+	}
+
+	if offset > 0 {
+		// Seek to the offset position
+		_, err := w.valueFile.Seek(offset, io.SeekStart)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	buf := make([]byte, size)
+	_, err := io.ReadFull(w.valueFile, buf)
+	if err == io.ErrUnexpectedEOF {
+		if truncErr := w.valueFile.Truncate(offset); truncErr != nil {
+			return nil, errors.Join(ErrCorruption, ErrTruncate, truncErr)
+		}
+		return nil, ErrCorruption
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return buf, nil
+}
+
+func (w *wal) writeIndex(data []byte) error {
+	_, err := w.indexFile.Write(data)
+	if err != nil {
+		return err
+	}
+
+	return w.indexFile.Sync()
+}
+
+func (w *wal) writeValue(data []byte) error {
+	_, err := w.valueFile.Write(data)
+	if err != nil {
+		return err
+	}
+
+	return w.valueFile.Sync()
 }

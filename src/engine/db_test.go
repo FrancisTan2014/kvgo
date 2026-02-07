@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -9,13 +10,15 @@ import (
 
 // The "Systems" Test
 func TestDurability(t *testing.T) {
-	// 1. Setup: Use a temp file so we don't mess up your real DB
-	tmpFile := "test_wal.db"
-	os.Remove(tmpFile)       // Clean up previous runs
-	defer os.Remove(tmpFile) // Clean up after we are done
+	// 1. Setup: Use a temp directory for shard files
+	tmpDir, err := os.MkdirTemp("", "test_wal_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
 	// --- PHASE 1: Write ---
-	db, err := NewDB(tmpFile)
+	db, err := NewDB(tmpDir, context.Background())
 	if err != nil {
 		t.Fatalf("Failed to open DB: %v", err)
 	}
@@ -35,7 +38,7 @@ func TestDurability(t *testing.T) {
 
 	// --- PHASE 2: Restart ---
 	t.Log("Restarting DB...")
-	db2, err := NewDB(tmpFile) // Open the SAME file
+	db2, err := NewDB(tmpDir, context.Background()) // Open the SAME directory
 	if err != nil {
 		t.Fatalf("Failed to re-open DB: %v", err)
 	}
@@ -52,11 +55,13 @@ func TestDurability(t *testing.T) {
 }
 
 func TestPut_EdgeCases(t *testing.T) {
-	tmpFile := "test_put_edges.db"
-	os.Remove(tmpFile)
-	defer os.Remove(tmpFile)
+	tmpDir, err := os.MkdirTemp("", "test_put_edges_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
-	db, err := NewDB(tmpFile)
+	db, err := NewDB(tmpDir, context.Background())
 	if err != nil {
 		t.Fatalf("Failed to create DB: %v", err)
 	}
@@ -138,11 +143,13 @@ func TestPut_EdgeCases(t *testing.T) {
 }
 
 func TestClear(t *testing.T) {
-	tmpFile := "test_clear.db"
-	os.Remove(tmpFile)
-	defer os.Remove(tmpFile)
+	tmpDir, err := os.MkdirTemp("", "test_clear_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
-	db, err := NewDB(tmpFile)
+	db, err := NewDB(tmpDir, context.Background())
 	if err != nil {
 		t.Fatalf("Failed to create DB: %v", err)
 	}

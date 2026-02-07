@@ -13,13 +13,14 @@ const syncBatchSize = 100 // group commit: amortize fsync across many writes
 const DefaultSyncInterval = 10 * time.Millisecond
 
 type groupCommitter struct {
-	ticker    *time.Ticker       // periodic flush trigger
-	reqCh     chan *writeRequest // incoming Put() requests
-	buf       []*writeRequest    // current batch (reused to reduce allocations/GC pressure)
-	walBuf    []byte             // reusable WAL encode buffer (reduces large short-lived allocs -> less GC)
-	stopCh    chan struct{}      // shutdown signal
-	doneCh    chan struct{}      // closed when committer exits
-	compactCh chan *compactRequest
+	ticker      *time.Ticker       // periodic flush trigger
+	reqCh       chan *writeRequest // incoming Put() requests
+	buf         []*writeRequest    // current batch (reused to reduce allocations/GC pressure)
+	walIndexBuf []byte             // reusable WAL encode buffer (reduces large short-lived allocs -> less GC)
+	walValueBuf []byte             // reusable WAL encode buffer (reduces large short-lived allocs -> less GC)
+	stopCh      chan struct{}      // shutdown signal
+	doneCh      chan struct{}      // closed when committer exits
+	compactCh   chan *compactRequest
 }
 
 type compactRequest struct {
@@ -41,30 +42,29 @@ func newGroupCommitter(syncInterval time.Duration) *groupCommitter {
 		ticker:    time.NewTicker(syncInterval), // pacing for periodic flushes
 		reqCh:     make(chan *writeRequest, syncBatchSize*2),
 		buf:       make([]*writeRequest, 0, syncBatchSize),
-		walBuf:    nil,
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
 		compactCh: make(chan *compactRequest),
 	}
 }
 
-func (db *DB) startGroupCommitter() {
-	defer close(db.committer.doneCh)
+func (s *shard) startGroupCommitter() {
+	defer close(s.committer.doneCh)
 
 	appendToBatch := func(r *writeRequest) {
-		db.committer.buf = append(db.committer.buf, r)
-		if len(db.committer.buf) >= cap(db.committer.buf) {
+		s.committer.buf = append(s.committer.buf, r)
+		if len(s.committer.buf) >= cap(s.committer.buf) {
 			// Flush on size to cap memory and maximize fsync amortization.
-			db.flush(db.committer.buf)
-			db.committer.buf = db.committer.buf[:0]
+			s.flush(s.committer.buf)
+			s.committer.buf = s.committer.buf[:0]
 		}
 	}
 
 	flushBuffered := func() {
-		if len(db.committer.buf) > 0 {
+		if len(s.committer.buf) > 0 {
 			// Flush on timer/shutdown to bound write latency and ensure acks.
-			db.flush(db.committer.buf)
-			db.committer.buf = db.committer.buf[:0]
+			s.flush(s.committer.buf)
+			s.committer.buf = s.committer.buf[:0]
 		}
 	}
 
@@ -72,7 +72,7 @@ func (db *DB) startGroupCommitter() {
 		// Drain reqCh so enqueued Put() callers always get an ack.
 		for {
 			select {
-			case r := <-db.committer.reqCh:
+			case r := <-s.committer.reqCh:
 				appendToBatch(r)
 			default:
 				flushBuffered()
@@ -85,9 +85,9 @@ func (db *DB) startGroupCommitter() {
 		// Drain writes and also unblock any in-flight compaction requests.
 		for {
 			select {
-			case r := <-db.committer.reqCh:
+			case r := <-s.committer.reqCh:
 				appendToBatch(r)
-			case cr := <-db.committer.compactCh:
+			case cr := <-s.committer.compactCh:
 				// On shutdown, don't start expensive compaction work.
 				cr.err <- ErrClosed
 			default:
@@ -99,62 +99,93 @@ func (db *DB) startGroupCommitter() {
 
 	for {
 		select {
-		case r := <-db.committer.reqCh:
+		case r := <-s.committer.reqCh:
 			appendToBatch(r)
-		case <-db.committer.ticker.C:
+		case <-s.committer.ticker.C:
 			flushBuffered()
-		case cr := <-db.committer.compactCh:
+		case cr := <-s.committer.compactCh:
 			// Barrier: drain everything already enqueued before compaction proceeds.
 			drainReqCh()
 			err := cr.doCompact()
 			cr.err <- err
-		case <-db.committer.stopCh:
+		case <-s.committer.stopCh:
 			drainAllForShutdown()
 			return
 		}
 	}
 }
 
-func (db *DB) flush(batch []*writeRequest) {
+func (s *shard) flush(batch []*writeRequest) {
 	// Compute encoded size first so we can write a single contiguous WAL record buffer.
-	totalBytes := 0
+	idxTotal := 0
+	valTotal := 0
 	for _, r := range batch {
-		totalBytes += walRecordLen(len(r.key), len(r.value))
+		idxTotal += walIndexLen(len(r.key))
+		valTotal += len(r.value)
 	}
 
 	// Reuse a single encode buffer to avoid large short-lived allocations (GC pressure).
-	buf := db.committer.walBuf
-	if cap(buf) < totalBytes {
-		buf = make([]byte, totalBytes)
-		db.committer.walBuf = buf
-	} else {
-		buf = buf[:totalBytes]
-	}
+	idxBuf := s.reuseIdxBuf(idxTotal)
+	valBuf := s.reuseValBuf(valTotal)
 
-	offset := 0
+	idxBufOff := 0
+	valBufOff := 0
+	valueFileOff := s.valueOffset.Load()
 	for _, r := range batch {
-		offset += encodeInto(buf[offset:], r.key, r.value)
+		idxSize := encodeInto(idxBuf[idxBufOff:], r.key, len(r.value), valueFileOff)
+		idxBufOff += idxSize
+
+		copy(valBuf[valBufOff:], r.value)
+		valBufOff += len(r.value)
+		valueFileOff += int64(len(r.value))
 	}
 
-	err := db.wal.writeAndSync(buf)
-	if err != nil {
+	if err := s.wal.writeValue(valBuf); err != nil {
 		// In a critical system, failing to fsync means we cannot meet durability guarantees.
 		// Prefer crash-fast (restart + alert) over continuing in an unknown state.
 		for _, r := range batch {
 			r.respCh <- err
 		}
-		panic(fmt.Sprintf("wal write+sync failed: %v", err))
+		panic(fmt.Sprintf("wal write value failed: %v filename=%s", err, s.wal.valueFilename))
 	}
 
-	db.bytesOnDisk.Add(int64(len(buf)))
+	if err := s.wal.writeIndex(idxBuf); err != nil {
+		for _, r := range batch {
+			r.respCh <- err
+		}
+		panic(fmt.Sprintf("wal write index failed: %v filename=%s", err, s.wal.indexFilename))
+	}
 
-	var ramDelta int64
+	s.indexBytesOnDisk.Add(int64(len(idxBuf)))
+	s.valueOffset.Store(valueFileOff)
+
 	for _, r := range batch {
 		// Apply to memory only after WAL fsync succeeds ("strict" durability for acks).
-		ramDelta += db.putInternalAndDelta(r.key, r.value)
+		s.putInternal(r.key, r.value)
 		r.respCh <- nil
 	}
-	if ramDelta != 0 {
-		db.bytesInRAM.Add(ramDelta)
+}
+
+func (s *shard) reuseIdxBuf(size int) []byte {
+	buf := s.committer.walIndexBuf
+	if cap(buf) < size {
+		buf = make([]byte, size)
+		s.committer.walIndexBuf = buf
+	} else {
+		buf = buf[:size]
 	}
+
+	return buf
+}
+
+func (s *shard) reuseValBuf(size int) []byte {
+	buf := s.committer.walValueBuf
+	if cap(buf) < size {
+		buf = make([]byte, size)
+		s.committer.walValueBuf = buf
+	} else {
+		buf = buf[:size]
+	}
+
+	return buf
 }

@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -206,16 +205,15 @@ func (s *Server) Start() (err error) {
 		return err
 	}
 
-	walPath := filepath.Join(s.opts.DataDir, "wal.db")
-	db, err = engine.NewDBWithOptions(walPath, engine.Options{
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	db, err = engine.NewDBWithOptions(s.opts.DataDir, engine.Options{
 		SyncInterval: s.opts.SyncInterval,
-	})
+		Logger:       s.opts.Logger,
+	}, s.ctx)
 	if err != nil {
 		return err
 	}
 	s.db = db // Assign now so startReplicationLoop can use it
-
-	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	// Start replication loop only for replicas
 	if s.isReplica {
