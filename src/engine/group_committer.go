@@ -141,17 +141,20 @@ func (s *shard) flush(batch []*writeRequest) {
 	}
 
 	if err := s.wal.writeValue(valBuf); err != nil {
-		// In a critical system, failing to fsync means we cannot meet durability guarantees.
-		// Prefer crash-fast (restart + alert) over continuing in an unknown state.
+		// Failing to fsync means we cannot guarantee durability.
+		// Crash-fast: terminate process, restart, replay WAL to recover.
+		// Corruption during fsync is the most likely error - replay will fix it.
 		for _, r := range batch {
-			r.respCh <- err
+			r.respCh <- fmt.Errorf("WAL write value failed: %w", err)
 		}
 		panic(fmt.Sprintf("wal write value failed: %v filename=%s", err, s.wal.valueFilename))
 	}
 
 	if err := s.wal.writeIndex(idxBuf); err != nil {
+		// Index write failed after value write succeeded.
+		// Crash-fast: on restart, values exist but aren't indexed yet - replay will fix.
 		for _, r := range batch {
-			r.respCh <- err
+			r.respCh <- fmt.Errorf("WAL write index failed: %w", err)
 		}
 		panic(fmt.Sprintf("wal write index failed: %v filename=%s", err, s.wal.indexFilename))
 	}
