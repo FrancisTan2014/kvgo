@@ -1,19 +1,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"kvgo/engine"
 )
 
 func main() {
-	db, err := engine.NewDB("test")
+	db, err := engine.NewDB("../.test/src_main", context.Background())
 	if err != nil {
 		fmt.Printf("error: failed to create database: %v\n", err)
 		return
 	}
 
 	key := "user:100"
-	val := []byte("Hello World!")
+	var val []byte
 
 	fmt.Println("Writing data...")
 	db.Put(key, val)

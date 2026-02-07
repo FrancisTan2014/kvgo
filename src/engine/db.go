@@ -1,16 +1,21 @@
 package engine
 
 import (
+	"context"
 	"errors"
+	"hash/fnv"
 	"io"
+	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 const numShards = 256 // lock striping: reduce contention vs 1 global mutex
 
-var ErrClosed = errors.New("db is closed")
+var (
+	ErrClosed  = errors.New("db is closed")
+	noopLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+)
 
 // Options configures the database.
 type Options struct {
@@ -18,114 +23,121 @@ type Options struct {
 	// Lower = lower latency, higher = better throughput.
 	// Zero means use DefaultSyncInterval (100ms).
 	SyncInterval time.Duration
+	Logger       *slog.Logger
 }
 
 type DB struct {
-	shards           []*shard
-	wal              *wal
-	committer        *groupCommitter
-	compactionWorker *compactWorker
-	bytesInRAM       atomic.Int64
-	bytesOnDisk      atomic.Int64
+	shards []*shard
 
 	stateMu sync.RWMutex // shutdown gate: prevents Put/Close race (no enqueue after drain)
 	closed  bool         // protected by stateMu
 
 	closeOnce sync.Once
 	closeErr  error
+
+	opts Options
 }
 
 // NewDB opens or creates a database at path with default options.
-func NewDB(path string) (*DB, error) {
-	return NewDBWithOptions(path, Options{})
+func NewDB(path string, ctx context.Context) (*DB, error) {
+	return NewDBWithOptions(path, Options{}, ctx)
 }
 
 // NewDBWithOptions opens or creates a database at path with the given options.
-func NewDBWithOptions(path string, opts Options) (*DB, error) {
-	wal, err := newWAL(path)
-	if err != nil {
-		return nil, err
-	}
+func NewDBWithOptions(path string, opts Options, ctx context.Context) (*DB, error) {
+	var err error
 
 	shards := make([]*shard, numShards)
 	for i := range shards {
-		shards[i] = newShard()
+		shards[i], err = newShard(path, i, opts.SyncInterval, ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	db := &DB{shards: shards, wal: wal}
+	db := &DB{shards: shards}
 
-	// WAL replay: rebuild memory state without re-logging (no feedback loop).
-	err = wal.read(func(key, value []byte) error {
-		delta := db.putInternalAndDelta(string(key), value)
-		db.bytesInRAM.Add(delta)
-		return nil
-	})
-	if err != nil && err != io.EOF {
+	if err := db.replay(); err != nil {
 		return nil, err
+	} else {
+		db.startWorkers()
 	}
-
-	if info, statErr := wal.file.Stat(); statErr == nil {
-		db.bytesOnDisk.Store(info.Size())
-	}
-
-	db.committer = newGroupCommitter(opts.SyncInterval)
-	db.compactionWorker, err = newCompactionWorker(defaultCompactionPolicy)
-	if err != nil {
-		return nil, err
-	}
-	go db.startGroupCommitter()
-	go db.startCompactionWorker()
 
 	return db, nil
 }
 
+func (db *DB) replay() error {
+	db.stateMu.Lock()
+	defer db.stateMu.Unlock()
+
+	var mu sync.Mutex
+	var compoundErr error
+	var wg sync.WaitGroup
+	for _, s := range db.shards {
+		wg.Go(func() {
+			if err := s.replay(); err != nil {
+				mu.Lock()
+				errors.Join(compoundErr, err)
+				mu.Unlock()
+				db.log().Error("Error occurred on replaying %s: %v", s.wal.indexFilename, err)
+			}
+		})
+	}
+
+	wg.Wait()
+	db.log().Info("Replayed successfully")
+
+	return compoundErr
+}
+
+func (db *DB) startWorkers() {
+	for _, s := range db.shards {
+		s.startBackgroundWorker()
+	}
+}
+
 func (db *DB) Put(key string, value []byte) error {
-	db.stateMu.RLock()
-	if db.closed || db.committer == nil {
-		db.stateMu.RUnlock()
-		return ErrClosed
-	}
-	committer := db.committer
-	db.stateMu.RUnlock()
-
-	respCh := make(chan error, 1)
-	req := &writeRequest{key: key, value: value, respCh: respCh}
-
-	// Avoid holding stateMu while potentially blocking.
-	// If shutdown has started, stopCh is closed and we fail fast.
-	select {
-	case committer.reqCh <- req:
-		// ok
-	case <-committer.stopCh:
-		return ErrClosed
-	}
-
-	return <-respCh
+	s := db.getShard(key)
+	return s.put(key, value)
 }
 
 func (db *DB) Get(key string) ([]byte, bool) {
 	s := db.getShard(key)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	val, ok := s.data[key]
-	return val, ok
+	data, ok, err := s.get(key)
+	if err != nil {
+		// Read errors (corruption, I/O failures) are logged but not returned.
+		// Callers see (nil, false) for any read failure—same as missing key.
+		// Operators detect issues via logs.
+		db.log().Error("read failed", "key", key, "error", err)
+	}
+	return data, ok
 }
 
-// putInternalAndDelta writes to memory only and reports the logical delta bytes in RAM.
-// We track logical bytes (key bytes + value bytes), not actual heap usage.
-func (db *DB) putInternalAndDelta(key string, value []byte) int64 {
-	s := db.getShard(key)
-	s.mu.Lock()
-	oldV, existed := s.data[key]
-	s.data[key] = value
-	s.mu.Unlock()
+// Clear deletes all keys from memory and resets the WAL file.
+func (db *DB) Clear() error {
+	db.stateMu.Lock()
+	defer db.stateMu.Unlock()
 
-	delta := int64(len(value) - len(oldV))
-	if !existed {
-		delta += int64(len(key))
+	var mu sync.Mutex
+	var compoundErr error
+	var wg sync.WaitGroup
+	for _, s := range db.shards {
+		wg.Go(func() {
+			if err := s.clear(); err != nil {
+				mu.Lock()
+				errors.Join(compoundErr, err)
+				mu.Unlock()
+			}
+		})
 	}
-	return delta
+
+	wg.Wait()
+
+	if compoundErr != nil {
+		return compoundErr
+	}
+
+	return nil
 }
 
 func (db *DB) Close() error {
@@ -134,53 +146,59 @@ func (db *DB) Close() error {
 		db.closed = true
 		db.stateMu.Unlock()
 
-		if db.committer != nil {
-			close(db.committer.stopCh)
-			<-db.committer.doneCh
-			db.committer.ticker.Stop()
+		// Cancel all shard contexts to signal background workers
+		for _, s := range db.shards {
+			if s.cancel != nil {
+				s.cancel()
+			}
 		}
-		db.closeErr = db.wal.close()
+
+		// Stop all shards' background workers and close WAL files
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for _, s := range db.shards {
+			wg.Go(func() {
+				if err := s.stopBackgroundWorker(); err != nil {
+					mu.Lock()
+					if db.closeErr == nil {
+						db.closeErr = err
+					} else {
+						db.closeErr = errors.Join(db.closeErr, err)
+					}
+					mu.Unlock()
+				}
+			})
+		}
+		wg.Wait()
 	})
 	return db.closeErr
 }
 
-// Clear deletes all keys from memory and resets the WAL file.
-func (db *DB) Clear() error {
-	db.stateMu.Lock()
-	defer db.stateMu.Unlock()
-
-	var err error
-	if err = db.wal.clear(); err != nil {
-		return err
-	}
-
+// Range calls fn sequentially for each key-value pair in the database.
+// If fn returns false, iteration stops.
+func (db *DB) Range(fn func(key string, value []byte) bool) error {
 	for _, s := range db.shards {
-		s.mu.Lock()
-		s.data = make(map[string][]byte)
-		s.mu.Unlock()
-	}
-
-	db.bytesInRAM.Store(0)
-	db.bytesOnDisk.Store(0)
-
-	if db.wal, err = newWAL(db.wal.path); err != nil {
-		return err
+		if err := s.forEach(fn); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-// Range calls fn sequentially for each key-value pair in the database.
-// If fn returns false, iteration stops.
-func (db *DB) Range(fn func(key string, value []byte) bool) {
-	for _, s := range db.shards {
-		s.mu.RLock()
-		for k, v := range s.data {
-			if !fn(k, v) {
-				s.mu.RUnlock()
-				return
-			}
-		}
-		s.mu.RUnlock()
+func (db *DB) getShard(key string) *shard {
+	return db.shards[hash(key)%numShards]
+}
+
+func hash(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
+}
+
+func (db *DB) log() *slog.Logger {
+	if db.opts.Logger != nil {
+		return db.opts.Logger
 	}
+	return noopLogger
 }

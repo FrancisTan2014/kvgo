@@ -3,6 +3,8 @@ package engine
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -54,74 +56,77 @@ func isReasonable(p compactionPolicy) bool {
 		p.MinInterval <= p.MaxInterval
 }
 
-func (db *DB) startCompactionWorker() {
-	if db.compactionWorker == nil || db.committer == nil {
+func (s *shard) startCompactionWorker() {
+	if s.compactionWorker == nil || s.committer == nil {
 		return
 	}
 
-	ticker := time.NewTicker(db.compactionWorker.policy.CheckEvery)
+	ticker := time.NewTicker(s.compactionWorker.policy.CheckEvery)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if db.shouldCompact() {
-				if err := db.compact(); err == nil {
-					db.compactionWorker.lastCompacted = time.Now()
+			if s.shouldCompact() {
+				if err := s.compact(); err == nil {
+					s.compactionWorker.lastCompacted = time.Now()
 				} else if err == ErrClosed {
 					return
 				} else {
 					// TODO: record/log the error; do NOT update lastCompacted.
 				}
 			}
-		case <-db.committer.stopCh:
+		case <-s.committer.stopCh:
 			return
 		}
 	}
 }
 
-func (db *DB) shouldCompact() bool {
-	if db.compactionWorker == nil {
+func (s *shard) shouldCompact() bool {
+	if s.compactionWorker == nil {
 		return false
 	}
-	policy := db.compactionWorker.policy
+	policy := s.compactionWorker.policy
 	now := time.Now()
-	last := db.compactionWorker.lastCompacted
+	last := s.compactionWorker.lastCompacted
 
 	// Rate limit: never compact too frequently.
 	if !last.IsZero() && now.Sub(last) < policy.MinInterval {
 		return false
 	}
 
-	bytesOnDisk := db.bytesOnDisk.Load()
-	if bytesOnDisk <= 0 {
+	actualIndexBytes := s.indexBytesOnDisk.Load()
+	if actualIndexBytes <= 0 {
 		return false
 	}
 
 	// Optional safety net: force compaction if it's been too long.
 	maxDue := !last.IsZero() && now.Sub(last) >= policy.MaxInterval
 
-	bytesInRAM := db.bytesInRAM.Load()
-	if bytesInRAM <= 0 {
+	// Expected index size = keys + overhead (16 bytes header per key)
+	keyBytes := s.keyBytesInRAM.Load()
+	numKeys := s.numKeys.Load()
+	if keyBytes <= 0 || numKeys <= 0 {
 		return maxDue
 	}
 
-	amp := float64(bytesOnDisk) / float64(bytesInRAM)
+	expectedIndexBytes := keyBytes + numKeys*walIndexHeaderBytes
+	amp := float64(actualIndexBytes) / float64(expectedIndexBytes)
 	ampDue := amp >= policy.AmpThreshold
 
 	return maxDue || ampDue
 }
 
-func (db *DB) compact() error {
-	db.stateMu.RLock()
-	if db.closed || db.committer == nil {
-		db.stateMu.RUnlock()
+func (s *shard) compact() error {
+	s.mu.RLock()
+	if s.committer == nil {
+		s.mu.RUnlock()
 		return ErrClosed
 	}
-	committer := db.committer
-	db.stateMu.RUnlock()
+	committer := s.committer
+	s.mu.RUnlock()
 
-	req := &compactRequest{doCompact: db.doCompact, err: make(chan error)}
+	req := &compactRequest{doCompact: s.doCompact, err: make(chan error)}
 	select {
 	case committer.compactCh <- req:
 		// ok
@@ -132,32 +137,43 @@ func (db *DB) compact() error {
 	return <-req.err
 }
 
-func (db *DB) doCompact() error {
-	wholeMap := db.snapshot()
-	tempPath := db.wal.path + ".compacting"
+func (s *shard) doCompact() error {
+	indices := s.snapshot()
 
-	// Step 1: Write the new data to a temp file.
-	if err := writeSnapshot(tempPath, wholeMap); err != nil {
+	// Skip compaction if there's no data to compact
+	if len(indices) == 0 {
+		return nil
+	}
+
+	indexFilePath := filepath.Join(s.wal.path, s.wal.indexFilename)
+	tempPath := indexFilePath + ".compacting"
+
+	// Step 1: Write compacted index to temp file.
+	if err := writeSnapshot(tempPath, indices); err != nil {
 		return err
 	}
 
-	// Step 2: Swap the WAL files.
-	// Windows does not allow renaming over an open file, so we close the live WAL
-	// and use a backup+rename strategy.
-	if err := db.wal.close(); err != nil {
+	// Step 2: Close index file only (value file stays open).
+	if err := s.wal.indexFile.Close(); err != nil {
 		return err
 	}
 
-	if err := replaceWALFile(db.wal.path, tempPath); err != nil {
-		// Best-effort recovery: try to reopen the old WAL to keep the DB usable.
-		if reopenErr := db.openWAL(); reopenErr != nil {
+	// Windows needs a moment to fully release the file handle
+	if runtime.GOOS == "windows" {
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Step 3: Swap the index file using backup+rename.
+	if err := replaceWALFile(indexFilePath, tempPath); err != nil {
+		// Best-effort recovery: reopen the old index file.
+		if reopenErr := s.reopenIndexFile(); reopenErr != nil {
 			return errors.Join(err, reopenErr)
 		}
 		return err
 	}
 
-	// Step 3: Open the new WAL and refresh on-disk stats.
-	return db.openWAL()
+	// Step 4: Reopen the new index file and refresh on-disk stats.
+	return s.reopenIndexFile()
 }
 
 // writeSnapshot creates/truncates path, writes data, and fsyncs it.
@@ -199,14 +215,13 @@ func replaceWALFile(livePath, newPath string) error {
 		return err
 	}
 
-	// Move Current -> Backup.
-	// If this fails, 'livePath' is still valid, so it's safe to abort.
-	if err := os.Rename(livePath, backupPath); err != nil && !os.IsNotExist(err) {
+	// Move Current -> Backup with retry on Windows (file handle release delay).
+	if err := retryRename(livePath, backupPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
 	// Move New -> Current. If this fails, attempt to restore Backup -> Current.
-	if err := os.Rename(newPath, livePath); err != nil {
+	if err := retryRename(newPath, livePath); err != nil {
 		_ = os.Rename(backupPath, livePath)
 		return err
 	}
@@ -216,40 +231,58 @@ func replaceWALFile(livePath, newPath string) error {
 	return nil
 }
 
-// openWAL reopens the WAL file for normal operation and refreshes bytesOnDisk.
-func (db *DB) openWAL() error {
-	wal, err := newWAL(db.wal.path)
+// retryRename retries os.Rename on Windows to handle file handle release delays.
+func retryRename(oldpath, newpath string) error {
+	var err error
+	maxRetries := 10
+
+	for i := 0; i < maxRetries; i++ {
+		err = os.Rename(oldpath, newpath)
+		if err == nil {
+			return nil
+		}
+
+		// Only retry on Windows for file access errors
+		if runtime.GOOS == "windows" && i < maxRetries-1 {
+			time.Sleep(time.Duration(20*(i+1)) * time.Millisecond)
+			continue
+		}
+		break
+	}
+	return err
+}
+
+// reopenIndexFile reopens just the index file after compaction and refreshes metrics.
+func (s *shard) reopenIndexFile() error {
+	indexPath := filepath.Join(s.wal.path, s.wal.indexFilename)
+	f, err := openFile(indexPath)
 	if err != nil {
 		return err
 	}
-	db.wal = wal
+	s.wal.indexFile = f
 
-	if info, err := wal.file.Stat(); err == nil {
-		db.bytesOnDisk.Store(info.Size())
+	if info, err := f.Stat(); err == nil {
+		s.indexBytesOnDisk.Store(info.Size())
 	} else {
 		// Avoid keeping a stale value if stat fails.
-		db.bytesOnDisk.Store(0)
+		s.indexBytesOnDisk.Store(0)
 	}
 	return nil
 }
 
 // snapshot is called from the group committer goroutine after a drain barrier,
 // so no map writers can run concurrently and no shard locks are needed.
-func (db *DB) snapshot() []byte {
+func (s *shard) snapshot() []byte {
 	total := 0
-	for _, s := range db.shards {
-		for k, v := range s.data {
-			total += walRecordLen(len(k), len(v))
-		}
+	for k, _ := range s.data {
+		total += walIndexLen(len(k))
 	}
 
 	// Allocate the final size up front, then encode sequentially.
 	buf := make([]byte, total)
 	offset := 0
-	for _, s := range db.shards {
-		for k, v := range s.data {
-			offset += encodeInto(buf[offset:], k, v)
-		}
+	for k, v := range s.data {
+		offset += encodeInto(buf[offset:], k, v.size, v.offset)
 	}
 	return buf[:offset]
 }
