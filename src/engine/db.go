@@ -38,6 +38,10 @@ type DB struct {
 	closeOnce sync.Once
 	closeErr  error
 
+	// FatalErr is closed when a critical error occurs (e.g., WAL write failure).
+	// Server should monitor this and initiate graceful shutdown.
+	FatalErr chan struct{}
+
 	opts Options
 }
 
@@ -53,9 +57,12 @@ func NewDBWithOptions(path string, opts Options, ctx context.Context) (*DB, erro
 	// Create root context for all shards - canceling this cancels all shard contexts
 	rootCtx, rootCancel := context.WithCancel(ctx)
 
+	// Create fatal error channel before shards (shared across all shards)
+	fatalErrCh := make(chan struct{})
+
 	shards := make([]*shard, numShards)
 	for i := range shards {
-		shards[i], err = newShard(path, i, opts.SyncInterval, rootCtx)
+		shards[i], err = newShard(path, i, opts.SyncInterval, rootCtx, fatalErrCh, opts.Logger)
 		if err != nil {
 			rootCancel()
 			return nil, err
@@ -63,10 +70,11 @@ func NewDBWithOptions(path string, opts Options, ctx context.Context) (*DB, erro
 	}
 
 	db := &DB{
-		shards: shards,
-		ctx:    rootCtx,
-		cancel: rootCancel,
-		opts:   opts,
+		shards:   shards,
+		ctx:      rootCtx,
+		cancel:   rootCancel,
+		FatalErr: fatalErrCh,
+		opts:     opts,
 	}
 
 	if err := db.replay(); err != nil {

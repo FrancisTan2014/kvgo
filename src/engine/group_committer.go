@@ -49,7 +49,26 @@ func newGroupCommitter(syncInterval time.Duration) *groupCommitter {
 }
 
 func (s *shard) startGroupCommitter() {
-	defer close(s.committer.doneCh)
+	defer func() {
+		if r := recover(); r != nil {
+			// Critical failure (WAL write): log and signal Server for graceful shutdown
+			if s.logger != nil {
+				s.logger.Error("FATAL: WAL write failed",
+					"panic", r,
+					"index_file", s.wal.indexFilename,
+					"value_file", s.wal.valueFilename,
+					"action", "signaling_server_for_shutdown",
+				)
+			}
+			// Signal fatal error to Server (close channel once)
+			select {
+			case <-s.fatalErrCh: // already closed
+			default:
+				close(s.fatalErrCh)
+			}
+		}
+		close(s.committer.doneCh)
+	}()
 
 	appendToBatch := func(r *writeRequest) {
 		s.committer.buf = append(s.committer.buf, r)
@@ -142,8 +161,7 @@ func (s *shard) flush(batch []*writeRequest) {
 
 	if err := s.wal.writeValue(valBuf); err != nil {
 		// Failing to fsync means we cannot guarantee durability.
-		// Crash-fast: terminate process, restart, replay WAL to recover.
-		// Corruption during fsync is the most likely error - replay will fix it.
+		// Panic propagates to Server layer for logging and graceful shutdown.
 		for _, r := range batch {
 			r.respCh <- fmt.Errorf("WAL write value failed: %w", err)
 		}
@@ -152,7 +170,7 @@ func (s *shard) flush(batch []*writeRequest) {
 
 	if err := s.wal.writeIndex(idxBuf); err != nil {
 		// Index write failed after value write succeeded.
-		// Crash-fast: on restart, values exist but aren't indexed yet - replay will fix.
+		// Panic propagates to Server layer for logging and graceful shutdown.
 		for _, r := range batch {
 			r.respCh <- fmt.Errorf("WAL write index failed: %w", err)
 		}
