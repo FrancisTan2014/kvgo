@@ -21,6 +21,7 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdPing] = (*Server).handlePing
 	s.requestHandlers[protocol.CmdPromote] = (*Server).handlePromote
 	s.requestHandlers[protocol.CmdReplicaOf] = (*Server).handleReplicaOf
+	s.requestHandlers[protocol.CmdCleanup] = (*Server).handleCleanup
 }
 
 func (s *Server) handleRequest(conn net.Conn) {

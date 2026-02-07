@@ -2,11 +2,13 @@ package engine
 
 import (
 	"errors"
+	"kvgo/platform"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
 )
+
+const compactingFileSuffix = ".compacting"
 
 type compactWorker struct {
 	lastCompacted time.Time
@@ -137,47 +139,43 @@ func (s *shard) compact() error {
 	return <-req.err
 }
 
+// doCompact rewrites the index file to remove deleted entries.
+// Called by group committer after draining writes. Value file unchanged.
 func (s *shard) doCompact() error {
 	indices := s.snapshot()
-
-	// Skip compaction if there's no data to compact
 	if len(indices) == 0 {
 		return nil
 	}
 
 	indexFilePath := filepath.Join(s.wal.path, s.wal.indexFilename)
-	tempPath := indexFilePath + ".compacting"
+	tempPath := indexFilePath + compactingFileSuffix
 
-	// Step 1: Write compacted index to temp file.
 	if err := writeSnapshot(tempPath, indices); err != nil {
 		return err
 	}
 
-	// Step 2: Close index file only (value file stays open).
 	if err := s.wal.indexFile.Close(); err != nil {
 		return err
 	}
 
-	// Windows needs a moment to fully release the file handle
-	if runtime.GOOS == "windows" {
+	if platform.IsWindows {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Step 3: Swap the index file using backup+rename.
 	if err := replaceWALFile(indexFilePath, tempPath); err != nil {
-		// Best-effort recovery: reopen the old index file.
+		if platform.IsWindows {
+			s.handleWindowsCompactionFailure(tempPath, err)
+		}
 		if reopenErr := s.reopenIndexFile(); reopenErr != nil {
 			return errors.Join(err, reopenErr)
 		}
 		return err
 	}
 
-	// Step 4: Reopen the new index file and refresh on-disk stats.
 	return s.reopenIndexFile()
 }
 
-// writeSnapshot creates/truncates path, writes data, and fsyncs it.
-// On failure, it best-effort removes the partially written file.
+// writeSnapshot writes data to path atomically. Removes partial file on error.
 func writeSnapshot(path string, data []byte) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -205,54 +203,7 @@ func writeSnapshot(path string, data []byte) (err error) {
 	return nil
 }
 
-// replaceWALFile replaces livePath with newPath using a backup+rename sequence.
-// On Windows this avoids renaming over an existing file.
-func replaceWALFile(livePath, newPath string) error {
-	backupPath := livePath + ".bak"
-
-	// Remove old backup if it exists.
-	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	// Move Current -> Backup with retry on Windows (file handle release delay).
-	if err := retryRename(livePath, backupPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	// Move New -> Current. If this fails, attempt to restore Backup -> Current.
-	if err := retryRename(newPath, livePath); err != nil {
-		_ = os.Rename(backupPath, livePath)
-		return err
-	}
-
-	// Cleanup backup (best effort).
-	_ = os.Remove(backupPath)
-	return nil
-}
-
-// retryRename retries os.Rename on Windows to handle file handle release delays.
-func retryRename(oldpath, newpath string) error {
-	var err error
-	maxRetries := 10
-
-	for i := 0; i < maxRetries; i++ {
-		err = os.Rename(oldpath, newpath)
-		if err == nil {
-			return nil
-		}
-
-		// Only retry on Windows for file access errors
-		if runtime.GOOS == "windows" && i < maxRetries-1 {
-			time.Sleep(time.Duration(20*(i+1)) * time.Millisecond)
-			continue
-		}
-		break
-	}
-	return err
-}
-
-// reopenIndexFile reopens just the index file after compaction and refreshes metrics.
+// reopenIndexFile reopens the index file and updates metrics.
 func (s *shard) reopenIndexFile() error {
 	indexPath := filepath.Join(s.wal.path, s.wal.indexFilename)
 	f, err := openFile(indexPath)
@@ -270,8 +221,41 @@ func (s *shard) reopenIndexFile() error {
 	return nil
 }
 
-// snapshot is called from the group committer goroutine after a drain barrier,
-// so no map writers can run concurrently and no shard locks are needed.
+// handleWindowsCompactionFailure logs file inventory and triggers shutdown.
+func (s *shard) handleWindowsCompactionFailure(tempPath string, err error) {
+	s.logger.Error("CRITICAL: Windows compaction file replacement failed - index may be inconsistent",
+		"error", err,
+		"shard_path", s.wal.path,
+		"action", "server_terminating")
+
+	entries, readErr := os.ReadDir(s.wal.path)
+	if readErr == nil {
+		s.logger.Error("Files present in shard directory for manual recovery",
+			"shard_path", s.wal.path,
+			"index_file", s.wal.indexFilename,
+			"temp_file", filepath.Base(tempPath))
+
+		for _, entry := range entries {
+			info, _ := entry.Info()
+			size := int64(0)
+			if info != nil {
+				size = info.Size()
+			}
+			s.logger.Error("  file_inventory",
+				"name", entry.Name(),
+				"size", size,
+				"is_dir", entry.IsDir())
+		}
+	}
+
+	s.logger.Error("Operator action required: manually inspect shard directory and restore consistent state")
+	s.logger.Error("Server terminating due to unrecoverable Windows compaction failure")
+
+	close(s.fatalErrCh)
+}
+
+// snapshot serializes all index entries to a compact byte slice.
+// Called by group committer with exclusive access to s.data.
 func (s *shard) snapshot() []byte {
 	total := 0
 	for k, _ := range s.data {

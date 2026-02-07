@@ -117,6 +117,9 @@ type Server struct {
 	backlogCtx    context.Context
 	backlogCancel context.CancelFunc
 
+	// Cleanup
+	cleanupInProgress atomic.Bool
+
 	// Persistence
 	metaFile *os.File
 }

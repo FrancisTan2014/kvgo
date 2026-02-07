@@ -10,6 +10,7 @@ import (
 
 // The "Systems" Test
 func TestDurability(t *testing.T) {
+	t.Parallel()
 	// 1. Setup: Use a temp directory for shard files
 	tmpDir, err := os.MkdirTemp("", "test_wal_*")
 	if err != nil {
@@ -55,6 +56,7 @@ func TestDurability(t *testing.T) {
 }
 
 func TestPut_EdgeCases(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_put_edges_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -105,6 +107,7 @@ func TestPut_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := db.Put(tt.key, tt.value)
 
 			if tt.wantErr && err == nil {
@@ -143,6 +146,7 @@ func TestPut_EdgeCases(t *testing.T) {
 }
 
 func TestClear(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_clear_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)

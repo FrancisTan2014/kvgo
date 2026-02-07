@@ -29,7 +29,7 @@ func main() {
 	defer conn.Close()
 
 	fmt.Printf("connected to %s\n", *addr)
-	fmt.Println("commands: get <key>, put <key> <value>, quit")
+	fmt.Println("commands: get <key>, put <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 	fmt.Println()
 
 	f := protocol.NewConnFramer(conn)
@@ -106,9 +106,18 @@ func main() {
 				}
 			}
 
+		case "cleanup":
+			if err := doCleanup(f, *timeout); err != nil {
+				fmt.Printf("error: %v\n", err)
+				if isConnectionError(err) {
+					fmt.Println("connection lost, exiting")
+					os.Exit(1)
+				}
+			}
+
 		default:
 			fmt.Printf("unknown command: %s\n", cmd)
-			fmt.Println("commands: get <key>, put <key> <value>, promote, replicaof <host:port>, quit")
+			fmt.Println("commands: get <key>, put <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 		}
 	}
 
@@ -239,6 +248,38 @@ func doReplicaOf(f *protocol.Framer, primaryAddr string, timeout time.Duration) 
 	switch resp.Status {
 	case protocol.StatusOK:
 		fmt.Println("OK")
+	case protocol.StatusError:
+		fmt.Println("(server error)")
+	default:
+		fmt.Printf("(unexpected status: %d)\n", resp.Status)
+	}
+	return nil
+}
+
+func doCleanup(f *protocol.Framer, timeout time.Duration) error {
+	req := protocol.Request{Cmd: protocol.CmdCleanup}
+	payload, err := protocol.EncodeRequest(req)
+	if err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+
+	if err := f.WriteWithTimeout(payload, timeout); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	respPayload, err := f.ReadWithTimeout(timeout)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	switch resp.Status {
+	case protocol.StatusOK:
+		fmt.Println("OK (cleanup started)")
 	case protocol.StatusError:
 		fmt.Println("(server error)")
 	default:

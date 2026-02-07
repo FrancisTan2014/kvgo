@@ -44,6 +44,7 @@ const (
 	CmdPing      Cmd = 4
 	CmdPromote   Cmd = 5
 	CmdReplicaOf Cmd = 6
+	CmdCleanup   Cmd = 7 // Background cleanup of orphaned values
 )
 
 type Status uint8
@@ -54,6 +55,7 @@ const (
 	StatusError      Status = 2
 	StatusPong       Status = 4
 	StatusFullResync Status = 5 // primary requires full resync
+	StatusCleaning   Status = 6 // shard cleanup in progress, writes temporarily rejected
 )
 
 type Request struct {
@@ -162,7 +164,7 @@ func EncodeRequest(req Request) ([]byte, error) {
 		copy(buf[requestKeyOff+u64Size:], req.Value) // replid follows seq
 		return buf, nil
 
-	case CmdPing, CmdPromote:
+	case CmdPing, CmdPromote, CmdCleanup:
 		buf := make([]byte, requestHeaderSize)
 		buf[requestCmdOff] = byte(req.Cmd)
 		putU32LE(buf, requestKLenOff, 0)
@@ -249,7 +251,7 @@ func DecodeRequest(payload []byte) (Request, error) {
 		val := append([]byte(nil), payload[requestHeaderSize:need]...)
 		return Request{Cmd: cmd, Value: val}, nil
 
-	case CmdPing, CmdPromote:
+	case CmdPing, CmdPromote, CmdCleanup:
 		// These requests carry no data
 		if klen != 0 || vlen != 0 {
 			return Request{}, ErrInvalidMessage

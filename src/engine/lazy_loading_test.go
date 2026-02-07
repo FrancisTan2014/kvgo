@@ -11,6 +11,7 @@ import (
 // TestLazyLoading verifies that values are NOT loaded into RAM during replay.
 // Only keys are loaded; values stay on disk until first Get.
 func TestLazyLoading(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_lazy_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -81,6 +82,7 @@ func TestLazyLoading(t *testing.T) {
 
 // TestValueCaching verifies that second Get doesn't hit disk.
 func TestValueCaching(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_cache_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -127,6 +129,7 @@ func TestValueCaching(t *testing.T) {
 
 // TestEmptyValueOptimization verifies empty values skip disk reads.
 func TestEmptyValueOptimization(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_empty_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -169,6 +172,7 @@ func TestEmptyValueOptimization(t *testing.T) {
 
 // TestSplitFileFormat verifies index and value files are separate.
 func TestSplitFileFormat(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_split_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -212,6 +216,7 @@ func TestSplitFileFormat(t *testing.T) {
 
 // TestMetricsAfterReplay verifies RAM metrics only include keys after replay.
 func TestMetricsAfterReplay(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_metrics_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -273,6 +278,7 @@ func TestMetricsAfterReplay(t *testing.T) {
 
 // TestUpdateWithLazyValue tests updating a key whose value hasn't been loaded yet.
 func TestUpdateWithLazyValue(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_update_lazy_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -327,6 +333,7 @@ func TestUpdateWithLazyValue(t *testing.T) {
 
 // TestCompactionWithLazyValues verifies compaction works with non-loaded values.
 func TestCompactionWithLazyValues(t *testing.T) {
+	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "test_compact_lazy_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
