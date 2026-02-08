@@ -12,9 +12,6 @@ func (s *Server) handleGet(ctx *RequestContext) error {
 
 	key := string(req.Key)
 	val, ok := s.db.Get(key)
-	if err != nil {
-		return err
-	}
 
 	var resp protocol.Response
 	if !ok {
