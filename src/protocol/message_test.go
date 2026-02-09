@@ -36,12 +36,8 @@ func TestRequest_Put_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestRequest_GetRejectsValue(t *testing.T) {
-	_, err := EncodeRequest(Request{Cmd: CmdGet, Key: []byte("k"), Value: []byte("v")})
-	if !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("expected ErrInvalidMessage, got %v", err)
-	}
-}
+// TestRequest_GetRejectsValue removed: uniform header design allows all fields,
+// application layer ignores unused fields based on command type
 
 func TestResponse_RoundTrip(t *testing.T) {
 	resp := Response{Status: StatusOK, Value: []byte("hello")}

@@ -17,23 +17,31 @@ const (
 	u32Size = 4
 	u64Size = 8
 
-	// Request payload: [cmd u8][klen u32][vlen u32][key][value]
-	// For CmdPut: [cmd u8][klen u32][vlen u32][seq u64][key][value]
-	requestHeaderSize    = u8Size + u32Size + u32Size
-	requestHeaderSizePut = requestHeaderSize + u64Size // includes seq
-	requestCmdOff        = 0
-	requestKLenOff       = requestCmdOff + u8Size
-	requestVLenOff       = requestKLenOff + u32Size
-	requestSeqOff        = requestVLenOff + u32Size // only for OpPut
-	requestKeyOff        = requestHeaderSize
-	requestKeyOffPut     = requestHeaderSizePut // key starts after seq for OpPut
+	// Uniform request header (all commands):
+	// [cmd u8][flags u8][seq u64][waitForSeq u64][klen u32][vlen u32][key][value]
+	requestHeaderSize = u8Size + u8Size + u64Size + u64Size + u32Size + u32Size // 26 bytes
+	requestCmdOff     = 0
+	requestFlagsOff   = requestCmdOff + u8Size       // 1
+	requestSeqOff     = requestFlagsOff + u8Size     // 2
+	requestWaitSeqOff = requestSeqOff + u64Size      // 10
+	requestKLenOff    = requestWaitSeqOff + u64Size  // 18
+	requestVLenOff    = requestKLenOff + u32Size     // 22
+	requestKeyOff     = requestHeaderSize            // 26
 
-	// Response payload: [status u8][vlen u32][value]
-	responseHeaderSize = u8Size + u32Size
+	// Response payload: [status u8][seq u64][vlen u32][value]
+	responseHeaderSize = u8Size + u64Size + u32Size // 13 bytes
 	responseStatusOff  = 0
-	responseVLenOff    = responseStatusOff + u8Size
-	responseValueOff   = responseHeaderSize
+	responseSeqOff     = responseStatusOff + u8Size // 1
+	responseVLenOff    = responseSeqOff + u64Size   // 9
+	responseValueOff   = responseHeaderSize         // 13
 )
+
+// Request flags indicate which optional fields are meaningful
+const (
+	FlagHasSeq        = 1 << 0 // seq field is meaningful (CmdPut, CmdReplicate)
+	FlagHasWaitForSeq = 1 << 1 // waitForSeq field is meaningful (CmdGet with strong read)
+)
+
 
 type Cmd uint8
 
@@ -75,8 +83,9 @@ type Request struct {
 	// - CmdReplicaOf: the target primary address (host:port format)
 	// - CmdReplicate: optionally contains replid for replica identification
 	// - Others: unused (must be empty)
-	Value []byte
-	Seq   uint64 // sequence number for replication (used by CmdPut and CmdReplicate)
+	Value      []byte
+	Seq        uint64 // Sequence number (meaningful if FlagHasSeq set: CmdPut, CmdReplicate)
+	WaitForSeq uint64 // Wait for replication (meaningful if FlagHasWaitForSeq set: CmdGet strong read; 0 = eventual)
 }
 
 type Response struct {
@@ -88,6 +97,7 @@ type Response struct {
 	// - StatusFullResync: the full database snapshot for replica resync
 	// - Others: unused (must be empty)
 	Value []byte
+	Seq   uint64 // Sequence number at time of response (for tracking replication lag)
 }
 
 func lenFromU32(u uint32) (int, bool) {
@@ -116,23 +126,13 @@ func putU64LE(buf []byte, off int, v uint64) {
 
 // EncodeRequest encodes a Request into a payload (without the outer frameLen).
 //
-// Request payload formats by command:
+// Uniform request format (all commands):
 //
-// Standard format (CmdGet, CmdReplicaOf):
+//	[cmd uint8][flags uint8][seq uint64 LE][waitForSeq uint64 LE][klen uint32 LE][vlen uint32 LE][key bytes][value bytes]
 //
-//	[cmd uint8][klen uint32 LE][vlen uint32 LE][key bytes][value bytes]
-//
-// CmdPut with sequence number for replication:
-//
-//	[cmd uint8][klen uint32 LE][vlen uint32 LE][seq uint64 LE][key bytes][value bytes]
-//
-// CmdReplicate with sequence number and optional replid:
-//
-//	[cmd uint8][klen=0 uint32 LE][vlen uint32 LE][seq uint64 LE][replid bytes]
-//
-// Command-only (CmdPing, CmdPromote, CmdCleanup):
-//
-//	[cmd uint8][klen=0 uint32 LE][vlen=0 uint32 LE]
+// Flags indicate which fields are meaningful:
+//   - FlagHasSeq: seq field is used (CmdPut, CmdReplicate)
+//   - FlagHasWaitForSeq: waitForSeq field is used (CmdGet with strong consistency)
 func EncodeRequest(req Request) ([]byte, error) {
 	klen := len(req.Key)
 	if err := ensureU32Len(klen); err != nil {
@@ -143,61 +143,29 @@ func EncodeRequest(req Request) ([]byte, error) {
 		return nil, err
 	}
 
+	// Determine flags based on command and fields
+	var flags uint8
 	switch req.Cmd {
+	case CmdPut, CmdReplicate:
+		flags |= FlagHasSeq
 	case CmdGet:
-		if vlen != 0 {
-			return nil, ErrInvalidMessage
+		if req.WaitForSeq > 0 {
+			flags |= FlagHasWaitForSeq
 		}
-		buf := make([]byte, requestHeaderSize+klen)
-		buf[requestCmdOff] = byte(req.Cmd)
-		putU32LE(buf, requestKLenOff, klen)
-		putU32LE(buf, requestVLenOff, 0)
-		copy(buf[requestKeyOff:], req.Key)
-		return buf, nil
-
-	case CmdPut:
-		buf := make([]byte, requestHeaderSizePut+klen+vlen)
-		buf[requestCmdOff] = byte(req.Cmd)
-		putU32LE(buf, requestKLenOff, klen)
-		putU32LE(buf, requestVLenOff, vlen)
-		putU64LE(buf, requestSeqOff, req.Seq)
-		copy(buf[requestKeyOffPut:requestKeyOffPut+klen], req.Key)
-		copy(buf[requestKeyOffPut+klen:], req.Value)
-		return buf, nil
-
-	case CmdReplicate:
-		// Replicate carries seq (replica's last applied seq) and optionally replid in Value.
-		if klen != 0 {
-			return nil, ErrInvalidMessage
-		}
-		buf := make([]byte, requestHeaderSize+u64Size+vlen)
-		buf[requestCmdOff] = byte(req.Cmd)
-		putU32LE(buf, requestKLenOff, 0)
-		putU32LE(buf, requestVLenOff, vlen)
-		putU64LE(buf, requestKeyOff, req.Seq)        // seq follows header
-		copy(buf[requestKeyOff+u64Size:], req.Value) // replid follows seq
-		return buf, nil
-
-	case CmdPing, CmdPromote, CmdCleanup:
-		buf := make([]byte, requestHeaderSize)
-		buf[requestCmdOff] = byte(req.Cmd)
-		putU32LE(buf, requestKLenOff, 0)
-		putU32LE(buf, requestVLenOff, 0)
-		return buf, nil
-
-	case CmdReplicaOf:
-		// To make the protocol simple, we reuse the `Value` field here
-		buf := make([]byte, requestHeaderSize+vlen)
-		buf[requestCmdOff] = byte(req.Cmd)
-		putU32LE(buf, requestKLenOff, klen)
-		putU32LE(buf, requestVLenOff, vlen)
-		copy(buf[requestKeyOff:], req.Key)
-		copy(buf[requestHeaderSize+klen:], req.Value)
-		return buf, nil
-
-	default:
-		return nil, ErrUnknownCmd
 	}
+
+	// Uniform header for all commands
+	buf := make([]byte, requestHeaderSize+klen+vlen)
+	buf[requestCmdOff] = byte(req.Cmd)
+	buf[requestFlagsOff] = flags
+	putU64LE(buf, requestSeqOff, req.Seq)
+	putU64LE(buf, requestWaitSeqOff, req.WaitForSeq)
+	putU32LE(buf, requestKLenOff, klen)
+	putU32LE(buf, requestVLenOff, vlen)
+	copy(buf[requestKeyOff:], req.Key)
+	copy(buf[requestKeyOff+klen:], req.Value)
+
+	return buf, nil
 }
 
 // DecodeRequest decodes a payload (without the outer frameLen) into a Request.
@@ -208,8 +176,12 @@ func DecodeRequest(payload []byte) (Request, error) {
 	}
 
 	cmd := Cmd(payload[requestCmdOff])
+	flags := payload[requestFlagsOff]
+	seq := binary.LittleEndian.Uint64(payload[requestSeqOff : requestSeqOff+u64Size])
+	waitForSeq := binary.LittleEndian.Uint64(payload[requestWaitSeqOff : requestWaitSeqOff+u64Size])
 	kU32 := binary.LittleEndian.Uint32(payload[requestKLenOff : requestKLenOff+u32Size])
 	vU32 := binary.LittleEndian.Uint32(payload[requestVLenOff : requestVLenOff+u32Size])
+	
 	klen, ok := lenFromU32(kU32)
 	if !ok {
 		return Request{}, ErrInvalidMessage
@@ -219,73 +191,38 @@ func DecodeRequest(payload []byte) (Request, error) {
 		return Request{}, ErrInvalidMessage
 	}
 
-	switch cmd {
-	case CmdGet:
-		if vlen != 0 {
-			return Request{}, ErrInvalidMessage
-		}
-		need := requestHeaderSize + klen
-		if len(payload) != need {
-			return Request{}, ErrInvalidMessage
-		}
-		key := append([]byte(nil), payload[requestKeyOff:requestKeyOff+klen]...)
-		return Request{Cmd: cmd, Key: key}, nil
-
-	case CmdPut:
-		need := requestHeaderSizePut + klen + vlen
-		if len(payload) != need {
-			return Request{}, ErrInvalidMessage
-		}
-		seq := binary.LittleEndian.Uint64(payload[requestSeqOff : requestSeqOff+u64Size])
-		key := append([]byte(nil), payload[requestKeyOffPut:requestKeyOffPut+klen]...)
-		val := append([]byte(nil), payload[requestKeyOffPut+klen:need]...)
-		return Request{Cmd: cmd, Key: key, Value: val, Seq: seq}, nil
-
-	case CmdReplicate:
-		// Replicate carries seq and optionally replid in Value.
-		if klen != 0 {
-			return Request{}, ErrInvalidMessage
-		}
-		need := requestHeaderSize + u64Size + vlen
-		if len(payload) != need {
-			return Request{}, ErrInvalidMessage
-		}
-		seq := binary.LittleEndian.Uint64(payload[requestKeyOff : requestKeyOff+u64Size])
-		val := append([]byte(nil), payload[requestKeyOff+u64Size:need]...)
-		return Request{Cmd: cmd, Value: val, Seq: seq}, nil
-
-	case CmdReplicaOf:
-		if klen != 0 {
-			return Request{}, ErrInvalidMessage
-		}
-		need := requestHeaderSize + vlen
-		if len(payload) != need {
-			return Request{}, ErrInvalidMessage
-		}
-		val := append([]byte(nil), payload[requestHeaderSize:need]...)
-		return Request{Cmd: cmd, Value: val}, nil
-
-	case CmdPing, CmdPromote, CmdCleanup:
-		// These requests carry no data
-		if klen != 0 || vlen != 0 {
-			return Request{}, ErrInvalidMessage
-		}
-		if len(payload) != requestHeaderSize {
-			return Request{}, ErrInvalidMessage
-		}
-		return Request{Cmd: cmd}, nil
-
-	default:
-		return Request{}, ErrUnknownCmd
+	need := requestHeaderSize + klen + vlen
+	if len(payload) != need {
+		return Request{}, ErrInvalidMessage
 	}
+
+	key := append([]byte(nil), payload[requestKeyOff:requestKeyOff+klen]...)
+	val := append([]byte(nil), payload[requestKeyOff+klen:need]...)
+
+	req := Request{
+		Cmd:   cmd,
+		Key:   key,
+		Value: val,
+	}
+
+	// Apply flags: only set fields if flag indicates they're meaningful
+	if flags&FlagHasSeq != 0 {
+		req.Seq = seq
+	}
+	if flags&FlagHasWaitForSeq != 0 {
+		req.WaitForSeq = waitForSeq
+	}
+
+	return req, nil
 }
 
 // EncodeResponse encodes a Response into a payload (without the outer frameLen).
 //
-// Response payload format:
+// Uniform response format:
 //
-//	[status uint8][vlen uint32 LE][value bytes]
+//	[status uint8][seq uint64 LE][vlen uint32 LE][value bytes]
 //
+// The seq field indicates the server's sequence number at time of response (for replication tracking).
 // The value field is optional and used only for:
 //   - StatusOK: Retrieved value from GET operations
 //   - StatusReadOnly: Primary server address for redirect (host:port)
@@ -297,7 +234,7 @@ func EncodeResponse(resp Response) ([]byte, error) {
 	}
 
 	switch resp.Status {
-	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync:
+	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync, StatusCleaning:
 		// ok
 	default:
 		return nil, ErrUnknownStatus
@@ -313,6 +250,7 @@ func EncodeResponse(resp Response) ([]byte, error) {
 
 	buf := make([]byte, responseHeaderSize+vlen)
 	buf[responseStatusOff] = byte(resp.Status)
+	putU64LE(buf, responseSeqOff, resp.Seq)
 	putU32LE(buf, responseVLenOff, vlen)
 	copy(buf[responseValueOff:], resp.Value)
 	return buf, nil
@@ -325,6 +263,7 @@ func DecodeResponse(payload []byte) (Response, error) {
 		return Response{}, ErrInvalidMessage
 	}
 	st := Status(payload[responseStatusOff])
+	seq := binary.LittleEndian.Uint64(payload[responseSeqOff : responseSeqOff+u64Size])
 	vU32 := binary.LittleEndian.Uint32(payload[responseVLenOff : responseVLenOff+u32Size])
 	vlen, ok := lenFromU32(vU32)
 	if !ok {
@@ -336,7 +275,7 @@ func DecodeResponse(payload []byte) (Response, error) {
 	}
 
 	switch st {
-	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync:
+	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync, StatusCleaning:
 		// ok
 	default:
 		return Response{}, ErrUnknownStatus
@@ -351,5 +290,5 @@ func DecodeResponse(payload []byte) (Response, error) {
 	}
 
 	val := append([]byte(nil), payload[responseValueOff:need]...)
-	return Response{Status: st, Value: val}, nil
+	return Response{Status: st, Seq: seq, Value: val}, nil
 }
