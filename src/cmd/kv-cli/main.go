@@ -216,6 +216,51 @@ func doPut(f *protocol.Framer, key, value string, timeout time.Duration) error {
 	switch resp.Status {
 	case protocol.StatusOK:
 		fmt.Println("OK")
+	case protocol.StatusReadOnly:
+		// Server is a replica, redirect to primary
+		primaryAddr := string(resp.Value)
+		fmt.Printf("(replica, redirecting to primary: %s)\n", primaryAddr)
+		return doPutToPrimary(key, value, primaryAddr, timeout)
+	case protocol.StatusError:
+		fmt.Println("(server error)")
+	default:
+		fmt.Printf("(unexpected status: %d)\n", resp.Status)
+	}
+	return nil
+}
+
+func doPutToPrimary(key, value, primaryAddr string, timeout time.Duration) error {
+	// Connect to primary and retry
+	conn, err := net.DialTimeout("tcp", primaryAddr, timeout)
+	if err != nil {
+		return fmt.Errorf("connect to primary: %w", err)
+	}
+	defer conn.Close()
+
+	f := protocol.NewConnFramer(conn)
+	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value)}
+	payload, err := protocol.EncodeRequest(req)
+	if err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+
+	if err := f.WriteWithTimeout(payload, timeout); err != nil {
+		return fmt.Errorf("write to primary: %w", err)
+	}
+
+	respPayload, err := f.ReadWithTimeout(timeout)
+	if err != nil {
+		return fmt.Errorf("read from primary: %w", err)
+	}
+
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	switch resp.Status {
+	case protocol.StatusOK:
+		fmt.Println("OK")
 	case protocol.StatusError:
 		fmt.Println("(server error)")
 	default:

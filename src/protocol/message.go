@@ -38,50 +38,56 @@ const (
 type Cmd uint8
 
 const (
-	CmdGet       Cmd = 1
-	CmdPut       Cmd = 2
-	CmdReplicate Cmd = 3
-	CmdPing      Cmd = 4
-	CmdPromote   Cmd = 5
-	CmdReplicaOf Cmd = 6
-	CmdCleanup   Cmd = 7 // Background cleanup of orphaned values
+	CmdGet       Cmd = 1 // Retrieve value by key
+	CmdPut       Cmd = 2 // Store key-value pair
+	CmdReplicate Cmd = 3 // Establish replication connection
+	CmdPing      Cmd = 4 // Health check
+	CmdPromote   Cmd = 5 // Promote replica to primary
+	CmdReplicaOf Cmd = 6 // Configure as replica of primary
+	CmdCleanup   Cmd = 7 // Trigger value file compaction
 )
 
 type Status uint8
 
 const (
-	StatusOK         Status = 0
-	StatusNotFound   Status = 1
-	StatusError      Status = 2
-	StatusPong       Status = 4
-	StatusFullResync Status = 5 // primary requires full resync
-	StatusCleaning   Status = 6 // shard cleanup in progress, writes temporarily rejected
+	StatusOK         Status = 0 // Success
+	StatusNotFound   Status = 1 // Key not found (GET)
+	StatusError      Status = 2 // Generic server error
+	StatusReadOnly   Status = 3 // Replica cannot accept writes; Value contains primary address
+	StatusPong       Status = 4 // Response to PING
+	StatusFullResync Status = 5 // Primary requires full resync; Value contains snapshot
+	StatusCleaning   Status = 6 // Cleanup in progress, writes temporarily rejected
 )
 
 type Request struct {
 	Cmd Cmd
-	// Key contains the indicator.
+	// Key contains the request identifier/parameter.
 	//
-	// - CmdPut: the key to store in the database.
-	//
-	// - CmdGet: the key to retrieve from the database.
-	//
-	// - CmdReplicaOf: the current replid of the replica
+	// - CmdGet: the key to retrieve from the database
+	// - CmdPut: the key to store in the database
+	// - CmdReplicaOf: unused (must be empty)
+	// - CmdReplicate: unused (must be empty)
+	// - CmdPing, CmdPromote, CmdCleanup: unused (must be empty)
 	Key []byte
 	// Value contains the payload data.
 	//
-	// - CmdPut: the value to store in the database.
-	//
-	// - CmdReplicaOf: the target primary address (host:port format).
-	//
-	// - Others: unused (must be empty).
+	// - CmdPut: the value to store in the database
+	// - CmdReplicaOf: the target primary address (host:port format)
+	// - CmdReplicate: optionally contains replid for replica identification
+	// - Others: unused (must be empty)
 	Value []byte
-	Seq   uint64 // sequence number for replication (only for CmdPut)
+	Seq   uint64 // sequence number for replication (used by CmdPut and CmdReplicate)
 }
 
 type Response struct {
 	Status Status
-	Value  []byte
+	// Value contains the response payload.
+	//
+	// - StatusOK (for CmdGet): the retrieved value
+	// - StatusReadOnly: the primary server address (host:port) for client redirect
+	// - StatusFullResync: the full database snapshot for replica resync
+	// - Others: unused (must be empty)
+	Value []byte
 }
 
 func lenFromU32(u uint32) (int, bool) {
@@ -110,15 +116,23 @@ func putU64LE(buf []byte, off int, v uint64) {
 
 // EncodeRequest encodes a Request into a payload (without the outer frameLen).
 //
-// Request payload format:
+// Request payload formats by command:
+//
+// Standard format (CmdGet, CmdReplicaOf):
 //
 //	[cmd uint8][klen uint32 LE][vlen uint32 LE][key bytes][value bytes]
 //
-// For CmdPut, includes seq for replication:
+// CmdPut with sequence number for replication:
 //
 //	[cmd uint8][klen uint32 LE][vlen uint32 LE][seq uint64 LE][key bytes][value bytes]
 //
-// For CmdGet, vlen must be 0 and value bytes must be omitted.
+// CmdReplicate with sequence number and optional replid:
+//
+//	[cmd uint8][klen=0 uint32 LE][vlen uint32 LE][seq uint64 LE][replid bytes]
+//
+// Command-only (CmdPing, CmdPromote, CmdCleanup):
+//
+//	[cmd uint8][klen=0 uint32 LE][vlen=0 uint32 LE]
 func EncodeRequest(req Request) ([]byte, error) {
 	klen := len(req.Key)
 	if err := ensureU32Len(klen); err != nil {
@@ -268,9 +282,14 @@ func DecodeRequest(payload []byte) (Request, error) {
 
 // EncodeResponse encodes a Response into a payload (without the outer frameLen).
 //
-// Response payload format (minimal):
+// Response payload format:
 //
 //	[status uint8][vlen uint32 LE][value bytes]
+//
+// The value field is optional and used only for:
+//   - StatusOK: Retrieved value from GET operations
+//   - StatusReadOnly: Primary server address for redirect (host:port)
+//   - StatusFullResync: Full database snapshot for replica resync
 func EncodeResponse(resp Response) ([]byte, error) {
 	vlen := len(resp.Value)
 	if err := ensureU32Len(vlen); err != nil {
@@ -278,14 +297,17 @@ func EncodeResponse(resp Response) ([]byte, error) {
 	}
 
 	switch resp.Status {
-	case StatusOK, StatusNotFound, StatusError, StatusPong, StatusFullResync:
+	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync:
 		// ok
 	default:
 		return nil, ErrUnknownStatus
 	}
 
-	// Minimal format from 007: OK and FullResync responses may carry a value.
-	if resp.Status != StatusOK && resp.Status != StatusFullResync && vlen != 0 {
+	// Response payload carries value only for specific status codes:
+	// - StatusOK: GET responses contain the retrieved value
+	// - StatusReadOnly: Replica rejection contains primary address for redirect
+	// - StatusFullResync: Full resync responses contain database snapshot
+	if resp.Status != StatusOK && resp.Status != StatusFullResync && resp.Status != StatusReadOnly && vlen != 0 {
 		return nil, ErrInvalidMessage
 	}
 
@@ -314,14 +336,17 @@ func DecodeResponse(payload []byte) (Response, error) {
 	}
 
 	switch st {
-	case StatusOK, StatusNotFound, StatusError, StatusPong, StatusFullResync:
+	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync:
 		// ok
 	default:
 		return Response{}, ErrUnknownStatus
 	}
 
-	// Minimal format from 007: OK and FullResync responses may carry a value.
-	if st != StatusOK && st != StatusFullResync && vlen != 0 {
+	// Response payload carries value only for specific status codes:
+	// - StatusOK: GET responses contain the retrieved value
+	// - StatusReadOnly: Replica rejection contains primary address for redirect
+	// - StatusFullResync: Full resync responses contain database snapshot
+	if st != StatusOK && st != StatusFullResync && st != StatusReadOnly && vlen != 0 {
 		return Response{}, ErrInvalidMessage
 	}
 
