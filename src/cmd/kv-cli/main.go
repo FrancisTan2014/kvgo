@@ -29,11 +29,14 @@ func main() {
 	defer conn.Close()
 
 	fmt.Printf("connected to %s\n", *addr)
-	fmt.Println("commands: get <key>, put <key> <value>, promote, replicaof <host:port>, cleanup, quit")
+	fmt.Println("commands: get [--strong] <key>, put <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 	fmt.Println()
 
 	f := protocol.NewConnFramer(conn)
 	scanner := bufio.NewScanner(os.Stdin)
+
+	// Track last sequence number from PUT for read-your-writes guarantee
+	var lastSeq uint64
 
 	for {
 		fmt.Print("> ")
@@ -56,11 +59,36 @@ func main() {
 
 		case "get":
 			if len(parts) < 2 {
-				fmt.Println("usage: get <key>")
+				fmt.Println("usage: get [--strong] <key>")
 				continue
 			}
-			key := parts[1]
-			if err := doGet(f, key, *timeout); err != nil {
+			// Parse flags: get --strong key OR get key --strong
+			var strong bool
+			var key string
+			if parts[1] == "--strong" {
+				if len(parts) < 3 {
+					fmt.Println("usage: get [--strong] <key>")
+					continue
+				}
+				strong = true
+				key = parts[2]
+			} else {
+				key = parts[1]
+				if len(parts) > 2 && parts[2] == "--strong" {
+					strong = true
+				}
+			}
+			
+			var waitForSeq uint64
+			if strong {
+				if lastSeq == 0 {
+					fmt.Println("(no writes in this session, --strong has no effect)")
+				} else {
+					waitForSeq = lastSeq
+				}
+			}
+			
+			if err := doGet(f, key, waitForSeq, *timeout); err != nil {
 				fmt.Printf("error: %v\n", err)
 				if isConnectionError(err) {
 					fmt.Println("connection lost, exiting")
@@ -75,12 +103,15 @@ func main() {
 			}
 			key := parts[1]
 			value := parts[2]
-			if err := doPut(f, key, value, *timeout); err != nil {
+			seq, err := doPut(f, key, value, *timeout)
+			if err != nil {
 				fmt.Printf("error: %v\n", err)
 				if isConnectionError(err) {
 					fmt.Println("connection lost, exiting")
 					os.Exit(1)
 				}
+			} else if seq > 0 {
+				lastSeq = seq // Track for read-your-writes
 			}
 
 		case "promote":
@@ -117,7 +148,7 @@ func main() {
 
 		default:
 			fmt.Printf("unknown command: %s\n", cmd)
-			fmt.Println("commands: get <key>, put <key> <value>, promote, replicaof <host:port>, cleanup, quit")
+			fmt.Println("commands: get [--strong] <key>, put <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 		}
 	}
 
@@ -158,8 +189,8 @@ func doPromote(f *protocol.Framer, timeout time.Duration) error {
 	return nil
 }
 
-func doGet(f *protocol.Framer, key string, timeout time.Duration) error {
-	req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key)}
+func doGet(f *protocol.Framer, key string, waitForSeq uint64, timeout time.Duration) error {
+	req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key), WaitForSeq: waitForSeq}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -182,8 +213,18 @@ func doGet(f *protocol.Framer, key string, timeout time.Duration) error {
 	switch resp.Status {
 	case protocol.StatusOK:
 		fmt.Printf("%s\n", resp.Value)
+		if waitForSeq > 0 {
+			fmt.Printf("(strong read: waited for seq=%d, replica at seq=%d)\n", waitForSeq, resp.Seq)
+		}
 	case protocol.StatusNotFound:
 		fmt.Println("(not found)")
+		if waitForSeq > 0 {
+			fmt.Printf("(strong read: waited for seq=%d, replica at seq=%d)\n", waitForSeq, resp.Seq)
+		}
+	case protocol.StatusReadOnly:
+		// Strong read timed out, server suggests redirect to primary
+		primaryAddr := string(resp.Value)
+		fmt.Printf("(replica lagging, try primary: %s)\n", primaryAddr)
 	case protocol.StatusError:
 		fmt.Println("(server error)")
 	default:
@@ -192,30 +233,31 @@ func doGet(f *protocol.Framer, key string, timeout time.Duration) error {
 	return nil
 }
 
-func doPut(f *protocol.Framer, key, value string, timeout time.Duration) error {
+func doPut(f *protocol.Framer, key, value string, timeout time.Duration) (uint64, error) {
 	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
-		return fmt.Errorf("encode: %w", err)
+		return 0, fmt.Errorf("encode: %w", err)
 	}
 
 	if err := f.WriteWithTimeout(payload, timeout); err != nil {
-		return fmt.Errorf("write: %w", err)
+		return 0, fmt.Errorf("write: %w", err)
 	}
 
 	respPayload, err := f.ReadWithTimeout(timeout)
 	if err != nil {
-		return fmt.Errorf("read: %w", err)
+		return 0, fmt.Errorf("read: %w", err)
 	}
 
 	resp, err := protocol.DecodeResponse(respPayload)
 	if err != nil {
-		return fmt.Errorf("decode: %w", err)
+		return 0, fmt.Errorf("decode: %w", err)
 	}
 
 	switch resp.Status {
 	case protocol.StatusOK:
 		fmt.Println("OK")
+		return resp.Seq, nil // Return seq for read-your-writes tracking
 	case protocol.StatusReadOnly:
 		// Server is a replica, redirect to primary
 		primaryAddr := string(resp.Value)
@@ -226,14 +268,14 @@ func doPut(f *protocol.Framer, key, value string, timeout time.Duration) error {
 	default:
 		fmt.Printf("(unexpected status: %d)\n", resp.Status)
 	}
-	return nil
+	return 0, nil
 }
 
-func doPutToPrimary(key, value, primaryAddr string, timeout time.Duration) error {
+func doPutToPrimary(key, value, primaryAddr string, timeout time.Duration) (uint64, error) {
 	// Connect to primary and retry
 	conn, err := net.DialTimeout("tcp", primaryAddr, timeout)
 	if err != nil {
-		return fmt.Errorf("connect to primary: %w", err)
+		return 0, fmt.Errorf("connect to primary: %w", err)
 	}
 	defer conn.Close()
 
@@ -241,32 +283,33 @@ func doPutToPrimary(key, value, primaryAddr string, timeout time.Duration) error
 	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
-		return fmt.Errorf("encode: %w", err)
+		return 0, fmt.Errorf("encode: %w", err)
 	}
 
 	if err := f.WriteWithTimeout(payload, timeout); err != nil {
-		return fmt.Errorf("write to primary: %w", err)
+		return 0, fmt.Errorf("write to primary: %w", err)
 	}
 
 	respPayload, err := f.ReadWithTimeout(timeout)
 	if err != nil {
-		return fmt.Errorf("read from primary: %w", err)
+		return 0, fmt.Errorf("read from primary: %w", err)
 	}
 
 	resp, err := protocol.DecodeResponse(respPayload)
 	if err != nil {
-		return fmt.Errorf("decode: %w", err)
+		return 0, fmt.Errorf("decode: %w", err)
 	}
 
 	switch resp.Status {
 	case protocol.StatusOK:
 		fmt.Println("OK")
+		return resp.Seq, nil // Return seq from primary
 	case protocol.StatusError:
 		fmt.Println("(server error)")
 	default:
 		fmt.Printf("(unexpected status: %d)\n", resp.Status)
 	}
-	return nil
+	return 0, nil
 }
 
 func doReplicaOf(f *protocol.Framer, primaryAddr string, timeout time.Duration) error {

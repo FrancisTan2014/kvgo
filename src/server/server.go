@@ -69,6 +69,8 @@ type Options struct {
 	BacklogSizeLimit    int64         // default 16MB
 	BacklogTrimDuration time.Duration // default 100ms
 
+	StrongReadTimeout time.Duration // default 100ms, how long to wait for replica to catch up
+
 	// SyncInterval controls how often the WAL is fsynced (latency vs throughput tradeoff).
 	// Lower values reduce latency but increase fsync overhead.
 	// Zero means use engine.DefaultSyncInterval (100ms).
@@ -138,6 +140,15 @@ func NewServer(opts Options) (*Server, error) {
 		// Default to protocol DefaultMaxFrameSize, but keep it local to avoid
 		// pulling protocol into the server config.
 		opts.MaxFrameSize = 16 << 20
+	}
+	if opts.BacklogSizeLimit <= 0 {
+		opts.BacklogSizeLimit = 16 << 20 // 16MB
+	}
+	if opts.BacklogTrimDuration <= 0 {
+		opts.BacklogTrimDuration = 100 * time.Millisecond
+	}
+	if opts.StrongReadTimeout <= 0 {
+		opts.StrongReadTimeout = 100 * time.Millisecond
 	}
 
 	isReplica := opts.ReplicaOf != ""
