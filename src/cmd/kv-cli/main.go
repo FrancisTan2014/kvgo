@@ -29,7 +29,7 @@ func main() {
 	defer conn.Close()
 
 	fmt.Printf("connected to %s\n", *addr)
-	fmt.Println("commands: get [--strong] <key>, put <key> <value>, promote, replicaof <host:port>, cleanup, quit")
+	fmt.Println("commands: get [--strong] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 	fmt.Println()
 
 	f := protocol.NewConnFramer(conn)
@@ -98,12 +98,36 @@ func main() {
 
 		case "put":
 			if len(parts) < 3 {
-				fmt.Println("usage: put <key> <value>")
+				fmt.Println("usage: put [--quorum] <key> <value>")
 				continue
 			}
-			key := parts[1]
-			value := parts[2]
-			seq, err := doPut(f, key, value, *timeout)
+			// Parse flags: put --quorum key value OR put key value --quorum
+			var quorum bool
+			var key, value string
+			if parts[1] == "--quorum" {
+				if len(parts) < 3 {
+					fmt.Println("usage: put [--quorum] <key> <value>")
+					continue
+				}
+				quorum = true
+				// Reparse with 4 parts to get key and value
+				restParts := strings.SplitN(line, " ", 4)
+				if len(restParts) < 4 {
+					fmt.Println("usage: put [--quorum] <key> <value>")
+					continue
+				}
+				key = restParts[2]
+				value = restParts[3]
+			} else {
+				key = parts[1]
+				value = parts[2]
+				// Check for trailing --quorum flag
+				restParts := strings.SplitN(line, " ", 4)
+				if len(restParts) > 3 && restParts[3] == "--quorum" {
+					quorum = true
+				}
+			}
+			seq, err := doPut(f, key, value, quorum, *timeout)
 			if err != nil {
 				fmt.Printf("error: %v\n", err)
 				if isConnectionError(err) {
@@ -148,7 +172,7 @@ func main() {
 
 		default:
 			fmt.Printf("unknown command: %s\n", cmd)
-			fmt.Println("commands: get [--strong] <key>, put <key> <value>, promote, replicaof <host:port>, cleanup, quit")
+			fmt.Println("commands: get [--strong] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 		}
 	}
 
@@ -233,8 +257,8 @@ func doGet(f *protocol.Framer, key string, waitForSeq uint64, timeout time.Durat
 	return nil
 }
 
-func doPut(f *protocol.Framer, key, value string, timeout time.Duration) (uint64, error) {
-	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value)}
+func doPut(f *protocol.Framer, key, value string, quorum bool, timeout time.Duration) (uint64, error) {
+	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value), RequireQuorum: quorum}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return 0, fmt.Errorf("encode: %w", err)
@@ -256,13 +280,17 @@ func doPut(f *protocol.Framer, key, value string, timeout time.Duration) (uint64
 
 	switch resp.Status {
 	case protocol.StatusOK:
-		fmt.Println("OK")
+		if quorum {
+			fmt.Println("OK (quorum write succeeded)")
+		} else {
+			fmt.Println("OK")
+		}
 		return resp.Seq, nil // Return seq for read-your-writes tracking
 	case protocol.StatusReadOnly:
 		// Server is a replica, redirect to primary
 		primaryAddr := string(resp.Value)
 		fmt.Printf("(replica, redirecting to primary: %s)\n", primaryAddr)
-		return doPutToPrimary(key, value, primaryAddr, timeout)
+		return doPutToPrimary(key, value, quorum, primaryAddr, timeout)
 	case protocol.StatusError:
 		fmt.Println("(server error)")
 	default:
@@ -271,7 +299,7 @@ func doPut(f *protocol.Framer, key, value string, timeout time.Duration) (uint64
 	return 0, nil
 }
 
-func doPutToPrimary(key, value, primaryAddr string, timeout time.Duration) (uint64, error) {
+func doPutToPrimary(key, value string, quorum bool, primaryAddr string, timeout time.Duration) (uint64, error) {
 	// Connect to primary and retry
 	conn, err := net.DialTimeout("tcp", primaryAddr, timeout)
 	if err != nil {
@@ -280,7 +308,7 @@ func doPutToPrimary(key, value, primaryAddr string, timeout time.Duration) (uint
 	defer conn.Close()
 
 	f := protocol.NewConnFramer(conn)
-	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value)}
+	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value), RequireQuorum: quorum}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return 0, fmt.Errorf("encode: %w", err)
@@ -302,7 +330,11 @@ func doPutToPrimary(key, value, primaryAddr string, timeout time.Duration) (uint
 
 	switch resp.Status {
 	case protocol.StatusOK:
-		fmt.Println("OK")
+		if quorum {
+			fmt.Println("OK (quorum write succeeded)")
+		} else {
+			fmt.Println("OK")
+		}
 		return resp.Seq, nil // Return seq from primary
 	case protocol.StatusError:
 		fmt.Println("(server error)")
