@@ -37,3 +37,4 @@ wal.db
 
 .github
 redis/
+etcd/
