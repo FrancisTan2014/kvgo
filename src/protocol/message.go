@@ -146,7 +146,7 @@ func EncodeRequest(req Request) ([]byte, error) {
 	// Determine flags based on command and fields
 	var flags uint8
 	switch req.Cmd {
-	case CmdPut, CmdReplicate:
+	case CmdPut, CmdReplicate, CmdPing:
 		flags |= FlagHasSeq
 	case CmdGet:
 		if req.WaitForSeq > 0 {

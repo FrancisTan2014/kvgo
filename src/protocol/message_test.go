@@ -33,8 +33,8 @@ func TestRequestRoundTrip(t *testing.T) {
 			req:  Request{Cmd: CmdReplicate, Seq: 456, Value: []byte("replid-123")},
 		},
 		{
-			name: "PING (seq not preserved without flag)",
-			req:  Request{Cmd: CmdPing},  // Seq is not meaningful for PING
+			name: "PING with seq (for heartbeat)",
+			req:  Request{Cmd: CmdPing, Seq: 789},  // Seq indicates primary's position
 		},
 		{
 			name: "GET with WaitForSeq (strong read)",
