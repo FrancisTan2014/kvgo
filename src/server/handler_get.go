@@ -11,11 +11,25 @@ func (s *Server) handleGet(ctx *RequestContext) error {
 		return err
 	}
 
+	if s.isStaleness() {
+		return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReplicaTooStale)
+	}
+
 	if req.WaitForSeq > 0 {
 		return s.doStrongGet(ctx, &req)
 	}
 
 	return s.doGet(ctx, &req)
+}
+
+func (s *Server) isStaleness() bool {
+	if !s.isReplica {
+		return false
+	}
+
+	seqLag := s.primarySeq - s.lastSeq.Load()
+	heartbeatAge := time.Since(s.lastHeartbeat)
+	return seqLag > uint64(s.opts.ReplicaStaleLag) || heartbeatAge > s.opts.ReplicaStaleHeartbeat
 }
 
 func (s *Server) doGet(ctx *RequestContext, req *protocol.Request) error {
@@ -56,12 +70,12 @@ func (s *Server) doStrongGet(ctx *RequestContext, req *protocol.Request) error {
 		"elapsed", time.Since(startedAt),
 		"timeout", s.opts.StrongReadTimeout)
 
-	return s.respondReadOnly(ctx)
+	return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReadOnly)
 }
 
-func (s *Server) respondReadOnly(ctx *RequestContext) error {
+func (s *Server) responseStatusWithPrimaryAddress(ctx *RequestContext, status protocol.Status) error {
 	return s.writeResponse(ctx.Framer, protocol.Response{
-		Status: protocol.StatusReadOnly,
+		Status: status,
 		Value:  []byte(s.opts.ReplicaOf), // Primary address for client redirect
 	})
 }

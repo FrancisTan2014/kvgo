@@ -12,7 +12,7 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 	if s.isReplica {
 		// Replicas reject direct writes from clients.
 		s.log().Warn("PUT rejected on replica", "key", key)
-		return s.respondReadOnly(ctx)
+		return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReadOnly)
 	}
 
 	if err := s.db.Put(key, req.Value); err != nil {

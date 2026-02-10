@@ -21,12 +21,12 @@ const (
 	// [cmd u8][flags u8][seq u64][waitForSeq u64][klen u32][vlen u32][key][value]
 	requestHeaderSize = u8Size + u8Size + u64Size + u64Size + u32Size + u32Size // 26 bytes
 	requestCmdOff     = 0
-	requestFlagsOff   = requestCmdOff + u8Size       // 1
-	requestSeqOff     = requestFlagsOff + u8Size     // 2
-	requestWaitSeqOff = requestSeqOff + u64Size      // 10
-	requestKLenOff    = requestWaitSeqOff + u64Size  // 18
-	requestVLenOff    = requestKLenOff + u32Size     // 22
-	requestKeyOff     = requestHeaderSize            // 26
+	requestFlagsOff   = requestCmdOff + u8Size      // 1
+	requestSeqOff     = requestFlagsOff + u8Size    // 2
+	requestWaitSeqOff = requestSeqOff + u64Size     // 10
+	requestKLenOff    = requestWaitSeqOff + u64Size // 18
+	requestVLenOff    = requestKLenOff + u32Size    // 22
+	requestKeyOff     = requestHeaderSize           // 26
 
 	// Response payload: [status u8][seq u64][vlen u32][value]
 	responseHeaderSize = u8Size + u64Size + u32Size // 13 bytes
@@ -41,7 +41,6 @@ const (
 	FlagHasSeq        = 1 << 0 // seq field is meaningful (CmdPut, CmdReplicate)
 	FlagHasWaitForSeq = 1 << 1 // waitForSeq field is meaningful (CmdGet with strong read)
 )
-
 
 type Cmd uint8
 
@@ -58,13 +57,14 @@ const (
 type Status uint8
 
 const (
-	StatusOK         Status = 0 // Success
-	StatusNotFound   Status = 1 // Key not found (GET)
-	StatusError      Status = 2 // Generic server error
-	StatusReadOnly   Status = 3 // Replica cannot accept writes; Value contains primary address
-	StatusPong       Status = 4 // Response to PING
-	StatusFullResync Status = 5 // Primary requires full resync; Value contains snapshot
-	StatusCleaning   Status = 6 // Cleanup in progress, writes temporarily rejected
+	StatusOK              Status = 0 // Success
+	StatusNotFound        Status = 1 // Key not found (GET)
+	StatusError           Status = 2 // Generic server error
+	StatusReadOnly        Status = 3 // Replica cannot accept writes; Value contains primary address
+	StatusPong            Status = 4 // Response to PING
+	StatusFullResync      Status = 5 // Primary requires full resync; Value contains snapshot
+	StatusCleaning        Status = 6 // Cleanup in progress, writes temporarily rejected
+	StatusReplicaTooStale Status = 7 // Replica exceeds staleness bounds; client should retry another replica or primary
 )
 
 type Request struct {
@@ -181,7 +181,7 @@ func DecodeRequest(payload []byte) (Request, error) {
 	waitForSeq := binary.LittleEndian.Uint64(payload[requestWaitSeqOff : requestWaitSeqOff+u64Size])
 	kU32 := binary.LittleEndian.Uint32(payload[requestKLenOff : requestKLenOff+u32Size])
 	vU32 := binary.LittleEndian.Uint32(payload[requestVLenOff : requestVLenOff+u32Size])
-	
+
 	klen, ok := lenFromU32(kU32)
 	if !ok {
 		return Request{}, ErrInvalidMessage
@@ -234,7 +234,7 @@ func EncodeResponse(resp Response) ([]byte, error) {
 	}
 
 	switch resp.Status {
-	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync, StatusCleaning:
+	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync, StatusCleaning, StatusReplicaTooStale:
 		// ok
 	default:
 		return nil, ErrUnknownStatus
@@ -243,8 +243,9 @@ func EncodeResponse(resp Response) ([]byte, error) {
 	// Response payload carries value only for specific status codes:
 	// - StatusOK: GET responses contain the retrieved value
 	// - StatusReadOnly: Replica rejection contains primary address for redirect
+	// - StatusReplicaTooStale: Stale replica rejection contains primary address
 	// - StatusFullResync: Full resync responses contain database snapshot
-	if resp.Status != StatusOK && resp.Status != StatusFullResync && resp.Status != StatusReadOnly && vlen != 0 {
+	if resp.Status != StatusOK && resp.Status != StatusFullResync && resp.Status != StatusReadOnly && resp.Status != StatusReplicaTooStale && vlen != 0 {
 		return nil, ErrInvalidMessage
 	}
 
@@ -275,7 +276,7 @@ func DecodeResponse(payload []byte) (Response, error) {
 	}
 
 	switch st {
-	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync, StatusCleaning:
+	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync, StatusCleaning, StatusReplicaTooStale:
 		// ok
 	default:
 		return Response{}, ErrUnknownStatus
@@ -284,8 +285,9 @@ func DecodeResponse(payload []byte) (Response, error) {
 	// Response payload carries value only for specific status codes:
 	// - StatusOK: GET responses contain the retrieved value
 	// - StatusReadOnly: Replica rejection contains primary address for redirect
+	// - StatusReplicaTooStale: Stale replica rejection contains primary address
 	// - StatusFullResync: Full resync responses contain database snapshot
-	if st != StatusOK && st != StatusFullResync && st != StatusReadOnly && vlen != 0 {
+	if st != StatusOK && st != StatusFullResync && st != StatusReadOnly && st != StatusReplicaTooStale && vlen != 0 {
 		return Response{}, ErrInvalidMessage
 	}
 

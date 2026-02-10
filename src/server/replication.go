@@ -135,7 +135,10 @@ func (s *Server) connectToPrimary() (*protocol.Framer, error) {
 
 	s.log().Info("replication handshake complete")
 
+	s.mu.Lock()
 	s.primary = conn
+	s.lastHeartbeat = time.Now() // Initialize heartbeat timer on successful connection
+	s.mu.Unlock()
 	return f, nil
 }
 
@@ -248,7 +251,7 @@ func (s *Server) serveReplica(rc *replicaConn) {
 		case <-rc.hb.C:
 			// heartbeat: ping replica if idle
 			if time.Since(rc.lastWrite) > heartbeatInterval {
-				ping, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing})
+				ping, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing, Seq: s.seq.Load()})
 				if err := rc.framer.Write(ping); err != nil {
 					s.log().Error("replica ping failed", "replica", rc.conn.RemoteAddr(), "error", err)
 					return

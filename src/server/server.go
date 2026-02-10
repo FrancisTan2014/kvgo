@@ -76,6 +76,10 @@ type Options struct {
 	// Zero means use engine.DefaultSyncInterval (100ms).
 	SyncInterval time.Duration
 
+	// Staleness bounds (Episode 025): replica rejects reads when exceeding thresholds
+	ReplicaStaleHeartbeat time.Duration // time-based: reject if no heartbeat for N seconds (partition detection), default 5s
+	ReplicaStaleLag       int           // sequence-based: reject if > N operations behind (backlog limit), default 1000
+
 	Logger *slog.Logger // optional debug logger; nil disables logging
 }
 
@@ -104,9 +108,11 @@ type Server struct {
 	replid   string
 
 	// Replication state (replica role)
-	isReplica bool
-	primary   net.Conn
-	lastSeq   atomic.Uint64 // last applied sequence number
+	isReplica     bool
+	primary       net.Conn
+	lastSeq       atomic.Uint64 // last applied sequence number
+	lastHeartbeat time.Time     // updated from heartbeat messages
+	primarySeq    uint64        // primary's position from heartbeat; compared with lastSeq for staleness detection
 
 	// Replication loop control
 	replCtx    context.Context
@@ -150,6 +156,12 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.StrongReadTimeout <= 0 {
 		opts.StrongReadTimeout = 100 * time.Millisecond
 	}
+	if opts.ReplicaStaleHeartbeat <= 0 {
+		opts.ReplicaStaleHeartbeat = 5 * time.Second
+	}
+	if opts.ReplicaStaleLag <= 0 {
+		opts.ReplicaStaleLag = 1000
+	}
 
 	isReplica := opts.ReplicaOf != ""
 	replicas := make(map[net.Conn]*replicaConn)
@@ -160,6 +172,7 @@ func NewServer(opts Options) (*Server, error) {
 		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
 		isReplica:       isReplica,
 		replicas:        replicas,
+		lastHeartbeat:   time.Now(), // Initialize heartbeat timer (updated by PING messages)
 	}
 
 	s.registerRequestHandlers()
