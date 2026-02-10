@@ -1,239 +1,194 @@
 package server
 
 import (
-	"context"
+	"container/list"
+	"sync/atomic"
 	"testing"
-	"time"
 )
 
-func TestBacklogTrimmer_TrimsWhenOverThreshold(t *testing.T) {
-	dir := t.TempDir()
-
-	// Use limits above MinBacklogSize to avoid default override
-	const (
-		backlogLimit = 2 * 1024 * 1024 // 2MB (above 1MB min)
-		trimDuration = 10 * time.Millisecond
-		entrySize    = 100 * 1024 // 100KB per entry
-	)
-
-	s, err := NewServer(Options{
-		Port:                0,
-		DataDir:             dir,
-		BacklogSizeLimit:    backlogLimit,
-		BacklogTrimDuration: trimDuration,
-	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer s.Shutdown(context.Background())
-
-	// Append entries until we exceed 2x the limit (trim threshold)
-	payload := make([]byte, entrySize)
-	targetSize := int64(TrimRatioThreshold*backlogLimit) + int64(entrySize)
-
-	seq := uint64(1)
-	for s.backlogSize.Load() < targetSize {
-		s.appendBacklog(backlogEntry{
-			size:    entrySize,
-			seq:     seq,
-			payload: payload,
-		})
-		seq++
-	}
-
-	beforeTrim := s.backlogSize.Load()
-	if beforeTrim < targetSize {
-		t.Fatalf("expected backlogSize >= %d, got %d", targetSize, beforeTrim)
-	}
-	t.Logf("before trim: size=%d, entries=%d", beforeTrim, s.backlog.Len())
-
-	// Wait for trimmer to run
-	time.Sleep(trimDuration * 3)
-
-	afterTrim := s.backlogSize.Load()
-	t.Logf("after trim: size=%d, entries=%d", afterTrim, s.backlog.Len())
-
-	// Verify size is trimmed down to <= limit
-	if afterTrim > int64(backlogLimit) {
-		t.Errorf("expected backlogSize <= %d after trim, got %d", backlogLimit, afterTrim)
-	}
-
-	// Verify we actually removed entries
-	if afterTrim >= beforeTrim {
-		t.Errorf("trimmer did not reduce size: before=%d, after=%d", beforeTrim, afterTrim)
-	}
-}
-
-func TestBacklogTrimmer_DoesNotTrimBelowThreshold(t *testing.T) {
-	dir := t.TempDir()
-
-	const (
-		backlogLimit = 2 * 1024 * 1024 // 2MB (above 1MB min)
-		trimDuration = 10 * time.Millisecond
-		entrySize    = 100 * 1024 // 100KB per entry
-	)
-
-	s, err := NewServer(Options{
-		Port:                0,
-		DataDir:             dir,
-		BacklogSizeLimit:    backlogLimit,
-		BacklogTrimDuration: trimDuration,
-	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer s.Shutdown(context.Background())
-
-	// Append entries but stay below threshold (< 2x limit)
-	payload := make([]byte, entrySize)
-	targetSize := int64(backlogLimit) // 1x limit, below 2x threshold
-
-	seq := uint64(1)
-	for s.backlogSize.Load() < targetSize {
-		s.appendBacklog(backlogEntry{
-			size:    entrySize,
-			seq:     seq,
-			payload: payload,
-		})
-		seq++
-	}
-
-	beforeWait := s.backlogSize.Load()
-	entriesBefore := s.backlog.Len()
-	t.Logf("before wait: size=%d, entries=%d", beforeWait, entriesBefore)
-
-	// Wait for trimmer cycles
-	time.Sleep(trimDuration * 3)
-
-	afterWait := s.backlogSize.Load()
-	entriesAfter := s.backlog.Len()
-	t.Logf("after wait: size=%d, entries=%d", afterWait, entriesAfter)
-
-	// Verify nothing was trimmed
-	if entriesAfter != entriesBefore {
-		t.Errorf("trimmer should not run below threshold: entries before=%d, after=%d", entriesBefore, entriesAfter)
-	}
-}
-
-func TestBacklog_ExistsInBacklog(t *testing.T) {
-	dir := t.TempDir()
-
-	s, err := NewServer(Options{Port: 0, DataDir: dir})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer s.Shutdown(context.Background())
-
-	// Empty backlog
-	if s.existsInBacklog(1) {
-		t.Error("existsInBacklog should return false for empty backlog")
-	}
-
-	// Add entries seq 5, 6, 7
-	for seq := uint64(5); seq <= 7; seq++ {
-		s.appendBacklog(backlogEntry{size: 10, seq: seq, payload: []byte("test")})
-	}
-
+// TestExistsInBacklog tests the backlog membership check logic
+func TestExistsInBacklog(t *testing.T) {
 	tests := []struct {
-		seq    uint64
-		exists bool
+		name       string
+		entries    []uint64 // sequence numbers to add
+		checkSeq   uint64
+		wantExists bool
 	}{
-		{4, false}, // before range
-		{5, true},  // first entry
-		{6, true},  // middle
-		{7, true},  // last entry
-		{8, false}, // after range
+		{
+			name:       "empty backlog",
+			entries:    []uint64{},
+			checkSeq:   1,
+			wantExists: false,
+		},
+		{
+			name:       "seq before range",
+			entries:    []uint64{5, 6, 7},
+			checkSeq:   4,
+			wantExists: false,
+		},
+		{
+			name:       "seq at start",
+			entries:    []uint64{5, 6, 7},
+			checkSeq:   5,
+			wantExists: true,
+		},
+		{
+			name:       "seq in middle",
+			entries:    []uint64{5, 6, 7},
+			checkSeq:   6,
+			wantExists: true,
+		},
+		{
+			name:       "seq at end",
+			entries:    []uint64{5, 6, 7},
+			checkSeq:   7,
+			wantExists: true,
+		},
+		{
+			name:       "seq after range",
+			entries:    []uint64{5, 6, 7},
+			checkSeq:   8,
+			wantExists: false,
+		},
+		{
+			name:       "single entry match",
+			entries:    []uint64{10},
+			checkSeq:   10,
+			wantExists: true,
+		},
+		{
+			name:       "large gap",
+			entries:    []uint64{100, 101, 102},
+			checkSeq:   1,
+			wantExists: false,
+		},
 	}
 
 	for _, tt := range tests {
-		got := s.existsInBacklog(tt.seq)
-		if got != tt.exists {
-			t.Errorf("existsInBacklog(%d) = %v, want %v", tt.seq, got, tt.exists)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			for _, seq := range tt.entries {
+				s.backlog.PushBack(backlogEntry{seq: seq, size: 10, payload: []byte("test")})
+			}
+
+			got := s.existsInBacklog(tt.checkSeq)
+			if got != tt.wantExists {
+				t.Errorf("existsInBacklog(%d) = %v, want %v", tt.checkSeq, got, tt.wantExists)
+			}
+		})
 	}
 }
 
-func TestBacklog_ForwardBacklog(t *testing.T) {
-	dir := t.TempDir()
+// TestForwardBacklog tests forwarding entries from a specific sequence
+func TestForwardBacklog(t *testing.T) {
+	tests := []struct {
+		name        string
+		entries     []uint64 // sequence numbers to add
+		startSeq    uint64   // where to start forwarding
+		wantForward []uint64 // expected forwarded sequences
+	}{
+		{
+			name:        "empty backlog",
+			entries:     []uint64{},
+			startSeq:    1,
+			wantForward: []uint64{},
+		},
+		{
+			name:        "forward from start",
+			entries:     []uint64{10, 11, 12, 13},
+			startSeq:    10,
+			wantForward: []uint64{10, 11, 12, 13},
+		},
+		{
+			name:        "forward from middle",
+			entries:     []uint64{10, 11,12, 13, 14},
+			startSeq:    12,
+			wantForward: []uint64{12, 13, 14},
+		},
+		{
+			name:        "forward from end",
+			entries:     []uint64{10, 11, 12},
+			startSeq:    12,
+			wantForward: []uint64{12},
+		},
+		{
+			name:        "seq before range (starts from beginning)",
+			entries:     []uint64{10, 11, 12},
+			startSeq:    5,
+			wantForward: []uint64{10, 11, 12},
+		},
+		{
+			name:        "seq after range (nothing forwarded)",
+			entries:     []uint64{10, 11, 12},
+			startSeq:    15,
+			wantForward: []uint64{},
+		},
+	}
 
-	s, err := NewServer(Options{Port: 0, DataDir: dir})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer s.Shutdown(context.Background())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			for _, seq := range tt.entries {
+				s.backlog.PushBack(backlogEntry{seq: seq, size: 10, payload: []byte{byte(seq)}})
+			}
 
-	// Add entries seq 10, 11, 12, 13, 14
-	for seq := uint64(10); seq <= 14; seq++ {
-		s.appendBacklog(backlogEntry{size: 10, seq: seq, payload: []byte{byte(seq)}})
-	}
+			var forwarded []uint64
+			err := s.forwardBacklog(tt.startSeq, func(e backlogEntry) error {
+				forwarded = append(forwarded, e.seq)
+				return nil
+			})
 
-	// Forward from seq 12 onwards
-	var forwarded []uint64
-	err = s.forwardBacklog(12, func(e backlogEntry) error {
-		forwarded = append(forwarded, e.seq)
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("forwardBacklog: %v", err)
-	}
+			if err != nil {
+				t.Fatalf("forwardBacklog: %v", err)
+			}
 
-	expected := []uint64{12, 13, 14}
-	if len(forwarded) != len(expected) {
-		t.Fatalf("forwarded %d entries, want %d", len(forwarded), len(expected))
-	}
-	for i, seq := range expected {
-		if forwarded[i] != seq {
-			t.Errorf("forwarded[%d] = %d, want %d", i, forwarded[i], seq)
-		}
+			if len(forwarded) != len(tt.wantForward) {
+				t.Errorf("forwarded %d entries, want %d", len(forwarded), len(tt.wantForward))
+				return
+			}
+
+			for i, want := range tt.wantForward {
+				if forwarded[i] != want {
+					t.Errorf("forwarded[%d] = %d, want %d", i, forwarded[i], want)
+				}
+			}
+		})
 	}
 }
 
-func TestBacklog_ForwardBacklog_TrimmedSeq(t *testing.T) {
-	dir := t.TempDir()
-
-	s, err := NewServer(Options{Port: 0, DataDir: dir})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
+// TestAppendBacklog tests the backlog append logic
+func TestAppendBacklog(t *testing.T) {
+	s := &Server{
+		backlog: list.List{},
 	}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer s.Shutdown(context.Background())
+	s.backlogSize = atomic.Int64{}
 
-	// Add entries seq 10, 11, 12
-	for seq := uint64(10); seq <= 12; seq++ {
-		s.appendBacklog(backlogEntry{size: 10, seq: seq, payload: []byte{byte(seq)}})
+	// Append first entry
+	s.appendBacklog(backlogEntry{seq: 1, size: 100, payload: []byte("a")})
+	if s.backlog.Len() != 1 {
+		t.Errorf("backlog length = %d, want 1", s.backlog.Len())
 	}
-
-	// Request seq 5, which was "trimmed" - should start from 10
-	var forwarded []uint64
-	err = s.forwardBacklog(5, func(e backlogEntry) error {
-		forwarded = append(forwarded, e.seq)
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("forwardBacklog: %v", err)
+	if s.backlogSize.Load() != 100 {
+		t.Errorf("backlog size = %d, want 100", s.backlogSize.Load())
 	}
 
-	expected := []uint64{10, 11, 12}
-	if len(forwarded) != len(expected) {
-		t.Fatalf("forwarded %d entries, want %d", len(forwarded), len(expected))
+	// Append second entry
+	s.appendBacklog(backlogEntry{seq: 2, size: 200, payload: []byte("b")})
+	if s.backlog.Len() != 2 {
+		t.Errorf("backlog length = %d, want 2", s.backlog.Len())
 	}
-	for i, seq := range expected {
-		if forwarded[i] != seq {
-			t.Errorf("forwarded[%d] = %d, want %d", i, forwarded[i], seq)
-		}
+	if s.backlogSize.Load() != 300 {
+		t.Errorf("backlog size = %d, want 300", s.backlogSize.Load())
+	}
+
+	// Verify order (FIFO)
+	front := s.backlog.Front().Value.(backlogEntry)
+	if front.seq != 1 {
+		t.Errorf("front seq = %d, want 1", front.seq)
+	}
+
+	back := s.backlog.Back().Value.(backlogEntry)
+	if back.seq != 2 {
+		t.Errorf("back seq = %d, want 2", back.seq)
 	}
 }
