@@ -3,12 +3,12 @@ package server
 import (
 	"container/list"
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"kvgo/engine"
 	"kvgo/protocol"
+	"kvgo/utils"
 	"log/slog"
 	"net"
 	"os"
@@ -69,7 +69,8 @@ type Options struct {
 	BacklogSizeLimit    int64         // default 16MB
 	BacklogTrimDuration time.Duration // default 100ms
 
-	StrongReadTimeout time.Duration // default 100ms, how long to wait for replica to catch up
+	StrongReadTimeout  time.Duration // default 100ms, how long to wait for replica to catch up
+	QuorumWriteTimeout time.Duration // default 500ms, how long to wait for quorum ACKs before timeout (Episode 026)
 
 	// SyncInterval controls how often the WAL is fsynced (latency vs throughput tradeoff).
 	// Lower values reduce latency but increase fsync overhead.
@@ -81,6 +82,16 @@ type Options struct {
 	ReplicaStaleLag       int           // sequence-based: reject if > N operations behind (backlog limit), default 1000
 
 	Logger *slog.Logger // optional debug logger; nil disables logging
+}
+
+type quorumState struct {
+	mu            sync.Mutex // Per-request lock
+	needed        int
+	ackCount      int32 // Protected by mu
+	ackCh         chan struct{}
+	closeOnce     sync.Once
+	failed        atomic.Bool           // true if NACK received
+	ackedReplicas map[net.Conn]struct{} // Track which replicas ACK'd (protected by mu)
 }
 
 type Server struct {
@@ -106,6 +117,11 @@ type Server struct {
 	seq      atomic.Uint64 // monotonic sequence number for writes
 	replicas map[net.Conn]*replicaConn
 	replid   string
+
+	// Quorum control
+	quorumMu     sync.RWMutex
+	quorumWrites map[string]*quorumState
+	quorumAckCh  chan string // Quorum ack channel
 
 	// Replication state (replica role)
 	isReplica     bool
@@ -156,6 +172,9 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.StrongReadTimeout <= 0 {
 		opts.StrongReadTimeout = 100 * time.Millisecond
 	}
+	if opts.QuorumWriteTimeout <= 0 {
+		opts.QuorumWriteTimeout = 500 * time.Millisecond
+	}
 	if opts.ReplicaStaleHeartbeat <= 0 {
 		opts.ReplicaStaleHeartbeat = 5 * time.Second
 	}
@@ -173,6 +192,8 @@ func NewServer(opts Options) (*Server, error) {
 		isReplica:       isReplica,
 		replicas:        replicas,
 		lastHeartbeat:   time.Now(), // Initialize heartbeat timer (updated by PING messages)
+		quorumAckCh:     make(chan string),
+		quorumWrites:    make(map[string]*quorumState),
 	}
 
 	s.registerRequestHandlers()
@@ -221,7 +242,7 @@ func (s *Server) Start() (err error) {
 	}
 
 	if s.replid == "" {
-		s.replid = generateReplID()
+		s.replid = utils.GenerateUniqueID()
 	}
 
 	lock, err = acquireDataDirLock(s.opts.DataDir)
@@ -440,12 +461,6 @@ func (s *Server) relocate(primaryAddr string) error {
 	}()
 
 	return nil
-}
-
-func generateReplID() string {
-	b := make([]byte, 20) // 20 bytes = 40 hex chars
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
 }
 
 func (s *Server) log() *slog.Logger {

@@ -18,15 +18,16 @@ const (
 	u64Size = 8
 
 	// Uniform request header (all commands):
-	// [cmd u8][flags u8][seq u64][waitForSeq u64][klen u32][vlen u32][key][value]
-	requestHeaderSize = u8Size + u8Size + u64Size + u64Size + u32Size + u32Size // 26 bytes
+	// [cmd u8][flags u8][seq u64][waitForSeq u64][ridLen u32][klen u32][vlen u32][requestId][key][value]
+	requestHeaderSize = u8Size + u8Size + u64Size + u64Size + u32Size + u32Size + u32Size // 30 bytes
 	requestCmdOff     = 0
 	requestFlagsOff   = requestCmdOff + u8Size      // 1
 	requestSeqOff     = requestFlagsOff + u8Size    // 2
 	requestWaitSeqOff = requestSeqOff + u64Size     // 10
-	requestKLenOff    = requestWaitSeqOff + u64Size // 18
-	requestVLenOff    = requestKLenOff + u32Size    // 22
-	requestKeyOff     = requestHeaderSize           // 26
+	requestRidLenOff  = requestWaitSeqOff + u64Size // 18
+	requestKLenOff    = requestRidLenOff + u32Size  // 22
+	requestVLenOff    = requestKLenOff + u32Size    // 26
+	requestDataOff    = requestHeaderSize           // 30
 
 	// Response payload: [status u8][seq u64][vlen u32][value]
 	responseHeaderSize = u8Size + u64Size + u32Size // 13 bytes
@@ -40,31 +41,38 @@ const (
 const (
 	FlagHasSeq        = 1 << 0 // seq field is meaningful (CmdPut, CmdReplicate)
 	FlagHasWaitForSeq = 1 << 1 // waitForSeq field is meaningful (CmdGet with strong read)
+	FlagRequireQuorum = 1 << 2 // RequireQuorum field is meaningful (CmdPut with quorum write)
+	FlagHasRequestId  = 1 << 3 // requestId field is present (quorum write tracking)
 )
 
 type Cmd uint8
 
 const (
-	CmdGet       Cmd = 1 // Retrieve value by key
-	CmdPut       Cmd = 2 // Store key-value pair
-	CmdReplicate Cmd = 3 // Establish replication connection
-	CmdPing      Cmd = 4 // Health check
-	CmdPromote   Cmd = 5 // Promote replica to primary
-	CmdReplicaOf Cmd = 6 // Configure as replica of primary
-	CmdCleanup   Cmd = 7 // Trigger value file compaction
+	CmdGet       Cmd = 1  // Retrieve value by key
+	CmdPut       Cmd = 2  // Store key-value pair
+	CmdReplicate Cmd = 3  // Establish replication connection
+	CmdPing      Cmd = 4  // Health check
+	CmdPromote   Cmd = 5  // Promote replica to primary
+	CmdReplicaOf Cmd = 6  // Configure as replica of primary
+	CmdCleanup   Cmd = 7  // Trigger value file compaction
+	CmdAck       Cmd = 8  // Replica ACKs
+	CmdNack      Cmd = 9  // Replica negative ACK (write failed)
+	CmdPong      Cmd = 10 // Response to PING
 )
 
 type Status uint8
 
 const (
-	StatusOK              Status = 0 // Success
-	StatusNotFound        Status = 1 // Key not found (GET)
-	StatusError           Status = 2 // Generic server error
-	StatusReadOnly        Status = 3 // Replica cannot accept writes; Value contains primary address
-	StatusPong            Status = 4 // Response to PING
-	StatusFullResync      Status = 5 // Primary requires full resync; Value contains snapshot
-	StatusCleaning        Status = 6 // Cleanup in progress, writes temporarily rejected
-	StatusReplicaTooStale Status = 7 // Replica exceeds staleness bounds; client should retry another replica or primary
+	StatusOK              Status = iota // Success
+	StatusNotFound                      // Key not found (GET)
+	StatusError                         // Generic server error
+	StatusReadOnly                      // Replica cannot accept writes; Value contains primary address
+	StatusPong                          // Response to PING
+	StatusFullResync                    // Primary requires full resync; Value contains snapshot
+	StatusCleaning                      // Cleanup in progress, writes temporarily rejected
+	StatusReplicaTooStale               // Replica exceeds staleness bounds; client should retry another replica or primary
+
+	statusMaxKnown // Sentinel: update when adding new status codes
 )
 
 type Request struct {
@@ -83,9 +91,11 @@ type Request struct {
 	// - CmdReplicaOf: the target primary address (host:port format)
 	// - CmdReplicate: optionally contains replid for replica identification
 	// - Others: unused (must be empty)
-	Value      []byte
-	Seq        uint64 // Sequence number (meaningful if FlagHasSeq set: CmdPut, CmdReplicate)
-	WaitForSeq uint64 // Wait for replication (meaningful if FlagHasWaitForSeq set: CmdGet strong read; 0 = eventual)
+	Value         []byte
+	Seq           uint64 // Sequence number (meaningful if FlagHasSeq set: CmdPut, CmdReplicate)
+	WaitForSeq    uint64 // Wait for replication (meaningful if FlagHasWaitForSeq set: CmdGet strong read; 0 = eventual)
+	RequireQuorum bool   // Quorum write (meaningful if FlagRequireQuorum set: CmdPut quorum write)
+	RequestId     string // Unique ID for request tracing (meaningful if FlagHasRequestId set: quorum writes, ACKs)
 }
 
 type Response struct {
@@ -124,16 +134,26 @@ func putU64LE(buf []byte, off int, v uint64) {
 	binary.LittleEndian.PutUint64(buf[off:off+u64Size], v)
 }
 
+// statusCanCarryValue returns true if the status code is allowed to have a non-empty value field.
+func statusCanCarryValue(st Status) bool {
+	return st == StatusOK || st == StatusFullResync || st == StatusReadOnly || st == StatusReplicaTooStale
+}
+
 // EncodeRequest encodes a Request into a payload (without the outer frameLen).
 //
 // Uniform request format (all commands):
 //
-//	[cmd uint8][flags uint8][seq uint64 LE][waitForSeq uint64 LE][klen uint32 LE][vlen uint32 LE][key bytes][value bytes]
+//	[cmd uint8][flags uint8][seq uint64 LE][waitForSeq uint64 LE][ridLen uint32 LE][klen uint32 LE][vlen uint32 LE][requestId bytes][key bytes][value bytes]
 //
 // Flags indicate which fields are meaningful:
 //   - FlagHasSeq: seq field is used (CmdPut, CmdReplicate)
 //   - FlagHasWaitForSeq: waitForSeq field is used (CmdGet with strong consistency)
+//   - FlagHasRequestId: requestId field is present (quorum writes, ACKs)
 func EncodeRequest(req Request) ([]byte, error) {
+	ridlen := len(req.RequestId)
+	if err := ensureU32Len(ridlen); err != nil {
+		return nil, err
+	}
 	klen := len(req.Key)
 	if err := ensureU32Len(klen); err != nil {
 		return nil, err
@@ -146,24 +166,42 @@ func EncodeRequest(req Request) ([]byte, error) {
 	// Determine flags based on command and fields
 	var flags uint8
 	switch req.Cmd {
-	case CmdPut, CmdReplicate, CmdPing:
+	case CmdPut:
+		flags |= FlagHasSeq
+		if req.RequireQuorum {
+			flags |= FlagRequireQuorum
+		}
+		if req.RequestId != "" {
+			flags |= FlagHasRequestId
+		}
+	case CmdReplicate, CmdPing:
 		flags |= FlagHasSeq
 	case CmdGet:
 		if req.WaitForSeq > 0 {
 			flags |= FlagHasWaitForSeq
 		}
+	case CmdAck:
+		if req.RequestId != "" {
+			flags |= FlagHasRequestId
+		}
 	}
 
 	// Uniform header for all commands
-	buf := make([]byte, requestHeaderSize+klen+vlen)
+	buf := make([]byte, requestHeaderSize+ridlen+klen+vlen)
 	buf[requestCmdOff] = byte(req.Cmd)
 	buf[requestFlagsOff] = flags
 	putU64LE(buf, requestSeqOff, req.Seq)
 	putU64LE(buf, requestWaitSeqOff, req.WaitForSeq)
+	putU32LE(buf, requestRidLenOff, ridlen)
 	putU32LE(buf, requestKLenOff, klen)
 	putU32LE(buf, requestVLenOff, vlen)
-	copy(buf[requestKeyOff:], req.Key)
-	copy(buf[requestKeyOff+klen:], req.Value)
+	// Variable-length sections in order: requestId, key, value
+	off := requestDataOff
+	copy(buf[off:], req.RequestId)
+	off += ridlen
+	copy(buf[off:], req.Key)
+	off += klen
+	copy(buf[off:], req.Value)
 
 	return buf, nil
 }
@@ -179,9 +217,14 @@ func DecodeRequest(payload []byte) (Request, error) {
 	flags := payload[requestFlagsOff]
 	seq := binary.LittleEndian.Uint64(payload[requestSeqOff : requestSeqOff+u64Size])
 	waitForSeq := binary.LittleEndian.Uint64(payload[requestWaitSeqOff : requestWaitSeqOff+u64Size])
+	ridU32 := binary.LittleEndian.Uint32(payload[requestRidLenOff : requestRidLenOff+u32Size])
 	kU32 := binary.LittleEndian.Uint32(payload[requestKLenOff : requestKLenOff+u32Size])
 	vU32 := binary.LittleEndian.Uint32(payload[requestVLenOff : requestVLenOff+u32Size])
 
+	ridlen, ok := lenFromU32(ridU32)
+	if !ok {
+		return Request{}, ErrInvalidMessage
+	}
 	klen, ok := lenFromU32(kU32)
 	if !ok {
 		return Request{}, ErrInvalidMessage
@@ -191,13 +234,18 @@ func DecodeRequest(payload []byte) (Request, error) {
 		return Request{}, ErrInvalidMessage
 	}
 
-	need := requestHeaderSize + klen + vlen
+	need := requestHeaderSize + ridlen + klen + vlen
 	if len(payload) != need {
 		return Request{}, ErrInvalidMessage
 	}
 
-	key := append([]byte(nil), payload[requestKeyOff:requestKeyOff+klen]...)
-	val := append([]byte(nil), payload[requestKeyOff+klen:need]...)
+	// Parse variable-length sections in order: requestId, key, value
+	off := requestDataOff
+	rid := string(payload[off : off+ridlen])
+	off += ridlen
+	key := append([]byte(nil), payload[off:off+klen]...)
+	off += klen
+	val := append([]byte(nil), payload[off:off+vlen]...)
 
 	req := Request{
 		Cmd:   cmd,
@@ -211,6 +259,12 @@ func DecodeRequest(payload []byte) (Request, error) {
 	}
 	if flags&FlagHasWaitForSeq != 0 {
 		req.WaitForSeq = waitForSeq
+	}
+	if flags&FlagRequireQuorum != 0 {
+		req.RequireQuorum = true
+	}
+	if flags&FlagHasRequestId != 0 {
+		req.RequestId = rid
 	}
 
 	return req, nil
@@ -233,10 +287,7 @@ func EncodeResponse(resp Response) ([]byte, error) {
 		return nil, err
 	}
 
-	switch resp.Status {
-	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync, StatusCleaning, StatusReplicaTooStale:
-		// ok
-	default:
+	if resp.Status > statusMaxKnown {
 		return nil, ErrUnknownStatus
 	}
 
@@ -245,7 +296,7 @@ func EncodeResponse(resp Response) ([]byte, error) {
 	// - StatusReadOnly: Replica rejection contains primary address for redirect
 	// - StatusReplicaTooStale: Stale replica rejection contains primary address
 	// - StatusFullResync: Full resync responses contain database snapshot
-	if resp.Status != StatusOK && resp.Status != StatusFullResync && resp.Status != StatusReadOnly && resp.Status != StatusReplicaTooStale && vlen != 0 {
+	if !statusCanCarryValue(resp.Status) && vlen != 0 {
 		return nil, ErrInvalidMessage
 	}
 
@@ -275,10 +326,7 @@ func DecodeResponse(payload []byte) (Response, error) {
 		return Response{}, ErrInvalidMessage
 	}
 
-	switch st {
-	case StatusOK, StatusNotFound, StatusError, StatusReadOnly, StatusPong, StatusFullResync, StatusCleaning, StatusReplicaTooStale:
-		// ok
-	default:
+	if st > statusMaxKnown {
 		return Response{}, ErrUnknownStatus
 	}
 
@@ -287,7 +335,7 @@ func DecodeResponse(payload []byte) (Response, error) {
 	// - StatusReadOnly: Replica rejection contains primary address for redirect
 	// - StatusReplicaTooStale: Stale replica rejection contains primary address
 	// - StatusFullResync: Full resync responses contain database snapshot
-	if st != StatusOK && st != StatusFullResync && st != StatusReadOnly && st != StatusReplicaTooStale && vlen != 0 {
+	if !statusCanCarryValue(st) && vlen != 0 {
 		return Response{}, ErrInvalidMessage
 	}
 

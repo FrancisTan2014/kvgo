@@ -6,20 +6,17 @@ import (
 )
 
 func (s *Server) handleGet(ctx *RequestContext) error {
-	req, err := protocol.DecodeRequest(ctx.Payload)
-	if err != nil {
-		return err
-	}
+	req := &ctx.Request
 
 	if s.isStaleness() {
 		return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReplicaTooStale)
 	}
 
 	if req.WaitForSeq > 0 {
-		return s.doStrongGet(ctx, &req)
+		return s.doStrongGet(ctx, req)
 	}
 
-	return s.doGet(ctx, &req)
+	return s.doGet(ctx, req)
 }
 
 func (s *Server) isStaleness() bool {
@@ -78,4 +75,8 @@ func (s *Server) responseStatusWithPrimaryAddress(ctx *RequestContext, status pr
 		Status: status,
 		Value:  []byte(s.opts.ReplicaOf), // Primary address for client redirect
 	})
+}
+
+func (s *Server) responseStatusError(ctx *RequestContext) error {
+	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
 }

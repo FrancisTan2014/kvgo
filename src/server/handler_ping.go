@@ -9,11 +9,7 @@ import (
 //
 // Primary → Replica: Sends PING with current seq periodically
 func (s *Server) handlePing(ctx *RequestContext) error {
-	req, err := protocol.DecodeRequest(ctx.Payload)
-	if err != nil {
-		s.log().Error("failed to decode PING request", "error", err)
-		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
-	}
+	req := &ctx.Request
 
 	if s.isReplica {
 		s.lastHeartbeat = time.Now()

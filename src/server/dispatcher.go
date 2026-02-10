@@ -10,7 +10,7 @@ type HandlerFunc func(*Server, *RequestContext) error
 type RequestContext struct {
 	Conn      net.Conn
 	Framer    *protocol.Framer
-	Payload   []byte
+	Request   protocol.Request // Decoded request (replaces raw Payload)
 	takenOver bool
 }
 
@@ -22,6 +22,8 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdPromote] = (*Server).handlePromote
 	s.requestHandlers[protocol.CmdReplicaOf] = (*Server).handleReplicaOf
 	s.requestHandlers[protocol.CmdCleanup] = (*Server).handleCleanup
+	s.requestHandlers[protocol.CmdAck] = (*Server).handleAck
+	s.requestHandlers[protocol.CmdNack] = (*Server).handleNack
 }
 
 func (s *Server) handleRequest(conn net.Conn) {
@@ -40,21 +42,26 @@ func (s *Server) handleRequest(conn net.Conn) {
 			return
 		}
 
-		cmd := payload[0]
-		handler := s.requestHandlers[protocol.Cmd(cmd)]
+		req, err := protocol.DecodeRequest(payload)
+		if err != nil {
+			s.log().Error("failed to decode request", "error", err)
+			return
+		}
+
+		handler := s.requestHandlers[req.Cmd]
 		if handler == nil {
-			s.log().Error("unsupported request detected", "cmd", cmd)
+			s.log().Error("unsupported request detected", "cmd", req.Cmd)
 			return
 		}
 
 		ctx := &RequestContext{
 			Conn:    conn,
 			Framer:  f,
-			Payload: payload,
+			Request: req,
 		}
 
 		if err := handler(s, ctx); err != nil {
-			s.log().Error("failed to process the request", "cmd", cmd, "error", err)
+			s.log().Error("failed to process the request", "cmd", req.Cmd, "error", err)
 			return
 		}
 

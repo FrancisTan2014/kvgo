@@ -58,7 +58,6 @@ func TestHandleGet_BasicOperation(t *testing.T) {
 			s.lastSeq.Store(10)
 
 			req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(tt.key)}
-			payload, _ := protocol.EncodeRequest(req)
 
 			// Use mock buffer for framer
 			mockBuf := &mockBuffer{}
@@ -66,7 +65,7 @@ func TestHandleGet_BasicOperation(t *testing.T) {
 
 			ctx := &RequestContext{
 				Framer:  mockFramer,
-				Payload: payload,
+				Request: req,
 			}
 
 			err := s.handleGet(ctx)
@@ -110,10 +109,10 @@ func TestHandlePut_BasicOperation(t *testing.T) {
 	s.seq.Store(100)
 
 	tests := []struct {
-		name      string
-		key       string
-		value     string
-		wantSeq   uint64
+		name    string
+		key     string
+		value   string
+		wantSeq uint64
 	}{
 		{
 			name:    "simple put",
@@ -148,14 +147,13 @@ func TestHandlePut_BasicOperation(t *testing.T) {
 				Key:   []byte(tt.key),
 				Value: []byte(tt.value),
 			}
-			payload, _ := protocol.EncodeRequest(req)
 
 			mockBuf := &mockBuffer{}
 			mockFramer := protocol.NewFramer(mockBuf, mockBuf)
 
 			ctx := &RequestContext{
 				Framer:  mockFramer,
-				Payload: payload,
+				Request: req,
 			}
 
 			err := s.handlePut(ctx)
@@ -209,14 +207,13 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 		Key:   []byte("test"),
 		Value: []byte("value"),
 	}
-	payload, _ := protocol.EncodeRequest(req)
 
 	mockBuf := &mockBuffer{}
 	mockFramer := protocol.NewFramer(mockBuf, mockBuf)
 
 	ctx := &RequestContext{
 		Framer:  mockFramer,
-		Payload: payload,
+		Request: req,
 	}
 
 	err = s.handlePut(ctx)
@@ -250,11 +247,11 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 // TestHandlePing_HeartbeatUpdate tests PING updates heartbeat and primarySeq
 func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 	tests := []struct {
-		name            string
-		isReplica       bool
-		pingSeq         uint64
-		wantSeqUpdated  bool
-		wantHeartbeat   bool
+		name           string
+		isReplica      bool
+		pingSeq        uint64
+		wantSeqUpdated bool
+		wantHeartbeat  bool
 	}{
 		{
 			name:           "replica updates heartbeat and seq",
@@ -278,18 +275,17 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 				isReplica:     tt.isReplica,
 				lastHeartbeat: time.Now().Add(-1 * time.Hour), // Old timestamp
 				primarySeq:    0,
-				opts:          Options{Logger: nil},  // Use noop logger
+				opts:          Options{Logger: nil}, // Use noop logger
 			}
 
 			req := protocol.Request{Cmd: protocol.CmdPing, Seq: tt.pingSeq}
-			payload, _ := protocol.EncodeRequest(req)
 
 			mockBuf := &mockBuffer{}
 			mockFramer := protocol.NewFramer(mockBuf, mockBuf)
 
 			ctx := &RequestContext{
 				Framer:  mockFramer,
-				Payload: payload,
+				Request: req,
 			}
 
 			beforeHeartbeat := s.lastHeartbeat
@@ -372,12 +368,12 @@ func TestRequestDispatch(t *testing.T) {
 // mockBuffer captures writes and provides reads for testing
 type mockBuffer struct {
 	written []byte
-	framed  []byte  // raw framed data
+	framed  []byte // raw framed data
 }
 
 func (m *mockBuffer) Write(p []byte) (n int, err error) {
 	m.framed = append(m.framed, p...)
-	
+
 	// Strip frame header (4 bytes) if we have enough data
 	if len(m.framed) >= 4 {
 		// Extract payload (skip 4-byte length prefix)

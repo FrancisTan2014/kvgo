@@ -32,7 +32,7 @@ func newReplicaConn(conn net.Conn, replicaLastSeq uint64, lastReplid string) *re
 	return &replicaConn{
 		conn:       conn,
 		framer:     protocol.NewConnFramer(conn),
-		sendCh:     make(chan []byte, replicaSendBuffer),
+		sendCh:     make(chan []byte),
 		lastReplid: lastReplid,
 		lastSeq:    replicaLastSeq,
 		hb:         time.NewTicker(heartbeatInterval),
@@ -170,12 +170,51 @@ func (s *Server) receiveFromPrimary(ctx context.Context, f *protocol.Framer) {
 			return
 		}
 
+		// Handle PING - respond with PONG for heartbeat
+		if req.Cmd == protocol.CmdPing {
+			pongReq := protocol.Request{Cmd: protocol.CmdPong}
+			pongPayload, _ := protocol.EncodeRequest(pongReq)
+			if err := f.Write(pongPayload); err != nil {
+				s.log().Error("failed to send PONG", "error", err)
+				return
+			}
+			continue
+		}
+
 		// Apply write locally (fire-and-forget from primary's perspective).
 		if req.Cmd == protocol.CmdPut {
 			key := string(req.Key)
 			if err := s.db.Put(key, req.Value); err != nil {
 				s.log().Error("replication PUT failed", "key", key, "seq", req.Seq, "error", err)
+
+				// Send NACK for quorum writes that failed
+				if req.RequestId != "" {
+					nackReq := protocol.Request{
+						Cmd:       protocol.CmdNack,
+						RequestId: req.RequestId,
+					}
+					nackPayload, _ := protocol.EncodeRequest(nackReq)
+					if err := f.Write(nackPayload); err != nil {
+						s.log().Error("failed to NACK quorum write",
+							"request_id", req.RequestId,
+							"error", err)
+					}
+				}
 			} else {
+				// Send ACK only for quorum writes (those with RequestId)
+				if req.RequestId != "" {
+					ackReq := protocol.Request{
+						Cmd:       protocol.CmdAck,
+						RequestId: req.RequestId,
+					}
+					ackPayload, _ := protocol.EncodeRequest(ackReq)
+					if err := f.Write(ackPayload); err != nil {
+						s.log().Error("failed to ACK quorum write",
+							"request_id", req.RequestId,
+							"error", err)
+					}
+				}
+
 				s.lastSeq.Store(req.Seq)
 				if err = s.storeState(); err != nil {
 					s.log().Error("failed to store replica state", "error", err)
@@ -231,6 +270,25 @@ func (s *Server) serveReplica(rc *replicaConn) {
 		s.partialSync(rc)
 	}
 
+	// Start unified read loop to handle all incoming messages from replica
+	readCh := make(chan protocol.Request, 10)
+	readErrCh := make(chan error, 1)
+	go func() {
+		for {
+			payload, err := rc.framer.Read()
+			if err != nil {
+				readErrCh <- err
+				return
+			}
+			req, err := protocol.DecodeRequest(payload)
+			if err != nil {
+				s.log().Warn("failed to decode replica message", "error", err)
+				continue
+			}
+			readCh <- req
+		}
+	}()
+
 	for {
 		select {
 		case payload, ok := <-rc.sendCh:
@@ -248,6 +306,26 @@ func (s *Server) serveReplica(rc *replicaConn) {
 			}
 			rc.lastWrite = time.Now()
 
+		case req := <-readCh:
+			// Handle incoming messages from replica
+			switch req.Cmd {
+			case protocol.CmdAck:
+				ctx := &RequestContext{Request: req, Conn: rc.conn}
+				_ = s.handleAck(ctx)
+			case protocol.CmdNack:
+				ctx := &RequestContext{Request: req, Conn: rc.conn}
+				_ = s.handleNack(ctx)
+			case protocol.CmdPong:
+				// PONG received, heartbeat OK
+				s.log().Debug("replica pong received", "replica", rc.conn.RemoteAddr())
+			default:
+				s.log().Warn("unexpected message from replica", "cmd", req.Cmd, "replica", rc.conn.RemoteAddr())
+			}
+
+		case err := <-readErrCh:
+			s.log().Error("replica read failed", "replica", rc.conn.RemoteAddr(), "error", err)
+			return
+
 		case <-rc.hb.C:
 			// heartbeat: ping replica if idle
 			if time.Since(rc.lastWrite) > heartbeatInterval {
@@ -256,12 +334,7 @@ func (s *Server) serveReplica(rc *replicaConn) {
 					s.log().Error("replica ping failed", "replica", rc.conn.RemoteAddr(), "error", err)
 					return
 				}
-
 				s.log().Debug("replica ping sent", "replica", rc.conn.RemoteAddr())
-				if _, err := rc.framer.ReadWithTimeout(pongTimeout); err != nil {
-					s.log().Warn("replica no pong, disconnecting", "replica", rc.conn.RemoteAddr(), "timeout", pongTimeout)
-					return
-				}
 			}
 		}
 	}
@@ -388,14 +461,10 @@ func (s *Server) storeState() error {
 func (s *Server) handleReplicate(ctx *RequestContext) error {
 	if s.isReplica {
 		s.log().Warn("REPLICATE rejected: node is replica")
-		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+		return s.responseStatusError(ctx)
 	}
 
-	req, err := protocol.DecodeRequest(ctx.Payload)
-	if err != nil {
-		s.log().Error("failed to decode replicate request", "replica", ctx.Conn.RemoteAddr())
-		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
-	}
+	req := &ctx.Request
 
 	replid := string(req.Value)
 	rc := newReplicaConn(ctx.Conn, req.Seq, replid)
@@ -416,14 +485,11 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 
 // handleReplicaOf handles the REPLICAOF command to dynamically change replication target.
 func (s *Server) handleReplicaOf(ctx *RequestContext) error {
-	req, err := protocol.DecodeRequest(ctx.Payload)
-	if err != nil {
-		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
-	}
+	req := &ctx.Request
 
 	if err := s.relocate(string(req.Value)); err != nil {
 		s.log().Error("REPLICAOF failed", "error", err)
-		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+		return s.responseStatusError(ctx)
 	}
 	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK})
 }
