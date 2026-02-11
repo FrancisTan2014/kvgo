@@ -142,6 +142,8 @@ func (s *Server) connectToPrimary() (*protocol.Framer, error) {
 	return f, nil
 }
 
+// receiveFromPrimary receives replication stream from primary.
+// Now delegates to standard handleRequest dispatcher for unified handling.
 func (s *Server) receiveFromPrimary(ctx context.Context, f *protocol.Framer) {
 	defer func() {
 		if s.primary != nil {
@@ -150,78 +152,9 @@ func (s *Server) receiveFromPrimary(ctx context.Context, f *protocol.Framer) {
 		}
 	}()
 
-	for {
-		select {
-		case <-ctx.Done():
-			s.log().Info("replication receive cancelled")
-			return
-		default:
-		}
-
-		payload, err := f.Read()
-		if err != nil {
-			s.log().Info("replication stream closed", "error", err)
-			return
-		}
-
-		req, err := protocol.DecodeRequest(payload)
-		if err != nil {
-			s.log().Error("replication decode error", "error", err)
-			return
-		}
-
-		// Handle PING - respond with PONG for heartbeat
-		if req.Cmd == protocol.CmdPing {
-			pongReq := protocol.Request{Cmd: protocol.CmdPong}
-			pongPayload, _ := protocol.EncodeRequest(pongReq)
-			if err := f.Write(pongPayload); err != nil {
-				s.log().Error("failed to send PONG", "error", err)
-				return
-			}
-			continue
-		}
-
-		// Apply write locally (fire-and-forget from primary's perspective).
-		if req.Cmd == protocol.CmdPut {
-			key := string(req.Key)
-			if err := s.db.Put(key, req.Value); err != nil {
-				s.log().Error("replication PUT failed", "key", key, "seq", req.Seq, "error", err)
-
-				// Send NACK for quorum writes that failed
-				if req.RequestId != "" {
-					nackReq := protocol.Request{
-						Cmd:       protocol.CmdNack,
-						RequestId: req.RequestId,
-					}
-					nackPayload, _ := protocol.EncodeRequest(nackReq)
-					if err := f.Write(nackPayload); err != nil {
-						s.log().Error("failed to NACK quorum write",
-							"request_id", req.RequestId,
-							"error", err)
-					}
-				}
-			} else {
-				// Send ACK only for quorum writes (those with RequestId)
-				if req.RequestId != "" {
-					ackReq := protocol.Request{
-						Cmd:       protocol.CmdAck,
-						RequestId: req.RequestId,
-					}
-					ackPayload, _ := protocol.EncodeRequest(ackReq)
-					if err := f.Write(ackPayload); err != nil {
-						s.log().Error("failed to ACK quorum write",
-							"request_id", req.RequestId,
-							"error", err)
-					}
-				}
-
-				s.lastSeq.Store(req.Seq)
-				if err = s.storeState(); err != nil {
-					s.log().Error("failed to store replica state", "error", err)
-				}
-			}
-		}
-	}
+	// Use standard request handler for replication stream
+	// This unifies client and replication connection handling
+	s.handleRequest(s.primary)
 }
 
 // forwardToReplicas sends a write to all connected replicas (non-blocking).

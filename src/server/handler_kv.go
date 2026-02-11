@@ -82,13 +82,82 @@ func (s *Server) doStrongGet(ctx *RequestContext, req *protocol.Request) error {
 
 func (s *Server) handlePut(ctx *RequestContext) error {
 	req := &ctx.Request
-
 	key := string(req.Key)
+
 	if s.isReplica {
-		// Replicas reject direct writes from clients.
+		// Check if this PUT is from our primary (replication stream)
+		s.mu.Lock()
+		isPrimaryConn := (s.primary != nil && ctx.Conn == s.primary)
+		s.mu.Unlock()
+
+		if isPrimaryConn {
+			// Replicated write from primary - apply locally
+			return s.applyReplicatedPut(ctx)
+		}
+
+		// Direct client write to replica - reject with redirect
 		s.log().Warn("PUT rejected on replica", "key", key)
 		return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReadOnly)
 	}
+
+	// Primary processing
+	return s.processPrimaryPut(ctx)
+}
+
+// applyReplicatedPut applies a write received from primary via replication.
+// Sends ACK for quorum writes, NACK on failure.
+func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
+	req := &ctx.Request
+	key := string(req.Key)
+
+	// Apply write locally
+	if err := s.db.Put(key, req.Value); err != nil {
+		s.log().Error("replication PUT failed", "key", key, "seq", req.Seq, "error", err)
+
+		// Send NACK for quorum writes that failed
+		if req.RequestId != "" {
+			nackReq := protocol.Request{
+				Cmd:       protocol.CmdNack,
+				RequestId: req.RequestId,
+			}
+			nackPayload, _ := protocol.EncodeRequest(nackReq)
+			if err := ctx.Framer.Write(nackPayload); err != nil {
+				s.log().Error("failed to NACK quorum write",
+					"request_id", req.RequestId,
+					"error", err)
+			}
+		}
+		return err
+	}
+
+	// Send ACK only for quorum writes (those with RequestId)
+	if req.RequestId != "" {
+		ackReq := protocol.Request{
+			Cmd:       protocol.CmdAck,
+			RequestId: req.RequestId,
+		}
+		ackPayload, _ := protocol.EncodeRequest(ackReq)
+		if err := ctx.Framer.Write(ackPayload); err != nil {
+			s.log().Error("failed to ACK quorum write",
+				"request_id", req.RequestId,
+				"error", err)
+		}
+	}
+
+	// Update replica state
+	s.lastSeq.Store(req.Seq)
+	if err := s.storeState(); err != nil {
+		s.log().Error("failed to store replica state", "error", err)
+	}
+
+	return nil
+}
+
+// processPrimaryPut handles a write on the primary node.
+// Applies locally, forwards to replicas, optionally waits for quorum ACKs.
+func (s *Server) processPrimaryPut(ctx *RequestContext) error {
+	req := &ctx.Request
+	key := string(req.Key)
 
 	if err := s.db.Put(key, req.Value); err != nil {
 		s.log().Error("PUT failed", "key", key, "error", err)
