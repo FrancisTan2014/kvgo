@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// ---------------------------------------------------------------------------
+// PING/PONG Handlers (Heartbeat)
+// ---------------------------------------------------------------------------
+
 // handlePing processes PING requests, which serve as heartbeat messages in replication.
 //
 // Primary → Replica: Sends PING with current seq periodically
@@ -22,5 +26,14 @@ func (s *Server) handlePing(ctx *RequestContext) error {
 	}
 
 	// Primary shouldn't receive PING (replicas send PONG)
+	return nil
+}
+
+// handlePong processes PONG responses from replicas (heartbeat acknowledgment).
+//
+// Replica → Primary: Sends PONG in response to PING
+func (s *Server) handlePong(ctx *RequestContext) error {
+	// Simply acknowledge the heartbeat - connection is alive
+	// No response needed (PONG is the response)
 	return nil
 }
