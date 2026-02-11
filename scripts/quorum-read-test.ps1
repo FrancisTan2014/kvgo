@@ -13,7 +13,7 @@ New-Item -ItemType Directory -Path "$dataDir\r2" | Out-Null
 # Build
 Write-Host "--- Building ---" -ForegroundColor Cyan
 Push-Location $srcDir
-go build -o kv-server.exe .
+go build -o kv-server.exe ./cmd/kv-server
 go build -o kv-cli.exe ./cmd/kv-cli
 Pop-Location
 $serverExe = Join-Path $srcDir "kv-server.exe"

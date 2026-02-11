@@ -14,7 +14,7 @@ New-Item -ItemType Directory -Path "$dataDir\r2" | Out-Null
 # Build
 Write-Host "--- Building ---" -ForegroundColor Cyan
 Push-Location $srcDir
-go build -o kv-server.exe .
+go build -o kv-server.exe ./cmd/kv-server
 go build -o kv-cli.exe ./cmd/kv-cli
 Pop-Location
 $serverExe = Join-Path $srcDir "kv-server.exe"
@@ -29,11 +29,11 @@ Write-Host "=== SCENARIO 1: Quorum Write + Read (All Nodes Healthy) ===" -Foregr
 # Start 3-node cluster
 Write-Host "--- Starting 3-Node Cluster (P=4000, R1=4001, R2=4002) ---" -ForegroundColor Cyan
 $p = Start-Process -FilePath $serverExe -ArgumentList "--port", "4000", "--data-dir", "$dataDir\p" -PassThru -NoNewWindow
-Start-Sleep -Milliseconds 300
+Start-Sleep -Milliseconds 500
 $r1 = Start-Process -FilePath $serverExe -ArgumentList "--port", "4001", "--data-dir", "$dataDir\r1", "--replica-of", "127.0.0.1:4000" -PassThru -NoNewWindow
 $r2 = Start-Process -FilePath $serverExe -ArgumentList "--port", "4002", "--data-dir", "$dataDir\r2", "--replica-of", "127.0.0.1:4000" -PassThru -NoNewWindow
 Write-Host "Primary: $($p.Id), R1: $($r1.Id), R2: $($r2.Id)" -ForegroundColor Yellow
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 2
 
 # Quorum write
 Write-Host "--- Quorum Write: account=Alice balance=100 ---" -ForegroundColor Cyan

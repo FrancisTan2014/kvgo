@@ -35,9 +35,6 @@ func main() {
 	f := protocol.NewConnFramer(conn)
 	scanner := bufio.NewScanner(os.Stdin)
 
-	// Track last sequence number from PUT for read-your-writes guarantee
-	var lastSeq uint64
-
 	for {
 		fmt.Print("> ")
 		if !scanner.Scan() {
@@ -118,15 +115,13 @@ func main() {
 					quorum = true
 				}
 			}
-			seq, err := doPut(f, key, value, quorum, *timeout)
+			_, err := doPut(f, key, value, quorum, *timeout)
 			if err != nil {
 				fmt.Printf("error: %v\n", err)
 				if isConnectionError(err) {
 					fmt.Println("connection lost, exiting")
 					os.Exit(1)
 				}
-			} else if seq > 0 {
-				lastSeq = seq // Track for read-your-writes
 			}
 
 		case "promote":
