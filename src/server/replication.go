@@ -128,9 +128,14 @@ func (s *Server) connectToPrimary() (*protocol.Framer, error) {
 		if len(resp.Value) > 0 {
 			s.replid = string(resp.Value)
 		}
+		// Initialize primarySeq from response to avoid initial staleness
+		s.primarySeq = resp.Seq
 	} else if resp.Status != protocol.StatusOK {
 		_ = conn.Close()
 		return nil, fmt.Errorf("primary rejected replication: status %d", resp.Status)
+	} else {
+		// Partial sync - update primarySeq for accurate lag tracking
+		s.primarySeq = resp.Seq
 	}
 
 	s.log().Info("replication handshake complete")
@@ -143,18 +148,20 @@ func (s *Server) connectToPrimary() (*protocol.Framer, error) {
 }
 
 // receiveFromPrimary receives replication stream from primary.
-// Now delegates to standard handleRequest dispatcher for unified handling.
+// Delegates to standard handleRequest dispatcher, reusing the framer from handshake.
 func (s *Server) receiveFromPrimary(ctx context.Context, f *protocol.Framer) {
+	s.log().Info("receiveFromPrimary started")
 	defer func() {
+		s.log().Info("receiveFromPrimary exiting")
 		if s.primary != nil {
 			_ = s.primary.Close()
 			s.primary = nil
 		}
 	}()
 
-	// Use standard request handler for replication stream
-	// This unifies client and replication connection handling
-	s.handleRequest(s.primary)
+	// Use standard request handler with existing framer (preserves buffered data from handshake)
+	s.handleRequestWithFramer(s.primary, f)
+	s.log().Info("handleRequestWithFramer returned")
 }
 
 // forwardToReplicas sends a write to all connected replicas (non-blocking).
@@ -202,6 +209,7 @@ func (s *Server) serveReplica(rc *replicaConn) {
 // serveReplicaWriter handles async write forwarding and heartbeats for a replica.
 // Runs in a dedicated goroutine until connection closes or channel is closed.
 func (s *Server) serveReplicaWriter(rc *replicaConn) {
+	s.log().Info("serveReplicaWriter started", "replica", rc.conn.RemoteAddr())
 	defer rc.hb.Stop()
 	defer func() {
 		// Clean up: remove from replicas map and close connection.
@@ -250,10 +258,13 @@ func (s *Server) fullResync(rc *replicaConn) {
 	// No deadline during full sync (could be large DB)
 	_ = rc.conn.SetWriteDeadline(time.Time{})
 
-	fullSyncResp, _ := protocol.EncodeResponse(protocol.Response{Status: protocol.StatusFullResync, Value: []byte(s.replid)})
-	_ = rc.framer.Write(fullSyncResp)
-
 	seq := s.seq.Load()
+	fullSyncResp, _ := protocol.EncodeResponse(protocol.Response{
+		Status: protocol.StatusFullResync,
+		Value:  []byte(s.replid),
+		Seq:    seq, // Include primary's current seq so replica can track lag immediately
+	})
+	_ = rc.framer.Write(fullSyncResp)
 	s.db.Range(func(key string, value []byte) bool {
 		req := protocol.Request{
 			Cmd:   protocol.CmdPut,
@@ -283,7 +294,11 @@ func (s *Server) partialSync(rc *replicaConn) {
 
 	_ = rc.conn.SetWriteDeadline(time.Time{})
 
-	psyncResp, _ := protocol.EncodeResponse(protocol.Response{Status: protocol.StatusOK})
+	seq := s.seq.Load()
+	psyncResp, _ := protocol.EncodeResponse(protocol.Response{
+		Status: protocol.StatusOK,
+		Seq:    seq, // Include primary's current seq for replica lag tracking
+	})
 	_ = rc.framer.Write(psyncResp)
 
 	err := s.forwardBacklog(rc.lastSeq, func(e backlogEntry) error {

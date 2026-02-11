@@ -19,6 +19,7 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdPut] = (*Server).handlePut
 	s.requestHandlers[protocol.CmdReplicate] = (*Server).handleReplicate
 	s.requestHandlers[protocol.CmdPing] = (*Server).handlePing
+	s.requestHandlers[protocol.CmdPong] = (*Server).handlePong
 	s.requestHandlers[protocol.CmdPromote] = (*Server).handlePromote
 	s.requestHandlers[protocol.CmdReplicaOf] = (*Server).handleReplicaOf
 	s.requestHandlers[protocol.CmdCleanup] = (*Server).handleCleanup
@@ -27,8 +28,17 @@ func (s *Server) registerRequestHandlers() {
 }
 
 func (s *Server) handleRequest(conn net.Conn) {
-	f := protocol.NewConnFramer(conn)
-	f.SetMaxPayload(s.opts.MaxFrameSize)
+	s.handleRequestWithFramer(conn, nil)
+}
+
+func (s *Server) handleRequestWithFramer(conn net.Conn, existingFramer *protocol.Framer) {
+	var f *protocol.Framer
+	if existingFramer != nil {
+		f = existingFramer
+	} else {
+		f = protocol.NewConnFramer(conn)
+		f.SetMaxPayload(s.opts.MaxFrameSize)
+	}
 
 	for {
 		var payload []byte

@@ -84,11 +84,19 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 	req := &ctx.Request
 	key := string(req.Key)
 
+	s.log().Debug("handlePut called", "key", key, "is_replica", s.isReplica, "from_conn", ctx.Conn.RemoteAddr())
+
 	if s.isReplica {
 		// Check if this PUT is from our primary (replication stream)
 		s.mu.Lock()
 		isPrimaryConn := (s.primary != nil && ctx.Conn == s.primary)
+		primaryAddr := ""
+		if s.primary != nil {
+			primaryAddr = s.primary.RemoteAddr().String()
+		}
 		s.mu.Unlock()
+
+		s.log().Debug("replica PUT check", "is_primary_conn", isPrimaryConn, "primary_addr", primaryAddr, "from_addr", ctx.Conn.RemoteAddr())
 
 		if isPrimaryConn {
 			// Replicated write from primary - apply locally
@@ -146,6 +154,10 @@ func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 
 	// Update replica state
 	s.lastSeq.Store(req.Seq)
+	// Also update primarySeq to track the primary's latest seq (helps reduce staleness window)
+	if req.Seq > s.primarySeq {
+		s.primarySeq = req.Seq
+	}
 	if err := s.storeState(); err != nil {
 		s.log().Error("failed to store replica state", "error", err)
 	}

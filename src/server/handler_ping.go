@@ -14,6 +14,13 @@ func (s *Server) handlePing(ctx *RequestContext) error {
 	if s.isReplica {
 		s.lastHeartbeat = time.Now()
 		s.primarySeq = req.Seq
+
+		// Send PONG as a Request (not Response) so primary's handleRequest can decode it
+		pongReq := protocol.Request{Cmd: protocol.CmdPong}
+		pongPayload, _ := protocol.EncodeRequest(pongReq)
+		return ctx.Framer.Write(pongPayload)
 	}
-	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusPong})
+
+	// Primary shouldn't receive PING (replicas send PONG)
+	return nil
 }
