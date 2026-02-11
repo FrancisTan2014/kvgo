@@ -18,16 +18,15 @@ const (
 	u64Size = 8
 
 	// Uniform request header (all commands):
-	// [cmd u8][flags u8][seq u64][waitForSeq u64][ridLen u32][klen u32][vlen u32][requestId][key][value]
-	requestHeaderSize = u8Size + u8Size + u64Size + u64Size + u32Size + u32Size + u32Size // 30 bytes
+	// [cmd u8][flags u8][seq u64][ridLen u32][klen u32][vlen u32][requestId][key][value]
+	requestHeaderSize = u8Size + u8Size + u64Size + u32Size + u32Size + u32Size // 22 bytes
 	requestCmdOff     = 0
-	requestFlagsOff   = requestCmdOff + u8Size      // 1
-	requestSeqOff     = requestFlagsOff + u8Size    // 2
-	requestWaitSeqOff = requestSeqOff + u64Size     // 10
-	requestRidLenOff  = requestWaitSeqOff + u64Size // 18
-	requestKLenOff    = requestRidLenOff + u32Size  // 22
-	requestVLenOff    = requestKLenOff + u32Size    // 26
-	requestDataOff    = requestHeaderSize           // 30
+	requestFlagsOff   = requestCmdOff + u8Size     // 1
+	requestSeqOff     = requestFlagsOff + u8Size   // 2
+	requestRidLenOff  = requestSeqOff + u64Size    // 10
+	requestKLenOff    = requestRidLenOff + u32Size // 14
+	requestVLenOff    = requestKLenOff + u32Size   // 18
+	requestDataOff    = requestHeaderSize          // 22
 
 	// Response payload: [status u8][seq u64][vlen u32][value]
 	responseHeaderSize = u8Size + u64Size + u32Size // 13 bytes
@@ -40,9 +39,8 @@ const (
 // Request flags indicate which optional fields are meaningful
 const (
 	FlagHasSeq        = 1 << 0 // seq field is meaningful (CmdPut, CmdReplicate)
-	FlagHasWaitForSeq = 1 << 1 // waitForSeq field is meaningful (CmdGet with strong read)
-	FlagRequireQuorum = 1 << 2 // RequireQuorum field is meaningful (CmdPut with quorum write)
-	FlagHasRequestId  = 1 << 3 // requestId field is present (quorum write tracking)
+	FlagRequireQuorum = 1 << 1 // RequireQuorum field is meaningful (CmdPut with quorum write)
+	FlagHasRequestId  = 1 << 2 // requestId field is present (quorum write tracking)
 )
 
 type Cmd uint8
@@ -71,6 +69,7 @@ const (
 	StatusFullResync                    // Primary requires full resync; Value contains snapshot
 	StatusCleaning                      // Cleanup in progress, writes temporarily rejected
 	StatusReplicaTooStale               // Replica exceeds staleness bounds; client should retry another replica or primary
+	StatusQuorumFailed                  // Quorum read failed; insufficient replica responses
 
 	statusMaxKnown // Sentinel: update when adding new status codes
 )
@@ -93,8 +92,7 @@ type Request struct {
 	// - Others: unused (must be empty)
 	Value         []byte
 	Seq           uint64 // Sequence number (meaningful if FlagHasSeq set: CmdPut, CmdReplicate)
-	WaitForSeq    uint64 // Wait for replication (meaningful if FlagHasWaitForSeq set: CmdGet strong read; 0 = eventual)
-	RequireQuorum bool   // Quorum write (meaningful if FlagRequireQuorum set: CmdPut quorum write)
+	RequireQuorum bool   // Quorum write/read (meaningful if FlagRequireQuorum set: CmdPut/CmdGet with quorum)
 	RequestId     string // Unique ID for request tracing (meaningful if FlagHasRequestId set: quorum writes, ACKs)
 }
 
@@ -143,11 +141,11 @@ func statusCanCarryValue(st Status) bool {
 //
 // Uniform request format (all commands):
 //
-//	[cmd uint8][flags uint8][seq uint64 LE][waitForSeq uint64 LE][ridLen uint32 LE][klen uint32 LE][vlen uint32 LE][requestId bytes][key bytes][value bytes]
+//	[cmd uint8][flags uint8][seq uint64 LE][ridLen uint32 LE][klen uint32 LE][vlen uint32 LE][requestId bytes][key bytes][value bytes]
 //
 // Flags indicate which fields are meaningful:
 //   - FlagHasSeq: seq field is used (CmdPut, CmdReplicate)
-//   - FlagHasWaitForSeq: waitForSeq field is used (CmdGet with strong consistency)
+//   - FlagRequireQuorum: quorum consistency is required (CmdPut/CmdGet)
 //   - FlagHasRequestId: requestId field is present (quorum writes, ACKs)
 func EncodeRequest(req Request) ([]byte, error) {
 	ridlen := len(req.RequestId)
@@ -177,10 +175,10 @@ func EncodeRequest(req Request) ([]byte, error) {
 	case CmdReplicate, CmdPing:
 		flags |= FlagHasSeq
 	case CmdGet:
-		if req.WaitForSeq > 0 {
-			flags |= FlagHasWaitForSeq
+		if req.RequireQuorum {
+			flags |= FlagRequireQuorum
 		}
-	case CmdAck:
+	case CmdAck, CmdNack:
 		if req.RequestId != "" {
 			flags |= FlagHasRequestId
 		}
@@ -191,7 +189,6 @@ func EncodeRequest(req Request) ([]byte, error) {
 	buf[requestCmdOff] = byte(req.Cmd)
 	buf[requestFlagsOff] = flags
 	putU64LE(buf, requestSeqOff, req.Seq)
-	putU64LE(buf, requestWaitSeqOff, req.WaitForSeq)
 	putU32LE(buf, requestRidLenOff, ridlen)
 	putU32LE(buf, requestKLenOff, klen)
 	putU32LE(buf, requestVLenOff, vlen)
@@ -216,7 +213,6 @@ func DecodeRequest(payload []byte) (Request, error) {
 	cmd := Cmd(payload[requestCmdOff])
 	flags := payload[requestFlagsOff]
 	seq := binary.LittleEndian.Uint64(payload[requestSeqOff : requestSeqOff+u64Size])
-	waitForSeq := binary.LittleEndian.Uint64(payload[requestWaitSeqOff : requestWaitSeqOff+u64Size])
 	ridU32 := binary.LittleEndian.Uint32(payload[requestRidLenOff : requestRidLenOff+u32Size])
 	kU32 := binary.LittleEndian.Uint32(payload[requestKLenOff : requestKLenOff+u32Size])
 	vU32 := binary.LittleEndian.Uint32(payload[requestVLenOff : requestVLenOff+u32Size])
@@ -256,9 +252,6 @@ func DecodeRequest(payload []byte) (Request, error) {
 	// Apply flags: only set fields if flag indicates they're meaningful
 	if flags&FlagHasSeq != 0 {
 		req.Seq = seq
-	}
-	if flags&FlagHasWaitForSeq != 0 {
-		req.WaitForSeq = waitForSeq
 	}
 	if flags&FlagRequireQuorum != 0 {
 		req.RequireQuorum = true

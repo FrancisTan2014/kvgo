@@ -34,11 +34,7 @@ func TestRequestRoundTrip(t *testing.T) {
 		},
 		{
 			name: "PING with seq (for heartbeat)",
-			req:  Request{Cmd: CmdPing, Seq: 789},  // Seq indicates primary's position
-		},
-		{
-			name: "GET with WaitForSeq (strong read)",
-			req:  Request{Cmd: CmdGet, Key: []byte("k"), WaitForSeq: 100},
+			req:  Request{Cmd: CmdPing, Seq: 789}, // Seq indicates primary's position
 		},
 		{
 			name: "REPLICAOF with primary address",
@@ -69,9 +65,6 @@ func TestRequestRoundTrip(t *testing.T) {
 			}
 			if got.Seq != tt.req.Seq {
 				t.Errorf("Seq = %d, want %d", got.Seq, tt.req.Seq)
-			}
-			if got.WaitForSeq != tt.req.WaitForSeq {
-				t.Errorf("WaitForSeq = %d, want %d", got.WaitForSeq, tt.req.WaitForSeq)
 			}
 		})
 	}

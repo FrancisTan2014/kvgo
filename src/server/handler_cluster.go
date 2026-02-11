@@ -25,6 +25,8 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 	s.replicas[ctx.Conn] = rc
 	s.mu.Unlock()
 
+	s.addReachableNode(ctx.Conn, rc.framer)
+
 	// Perform initial sync (blocks), then spawn writer goroutine.
 	// Connection continues through handleRequest loop for ACK/NACK/PONG.
 	s.serveReplica(rc)
@@ -69,6 +71,9 @@ func (s *Server) relocate(primaryAddr string) error {
 			_ = r.conn.Close()
 			delete(s.replicas, c)
 		}
+
+		// Clear reachable nodes when promoted (will be rebuilt as new replicas connect)
+		s.clearReachableNodes()
 
 		if s.primary != nil {
 			_ = s.primary.Close()

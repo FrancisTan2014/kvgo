@@ -4,6 +4,8 @@ import (
 	"kvgo/protocol"
 	"kvgo/utils"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -12,17 +14,16 @@ import (
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleGet(ctx *RequestContext) error {
-	req := &ctx.Request
-
+	// Replicas check staleness before serving ANY reads (eventual or quorum)
 	if s.isStaleness() {
 		return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReplicaTooStale)
 	}
 
-	if req.WaitForSeq > 0 {
-		return s.doStrongGet(ctx, req)
+	if ctx.Request.RequireQuorum {
+		return s.doQuorumGet(ctx)
 	}
 
-	return s.doGet(ctx, req)
+	return s.doGet(ctx)
 }
 
 func (s *Server) isStaleness() bool {
@@ -35,7 +36,9 @@ func (s *Server) isStaleness() bool {
 	return seqLag > uint64(s.opts.ReplicaStaleLag) || heartbeatAge > s.opts.ReplicaStaleHeartbeat
 }
 
-func (s *Server) doGet(ctx *RequestContext, req *protocol.Request) error {
+func (s *Server) doGet(ctx *RequestContext) error {
+	req := ctx.Request
+
 	key := string(req.Key)
 	val, ok := s.db.Get(key)
 
@@ -43,37 +46,127 @@ func (s *Server) doGet(ctx *RequestContext, req *protocol.Request) error {
 	if !ok {
 		resp = protocol.Response{Status: protocol.StatusNotFound, Seq: s.lastSeq.Load()}
 	} else {
+		seq := s.seq.Load()
+		if s.isReplica {
+			seq = s.lastSeq.Load()
+		}
+
 		// Avoid aliasing engine memory.
 		copyVal := append([]byte(nil), val...)
-		resp = protocol.Response{Status: protocol.StatusOK, Value: copyVal, Seq: s.lastSeq.Load()}
+
+		resp = protocol.Response{Status: protocol.StatusOK, Value: copyVal, Seq: seq}
 	}
 
 	return s.writeResponse(ctx.Framer, resp)
 }
 
-func (s *Server) doStrongGet(ctx *RequestContext, req *protocol.Request) error {
-	maxDuration := 10 * time.Millisecond
-	currentDuration := time.Millisecond
+func (s *Server) doQuorumGet(ctx *RequestContext) error {
+	req := ctx.Request
 
-	startedAt := time.Now()
-	for time.Since(startedAt) < s.opts.StrongReadTimeout {
-
-		if s.lastSeq.Load() >= req.WaitForSeq {
-			return s.doGet(ctx, req)
-		}
-
-		time.Sleep(currentDuration)
-		currentDuration = min(currentDuration*2, maxDuration)
+	key := string(req.Key)
+	localVal, localOk := s.db.Get(key)
+	localSeq := s.seq.Load()
+	if s.isReplica {
+		localSeq = s.lastSeq.Load()
 	}
 
-	// Timeout: replica didn't catch up within StrongReadTimeout window
-	s.log().Warn("strong read timeout: replica lagging, redirecting to primary",
-		"requested_seq", req.WaitForSeq,
-		"current_seq", s.lastSeq.Load(),
-		"elapsed", time.Since(startedAt),
-		"timeout", s.opts.StrongReadTimeout)
+	var wg sync.WaitGroup
+	var ackedCnt atomic.Int32
+	var maxSeq atomic.Uint64
+	var mu sync.Mutex
+	var val []byte
 
-	return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReadOnly)
+	maxSeq.Store(localSeq)
+	if localOk {
+		val = append([]byte(nil), localVal...)
+		ackedCnt.Store(1) // local counts as first ACK
+	}
+
+	req.RequireQuorum = false
+	payload, err := protocol.EncodeRequest(req)
+	if err != nil {
+		s.log().Error("quorum read: failed to encode request", "error", err)
+		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+	}
+
+	// Get snapshot of reachable nodes for safe iteration
+	nodes := s.getReachableNodesSnapshot()
+	n := len(nodes)
+	quorum := utils.ComputeQuorum(n + 1) // +1 for local node
+
+	for c, f := range nodes {
+		wg.Go(func() {
+			value, seq, ok := s.quorumReadFromReplica(f, payload, c.RemoteAddr())
+			if !ok {
+				return
+			}
+
+			ackedCnt.Add(1)
+
+			// Atomically update both seq and val together
+			for {
+				currentMax := maxSeq.Load()
+				if seq <= currentMax {
+					break // This response is older
+				}
+				if maxSeq.CompareAndSwap(currentMax, seq) {
+					mu.Lock()
+					val = value
+					mu.Unlock()
+					break
+				}
+				// CAS failed, retry
+			}
+		})
+	}
+
+	wg.Wait()
+
+	var resp protocol.Response
+	if ackedCnt.Load() >= int32(quorum) {
+		if len(val) == 0 && !localOk {
+			resp = protocol.Response{Status: protocol.StatusNotFound, Seq: maxSeq.Load()}
+		} else {
+			resp = protocol.Response{Status: protocol.StatusOK, Value: val, Seq: maxSeq.Load()}
+		}
+	} else {
+		s.log().Error("quorum read failed: insufficient responses",
+			"responses", ackedCnt.Load(),
+			"quorum_needed", quorum,
+			"total_nodes", n+1)
+		resp = protocol.Response{Status: protocol.StatusQuorumFailed}
+	}
+
+	return s.writeResponse(ctx.Framer, resp)
+}
+
+func (s *Server) quorumReadFromReplica(f *protocol.Framer, payload []byte, remoteAddr net.Addr) (value []byte, seq uint64, ok bool) {
+	deadline := time.Now().Add(s.opts.QuorumReadTimeout)
+	if err := f.WriteWithDeadline(payload, deadline); err != nil {
+		s.log().Warn("quorum read: failed to send GET to replica", "remote_addr", remoteAddr, "error", err)
+		return nil, 0, false
+	}
+
+	resp, err := f.ReadWithDeadline(deadline)
+	if err != nil {
+		s.log().Warn("quorum read: failed to get response", "remote_addr", remoteAddr, "error", err)
+		return nil, 0, false
+	}
+
+	r, err := protocol.DecodeResponse(resp)
+	if err != nil {
+		s.log().Warn("quorum read: decode error", "remote_addr", remoteAddr, "error", err)
+		return nil, 0, false
+	}
+
+	if r.Status != protocol.StatusOK && r.Status != protocol.StatusNotFound {
+		s.log().Warn("quorum read: non-OK response from replica",
+			"remote_addr", remoteAddr,
+			"status", r.Status)
+		return nil, 0, false
+	}
+
+	return r.Value, r.Seq, true
 }
 
 // ---------------------------------------------------------------------------
@@ -179,10 +272,10 @@ func (s *Server) processPrimaryPut(ctx *RequestContext) error {
 	req.Seq = seq
 
 	// Quorum write setup
-	var state *quorumState
+	var state *quorumWriteState
 	if req.RequireQuorum {
 		req.RequestId = utils.GenerateUniqueID() // Only generate ID for quorum writes
-		state = &quorumState{
+		state = &quorumWriteState{
 			needed:        s.computeReplicaAcksNeeded(),
 			ackCh:         make(chan struct{}),
 			ackedReplicas: make(map[net.Conn]struct{}),
@@ -218,15 +311,6 @@ func (s *Server) processPrimaryPut(ctx *RequestContext) error {
 					"seq", seq)
 				return s.responseStatusError(ctx)
 			}
-			state.mu.Lock()
-			acksReceived := state.ackCount
-			state.mu.Unlock()
-			s.log().Info("quorum write succeeded",
-				"key", key,
-				"request_id", req.RequestId,
-				"seq", seq,
-				"acks_received", acksReceived,
-				"quorum_needed", state.needed)
 			return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK, Seq: seq})
 		case <-time.After(s.opts.QuorumWriteTimeout):
 			state.mu.Lock()
@@ -251,7 +335,7 @@ func (s *Server) computeReplicaAcksNeeded() int {
 	s.mu.Lock()
 	totalNodes := len(s.replicas) + 1 // +1 for primary itself
 	s.mu.Unlock()
-	quorum := totalNodes/2 + 1
+	quorum := utils.ComputeQuorum(totalNodes)
 	return quorum - 1 // Primary doesn't ACK itself, only count replica ACKs
 }
 

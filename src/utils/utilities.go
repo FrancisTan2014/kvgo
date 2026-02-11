@@ -12,3 +12,7 @@ func GenerateUniqueID() string {
 	}
 	return fmt.Sprintf("%x", b)
 }
+
+func ComputeQuorum(n int) int {
+	return n/2 + 1
+}

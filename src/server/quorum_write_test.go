@@ -46,7 +46,7 @@ func TestComputeReplicaAcksNeeded(t *testing.T) {
 
 // TestQuorumStateThreadSafety verifies sync.Once prevents double-close (unit test)
 func TestQuorumStateThreadSafety(t *testing.T) {
-	state := &quorumState{
+	state := &quorumWriteState{
 		needed:        2,
 		ackCh:         make(chan struct{}),
 		ackedReplicas: make(map[net.Conn]struct{}),

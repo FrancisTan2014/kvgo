@@ -77,10 +77,22 @@ func (f *Framer) ReadWithTimeout(timeout time.Duration) ([]byte, error) {
 	if timeout == 0 {
 		return f.Read()
 	}
+	return f.ReadWithDeadline(time.Now().Add(timeout))
+}
+
+// ReadWithDeadline reads one frame but fails if the read does not complete by the deadline.
+// This requires the underlying reader to support deadlines (typically net.Conn).
+//
+// Note: this sets a deadline on the underlying connection and clears it afterwards.
+// If you want more control, set deadlines on the net.Conn directly.
+func (f *Framer) ReadWithDeadline(deadline time.Time) ([]byte, error) {
+	if deadline.IsZero() {
+		return f.Read()
+	}
 	if f.readDL == nil {
 		return nil, ErrNoDeadline
 	}
-	if err := f.readDL.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+	if err := f.readDL.SetReadDeadline(deadline); err != nil {
 		return nil, err
 	}
 	defer f.readDL.SetReadDeadline(time.Time{})
@@ -107,10 +119,22 @@ func (f *Framer) WriteWithTimeout(payload []byte, timeout time.Duration) error {
 	if timeout == 0 {
 		return f.Write(payload)
 	}
+	return f.WriteWithDeadline(payload, time.Now().Add(timeout))
+}
+
+// WriteWithDeadline writes one frame but fails if the write does not complete by the deadline.
+// This requires the underlying writer to support deadlines (typically net.Conn).
+//
+// Note: this sets a deadline on the underlying connection and clears it afterwards.
+// If you want more control, set deadlines on the net.Conn directly.
+func (f *Framer) WriteWithDeadline(payload []byte, deadline time.Time) error {
+	if deadline.IsZero() {
+		return f.Write(payload)
+	}
 	if f.writeDL == nil {
 		return ErrNoDeadline
 	}
-	if err := f.writeDL.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+	if err := f.writeDL.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 	defer f.writeDL.SetWriteDeadline(time.Time{})

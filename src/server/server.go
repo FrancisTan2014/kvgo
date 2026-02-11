@@ -69,8 +69,8 @@ type Options struct {
 	BacklogSizeLimit    int64         // default 16MB
 	BacklogTrimDuration time.Duration // default 100ms
 
-	StrongReadTimeout  time.Duration // default 100ms, how long to wait for replica to catch up
 	QuorumWriteTimeout time.Duration // default 500ms, how long to wait for quorum ACKs before timeout (Episode 026)
+	QuorumReadTimeout  time.Duration // default 500ms
 
 	// SyncInterval controls how often the WAL is fsynced (latency vs throughput tradeoff).
 	// Lower values reduce latency but increase fsync overhead.
@@ -84,7 +84,7 @@ type Options struct {
 	Logger *slog.Logger // optional debug logger; nil disables logging
 }
 
-type quorumState struct {
+type quorumWriteState struct {
 	mu            sync.Mutex // Per-request lock
 	needed        int
 	ackCount      int32 // Protected by mu
@@ -118,11 +118,6 @@ type Server struct {
 	replicas map[net.Conn]*replicaConn
 	replid   string
 
-	// Quorum control
-	quorumMu     sync.RWMutex
-	quorumWrites map[string]*quorumState
-	quorumAckCh  chan string // Quorum ack channel
-
 	// Replication state (replica role)
 	isReplica     bool
 	primary       net.Conn
@@ -133,6 +128,15 @@ type Server struct {
 	// Replication loop control
 	replCtx    context.Context
 	replCancel context.CancelFunc
+
+	// Quorum control
+	quorumMu     sync.RWMutex
+	quorumWrites map[string]*quorumWriteState
+	quorumAckCh  chan string // Quorum ack channel
+
+	// Cluster
+	clusterMu      sync.RWMutex
+	reachableNodes map[net.Conn]*protocol.Framer
 
 	// Partial resync backlog
 	backlog       list.List
@@ -169,11 +173,11 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.BacklogTrimDuration <= 0 {
 		opts.BacklogTrimDuration = 100 * time.Millisecond
 	}
-	if opts.StrongReadTimeout <= 0 {
-		opts.StrongReadTimeout = 100 * time.Millisecond
-	}
 	if opts.QuorumWriteTimeout <= 0 {
 		opts.QuorumWriteTimeout = 500 * time.Millisecond
+	}
+	if opts.QuorumReadTimeout <= 0 {
+		opts.QuorumReadTimeout = 500 * time.Millisecond
 	}
 	if opts.ReplicaStaleHeartbeat <= 0 {
 		opts.ReplicaStaleHeartbeat = 5 * time.Second
@@ -182,18 +186,16 @@ func NewServer(opts Options) (*Server, error) {
 		opts.ReplicaStaleLag = 1000
 	}
 
-	isReplica := opts.ReplicaOf != ""
-	replicas := make(map[net.Conn]*replicaConn)
-
 	s := &Server{
 		opts:            opts,
 		conns:           make(map[net.Conn]struct{}),
 		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
-		isReplica:       isReplica,
-		replicas:        replicas,
+		isReplica:       opts.ReplicaOf != "",
+		replicas:        make(map[net.Conn]*replicaConn),
 		lastHeartbeat:   time.Now(), // Initialize heartbeat timer (updated by PING messages)
 		quorumAckCh:     make(chan string),
-		quorumWrites:    make(map[string]*quorumState),
+		quorumWrites:    make(map[string]*quorumWriteState),
+		reachableNodes:  make(map[net.Conn]*protocol.Framer),
 	}
 
 	s.registerRequestHandlers()
@@ -421,6 +423,48 @@ func (s *Server) acceptLoop() {
 			_ = conn.Close()
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Cluster Management Helpers
+// ---------------------------------------------------------------------------
+
+// addReachableNode adds a node to the reachable cluster nodes.
+// Thread-safe: acquires clusterMu.
+func (s *Server) addReachableNode(conn net.Conn, framer *protocol.Framer) {
+	s.clusterMu.Lock()
+	s.reachableNodes[conn] = framer
+	s.clusterMu.Unlock()
+}
+
+// removeReachableNode removes a node from the reachable cluster nodes.
+// Thread-safe: acquires clusterMu.
+func (s *Server) removeReachableNode(conn net.Conn) {
+	s.clusterMu.Lock()
+	delete(s.reachableNodes, conn)
+	s.clusterMu.Unlock()
+}
+
+// clearReachableNodes removes all nodes from the reachable cluster nodes.
+// Thread-safe: acquires clusterMu.
+func (s *Server) clearReachableNodes() {
+	s.clusterMu.Lock()
+	s.reachableNodes = make(map[net.Conn]*protocol.Framer)
+	s.clusterMu.Unlock()
+}
+
+// getReachableNodesSnapshot returns a snapshot of reachable nodes for safe iteration.
+// Thread-safe: acquires clusterMu.RLock.
+// Returns a copy to prevent modification during iteration.
+func (s *Server) getReachableNodesSnapshot() map[net.Conn]*protocol.Framer {
+	s.clusterMu.RLock()
+	defer s.clusterMu.RUnlock()
+
+	snapshot := make(map[net.Conn]*protocol.Framer, len(s.reachableNodes))
+	for conn, framer := range s.reachableNodes {
+		snapshot[conn] = framer
+	}
+	return snapshot
 }
 
 func (s *Server) log() *slog.Logger {

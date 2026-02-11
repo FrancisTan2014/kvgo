@@ -29,7 +29,7 @@ func main() {
 	defer conn.Close()
 
 	fmt.Printf("connected to %s\n", *addr)
-	fmt.Println("commands: get [--strong] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
+	fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 	fmt.Println()
 
 	f := protocol.NewConnFramer(conn)
@@ -59,36 +59,27 @@ func main() {
 
 		case "get":
 			if len(parts) < 2 {
-				fmt.Println("usage: get [--strong] <key>")
+				fmt.Println("usage: get [--quorum] <key>")
 				continue
 			}
-			// Parse flags: get --strong key OR get key --strong
-			var strong bool
+			// Parse flags: get --quorum key OR get key --quorum
+			var quorum bool
 			var key string
-			if parts[1] == "--strong" {
+			if parts[1] == "--quorum" {
 				if len(parts) < 3 {
-					fmt.Println("usage: get [--strong] <key>")
+					fmt.Println("usage: get [--quorum] <key>")
 					continue
 				}
-				strong = true
+				quorum = true
 				key = parts[2]
 			} else {
 				key = parts[1]
-				if len(parts) > 2 && parts[2] == "--strong" {
-					strong = true
+				if len(parts) > 2 && parts[2] == "--quorum" {
+					quorum = true
 				}
 			}
 
-			var waitForSeq uint64
-			if strong {
-				if lastSeq == 0 {
-					fmt.Println("(no writes in this session, --strong has no effect)")
-				} else {
-					waitForSeq = lastSeq
-				}
-			}
-
-			if err := doGet(f, key, waitForSeq, *timeout); err != nil {
+			if err := doGet(f, key, quorum, *timeout); err != nil {
 				fmt.Printf("error: %v\n", err)
 				if isConnectionError(err) {
 					fmt.Println("connection lost, exiting")
@@ -172,7 +163,7 @@ func main() {
 
 		default:
 			fmt.Printf("unknown command: %s\n", cmd)
-			fmt.Println("commands: get [--strong] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
+			fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 		}
 	}
 
@@ -213,8 +204,8 @@ func doPromote(f *protocol.Framer, timeout time.Duration) error {
 	return nil
 }
 
-func doGet(f *protocol.Framer, key string, waitForSeq uint64, timeout time.Duration) error {
-	req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key), WaitForSeq: waitForSeq}
+func doGet(f *protocol.Framer, key string, quorum bool, timeout time.Duration) error {
+	req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key), RequireQuorum: quorum}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -237,16 +228,22 @@ func doGet(f *protocol.Framer, key string, waitForSeq uint64, timeout time.Durat
 	switch resp.Status {
 	case protocol.StatusOK:
 		fmt.Printf("%s\n", resp.Value)
-		if waitForSeq > 0 {
-			fmt.Printf("(strong read: waited for seq=%d, replica at seq=%d)\n", waitForSeq, resp.Seq)
+		if quorum {
+			fmt.Printf("(quorum read: verified across majority, seq=%d)\n", resp.Seq)
 		}
 	case protocol.StatusNotFound:
 		fmt.Println("(not found)")
-		if waitForSeq > 0 {
-			fmt.Printf("(strong read: waited for seq=%d, replica at seq=%d)\n", waitForSeq, resp.Seq)
+		if quorum {
+			fmt.Printf("(verified not found across majority)\n")
 		}
+	case protocol.StatusReplicaTooStale:
+		// Replica too stale, server suggests redirect to primary
+		primaryAddr := string(resp.Value)
+		fmt.Printf("(replica too stale, try primary: %s)\n", primaryAddr)
+	case protocol.StatusQuorumFailed:
+		fmt.Println("(quorum read failed: insufficient replica responses)")
 	case protocol.StatusReadOnly:
-		// Strong read timed out, server suggests redirect to primary
+		// Quorum read timed out or failed, server suggests redirect to primary
 		primaryAddr := string(resp.Value)
 		fmt.Printf("(replica lagging, try primary: %s)\n", primaryAddr)
 	case protocol.StatusError:

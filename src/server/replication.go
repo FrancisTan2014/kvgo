@@ -80,7 +80,7 @@ func (s *Server) replicationLoop(ctx context.Context) {
 			continue
 		}
 
-		s.receiveFromPrimary(ctx, f) // blocks until disconnect or cancel
+		s.receiveFromPrimary(f) // blocks until disconnect or cancel
 	}
 }
 
@@ -144,12 +144,14 @@ func (s *Server) connectToPrimary() (*protocol.Framer, error) {
 	s.primary = conn
 	s.lastHeartbeat = time.Now() // Initialize heartbeat timer on successful connection
 	s.mu.Unlock()
+
+	s.addReachableNode(conn, f)
 	return f, nil
 }
 
 // receiveFromPrimary receives replication stream from primary.
 // Delegates to standard handleRequest dispatcher, reusing the framer from handshake.
-func (s *Server) receiveFromPrimary(ctx context.Context, f *protocol.Framer) {
+func (s *Server) receiveFromPrimary(f *protocol.Framer) {
 	s.log().Info("receiveFromPrimary started")
 	defer func() {
 		s.log().Info("receiveFromPrimary exiting")
@@ -216,6 +218,7 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 		s.mu.Lock()
 		delete(s.replicas, rc.conn)
 		s.mu.Unlock()
+		s.removeReachableNode(rc.conn)
 		_ = rc.conn.Close()
 		s.log().Info("replica disconnected", "replica", rc.conn.RemoteAddr())
 	}()
