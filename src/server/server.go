@@ -423,46 +423,6 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-func (s *Server) relocate(primaryAddr string) error {
-	s.log().Info("switching primary", "address", primaryAddr)
-
-	// Update config immediately
-	s.mu.Lock()
-	s.isReplica = true
-	s.opts.ReplicaOf = primaryAddr
-	s.mu.Unlock()
-
-	// Do cleanup async to avoid blocking client response
-	go func() {
-		s.mu.Lock()
-		// Cancel old replication loop
-		if s.replCancel != nil {
-			s.replCancel()
-		}
-
-		for c, r := range s.replicas {
-			close(r.sendCh)
-			_ = r.conn.Close()
-			delete(s.replicas, c)
-		}
-
-		if s.primary != nil {
-			_ = s.primary.Close()
-			s.primary = nil
-		}
-
-		if s.backlogCancel != nil {
-			s.backlogCancel()
-		}
-		s.mu.Unlock()
-
-		s.db.Clear()
-		s.startReplicationLoop()
-	}()
-
-	return nil
-}
-
 func (s *Server) log() *slog.Logger {
 	if s.opts.Logger != nil {
 		return s.opts.Logger

@@ -9,19 +9,19 @@ import (
 	"time"
 )
 
-// TestComputeQuorum verifies quorum calculation (unit test)
-func TestComputeQuorum(t *testing.T) {
+// TestComputeReplicaAcksNeeded verifies replica ACK calculation (unit test)
+func TestComputeReplicaAcksNeeded(t *testing.T) {
 	tests := []struct {
 		name     string
 		replicas int
 		want     int
 	}{
-		{"1 node (primary only)", 0, 1}, // (0+1)/2 + 1 = 1
-		{"2 nodes", 1, 2},               // (1+1)/2 + 1 = 2
-		{"3 nodes", 2, 2},               // (2+1)/2 + 1 = 2
-		{"4 nodes", 3, 3},               // (3+1)/2 + 1 = 3
-		{"5 nodes", 4, 3},               // (4+1)/2 + 1 = 3
-		{"101 nodes", 100, 51},          // (100+1)/2 + 1 = 51
+		{"1 node (primary only)", 0, 0}, // quorum=1, need 0 replica ACKs
+		{"2 nodes", 1, 1},               // quorum=2, need 1 replica ACK
+		{"3 nodes", 2, 1},               // quorum=2, need 1 replica ACK
+		{"4 nodes", 3, 2},               // quorum=3, need 2 replica ACKs
+		{"5 nodes", 4, 2},               // quorum=3, need 2 replica ACKs
+		{"101 nodes", 100, 50},          // quorum=51, need 50 replica ACKs
 	}
 
 	for _, tt := range tests {
@@ -35,10 +35,10 @@ func TestComputeQuorum(t *testing.T) {
 				s.replicas[&fakeConns[i]] = &replicaConn{}
 			}
 
-			got := s.computeQuorum()
+			got := s.computeReplicaAcksNeeded()
 
 			if got != tt.want {
-				t.Errorf("computeQuorum() = %d, want %d (replicas=%d, actual len=%d)", got, tt.want, tt.replicas, len(s.replicas))
+				t.Errorf("computeReplicaAcksNeeded() = %d, want %d (replicas=%d, actual len=%d)", got, tt.want, tt.replicas, len(s.replicas))
 			}
 		})
 	}
@@ -143,7 +143,7 @@ func TestQuorumWrite_Success(t *testing.T) {
 		}
 	}
 
-	quorum := (len(replicas)+1)/2 + 1 // Same calculation as computeQuorum
+	quorum := (len(replicas)+1)/2 + 1 // Quorum size (majority of total nodes)
 	if count < quorum {
 		t.Errorf("only %d/%d nodes have the key, need quorum of %d", count, len(replicas)+1, quorum)
 	}

@@ -78,7 +78,7 @@ func main() {
 					strong = true
 				}
 			}
-			
+
 			var waitForSeq uint64
 			if strong {
 				if lastSeq == 0 {
@@ -87,7 +87,7 @@ func main() {
 					waitForSeq = lastSeq
 				}
 			}
-			
+
 			if err := doGet(f, key, waitForSeq, *timeout); err != nil {
 				fmt.Printf("error: %v\n", err)
 				if isConnectionError(err) {
