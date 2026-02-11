@@ -10,7 +10,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // handleReplicate handles the REPLICATE command from a replica wanting to sync.
-// This handler takes over the connection - serveReplica blocks until disconnection.
+// After initial sync, connection returns to normal request loop for ACK/NACK/PONG.
 func (s *Server) handleReplicate(ctx *RequestContext) error {
 	if s.isReplica {
 		s.log().Warn("REPLICATE rejected: node is replica")
@@ -25,12 +25,8 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 	s.replicas[ctx.Conn] = rc
 	s.mu.Unlock()
 
-	// Mark connection as taken over BEFORE blocking call.
-	// serveReplica will handle all communication until replica disconnects.
-	ctx.takenOver = true
-
-	// serveReplica blocks until replica disconnects.
-	// Connection cleanup happens inside serveReplica's defer.
+	// Perform initial sync (blocks), then spawn writer goroutine.
+	// Connection continues through handleRequest loop for ACK/NACK/PONG.
 	s.serveReplica(rc)
 
 	return nil

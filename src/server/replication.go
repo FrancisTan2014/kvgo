@@ -240,19 +240,9 @@ func (s *Server) forwardToReplicas(payload []byte, seq uint64) {
 	}
 }
 
-// serveReplica runs a dedicated goroutine per replica that forwards writes
-// and sends heartbeats when idle to detect dead connections.
+// serveReplica performs initial sync, then spawns a writer goroutine.
+// After this returns, the connection continues through normal handleRequest loop.
 func (s *Server) serveReplica(rc *replicaConn) {
-	defer rc.hb.Stop()
-	defer func() {
-		// Clean up: remove from replicas map and close connection.
-		s.mu.Lock()
-		delete(s.replicas, rc.conn)
-		s.mu.Unlock()
-		_ = rc.conn.Close()
-		s.log().Info("replica disconnected", "replica", rc.conn.RemoteAddr())
-	}()
-
 	// Check timeline compatibility
 	if rc.lastReplid != "" && rc.lastReplid != s.replid {
 		s.log().Error("incompatible replid detected — replica was following different primary",
@@ -270,30 +260,30 @@ func (s *Server) serveReplica(rc *replicaConn) {
 		s.partialSync(rc)
 	}
 
-	// Start unified read loop to handle all incoming messages from replica
-	readCh := make(chan protocol.Request, 10)
-	readErrCh := make(chan error, 1)
-	go func() {
-		for {
-			payload, err := rc.framer.Read()
-			if err != nil {
-				readErrCh <- err
-				return
-			}
-			req, err := protocol.DecodeRequest(payload)
-			if err != nil {
-				s.log().Warn("failed to decode replica message", "error", err)
-				continue
-			}
-			readCh <- req
-		}
+	// Spawn writer goroutine to handle async write forwarding + heartbeats
+	s.wg.Go(func() {
+		s.serveReplicaWriter(rc)
+	})
+}
+
+// serveReplicaWriter handles async write forwarding and heartbeats for a replica.
+// Runs in a dedicated goroutine until connection closes or channel is closed.
+func (s *Server) serveReplicaWriter(rc *replicaConn) {
+	defer rc.hb.Stop()
+	defer func() {
+		// Clean up: remove from replicas map and close connection.
+		s.mu.Lock()
+		delete(s.replicas, rc.conn)
+		s.mu.Unlock()
+		_ = rc.conn.Close()
+		s.log().Info("replica disconnected", "replica", rc.conn.RemoteAddr())
 	}()
 
 	for {
 		select {
 		case payload, ok := <-rc.sendCh:
 			if !ok {
-				// Channel closed
+				// Channel closed - replica removed
 				return
 			}
 			if err := rc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -306,34 +296,15 @@ func (s *Server) serveReplica(rc *replicaConn) {
 			}
 			rc.lastWrite = time.Now()
 
-		case req := <-readCh:
-			// Handle incoming messages from replica
-			switch req.Cmd {
-			case protocol.CmdAck:
-				ctx := &RequestContext{Request: req, Conn: rc.conn}
-				_ = s.handleAck(ctx)
-			case protocol.CmdNack:
-				ctx := &RequestContext{Request: req, Conn: rc.conn}
-				_ = s.handleNack(ctx)
-			case protocol.CmdPong:
-				// PONG received, heartbeat OK
-				s.log().Debug("replica pong received", "replica", rc.conn.RemoteAddr())
-			default:
-				s.log().Warn("unexpected message from replica", "cmd", req.Cmd, "replica", rc.conn.RemoteAddr())
-			}
-
-		case err := <-readErrCh:
-			s.log().Error("replica read failed", "replica", rc.conn.RemoteAddr(), "error", err)
-			return
-
 		case <-rc.hb.C:
-			// heartbeat: ping replica if idle
+			// Send PING if idle to detect dead connections
 			if time.Since(rc.lastWrite) > heartbeatInterval {
 				ping, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing, Seq: s.seq.Load()})
 				if err := rc.framer.Write(ping); err != nil {
 					s.log().Error("replica ping failed", "replica", rc.conn.RemoteAddr(), "error", err)
 					return
 				}
+				rc.lastWrite = time.Now()
 				s.log().Debug("replica ping sent", "replica", rc.conn.RemoteAddr())
 			}
 		}
