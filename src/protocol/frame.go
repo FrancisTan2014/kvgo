@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -26,12 +27,15 @@ type deadlineWriter interface{ SetWriteDeadline(time.Time) error }
 // Framer reads and writes length-prefixed frames.
 //
 // Framing is required because TCP is a byte stream; it does not preserve message boundaries.
+// Thread-safe: internal mutexes serialize Read/Write operations independently.
 type Framer struct {
 	r          *bufio.Reader
 	w          *bufio.Writer
 	maxPayload int
 	readDL     deadlineReader
 	writeDL    deadlineWriter
+	readMu     sync.Mutex // protects read operations
+	writeMu    sync.Mutex // protects write operations
 }
 
 // NewConnFramer is a convenience for the common server/client case.
@@ -63,7 +67,11 @@ func NewFramer(r io.Reader, w io.Writer) *Framer {
 // If you set this too large, a peer can force large allocations.
 func (f *Framer) SetMaxPayload(n int) { f.maxPayload = n }
 
-func (f *Framer) Read() ([]byte, error) { return readFrameMax(f.r, f.maxPayload) }
+func (f *Framer) Read() ([]byte, error) {
+	f.readMu.Lock()
+	defer f.readMu.Unlock()
+	return readFrameMax(f.r, f.maxPayload)
+}
 
 // ReadWithTimeout reads one frame but fails if the read does not complete within timeout.
 // This requires the underlying reader to support deadlines (typically net.Conn).
@@ -101,6 +109,8 @@ func (f *Framer) ReadWithDeadline(deadline time.Time) ([]byte, error) {
 
 // Write writes one frame.
 func (f *Framer) Write(payload []byte) error {
+	f.writeMu.Lock()
+	defer f.writeMu.Unlock()
 	if err := writeFrame(f.w, payload); err != nil {
 		return err
 	}
