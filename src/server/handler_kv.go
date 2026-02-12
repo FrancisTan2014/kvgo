@@ -2,8 +2,8 @@ package server
 
 import (
 	"kvgo/protocol"
+	"kvgo/transport"
 	"kvgo/utils"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,22 +44,22 @@ func (s *Server) doGet(ctx *RequestContext) error {
 	key := string(req.Key)
 	val, ok := s.db.Get(key)
 
+	// Determine which sequence number to report
+	seq := s.seq.Load()
+	if s.isReplica {
+		seq = s.lastSeq.Load()
+	}
+
 	var resp protocol.Response
 	if !ok {
-		resp = protocol.Response{Status: protocol.StatusNotFound, Seq: s.lastSeq.Load()}
+		resp = protocol.Response{Status: protocol.StatusNotFound, Seq: seq}
 	} else {
-		seq := s.seq.Load()
-		if s.isReplica {
-			seq = s.lastSeq.Load()
-		}
-
 		// Avoid aliasing engine memory.
 		copyVal := append([]byte(nil), val...)
-
 		resp = protocol.Response{Status: protocol.StatusOK, Value: copyVal, Seq: seq}
 	}
 
-	return s.writeResponse(ctx.Framer, resp)
+	return s.writeResponse(ctx.Transport, resp)
 }
 
 func (s *Server) doQuorumGet(ctx *RequestContext) error {
@@ -88,7 +88,7 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		s.log().Error("quorum read: failed to encode request", "error", err)
-		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+		return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusError})
 	}
 
 	// Get snapshot of reachable nodes for safe iteration
@@ -96,9 +96,9 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 	n := len(nodes)
 	quorum := utils.ComputeQuorum(n + 1) // +1 for local node
 
-	for c, f := range nodes {
+	for addr, t := range nodes {
 		wg.Go(func() {
-			value, seq, ok := s.quorumReadFromReplica(f, payload, c.RemoteAddr())
+			value, seq, ok := s.quorumReadFromReplica(t, payload, addr)
 			if !ok {
 				return
 			}
@@ -139,17 +139,11 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 		resp = protocol.Response{Status: protocol.StatusQuorumFailed}
 	}
 
-	return s.writeResponse(ctx.Framer, resp)
+	return s.writeResponse(ctx.Transport, resp)
 }
 
-func (s *Server) quorumReadFromReplica(f *protocol.Framer, payload []byte, remoteAddr net.Addr) (value []byte, seq uint64, ok bool) {
-	deadline := time.Now().Add(s.opts.QuorumReadTimeout)
-	if err := f.WriteWithDeadline(payload, deadline); err != nil {
-		s.log().Warn("quorum read: failed to send GET to replica", "remote_addr", remoteAddr, "error", err)
-		return nil, 0, false
-	}
-
-	resp, err := f.ReadWithDeadline(deadline)
+func (s *Server) quorumReadFromReplica(t transport.RequestTransport, payload []byte, remoteAddr string) (value []byte, seq uint64, ok bool) {
+	resp, err := t.Request(payload, s.opts.QuorumReadTimeout)
 	if err != nil {
 		s.log().Warn("quorum read: failed to get response", "remote_addr", remoteAddr, "error", err)
 		return nil, 0, false
@@ -179,19 +173,19 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 	req := &ctx.Request
 	key := string(req.Key)
 
-	s.log().Debug("handlePut called", "key", key, "is_replica", s.isReplica, "from_conn", ctx.Conn.RemoteAddr())
+	s.log().Debug("handlePut called", "key", key, "is_replica", s.isReplica, "from_conn", ctx.Transport.RemoteAddr())
 
 	if s.isReplica {
 		// Check if this PUT is from our primary (replication stream)
 		s.mu.Lock()
-		isPrimaryConn := (s.primary != nil && ctx.Conn == s.primary)
+		isPrimaryConn := (s.primary != nil && ctx.Transport == s.primary)
 		primaryAddr := ""
 		if s.primary != nil {
-			primaryAddr = s.primary.RemoteAddr().String()
+			primaryAddr = s.primary.RemoteAddr()
 		}
 		s.mu.Unlock()
 
-		s.log().Debug("replica PUT check", "is_primary_conn", isPrimaryConn, "primary_addr", primaryAddr, "from_addr", ctx.Conn.RemoteAddr())
+		s.log().Debug("replica PUT check", "is_primary_conn", isPrimaryConn, "primary_addr", primaryAddr, "from_addr", ctx.Transport.RemoteAddr())
 
 		if isPrimaryConn {
 			// Replicated write from primary - apply locally
@@ -224,7 +218,7 @@ func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 				RequestId: req.RequestId,
 			}
 			nackPayload, _ := protocol.EncodeRequest(nackReq)
-			if err := ctx.Framer.Write(nackPayload); err != nil {
+			if err := ctx.Transport.Send(nackPayload); err != nil {
 				s.log().Error("failed to NACK quorum write",
 					"request_id", req.RequestId,
 					"error", err)
@@ -240,7 +234,7 @@ func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 			RequestId: req.RequestId,
 		}
 		ackPayload, _ := protocol.EncodeRequest(ackReq)
-		if err := ctx.Framer.Write(ackPayload); err != nil {
+		if err := ctx.Transport.Send(ackPayload); err != nil {
 			s.log().Error("failed to ACK quorum write",
 				"request_id", req.RequestId,
 				"error", err)
@@ -280,7 +274,7 @@ func (s *Server) processPrimaryPut(ctx *RequestContext) error {
 		state = &quorumWriteState{
 			needed:        s.computeReplicaAcksNeeded(),
 			ackCh:         make(chan struct{}),
-			ackedReplicas: make(map[net.Conn]struct{}),
+			ackedReplicas: make(map[string]struct{}),
 		}
 		s.quorumMu.Lock()
 		s.quorumWrites[req.RequestId] = state
@@ -313,7 +307,7 @@ func (s *Server) processPrimaryPut(ctx *RequestContext) error {
 					"seq", seq)
 				return s.responseStatusError(ctx)
 			}
-			return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK, Seq: seq})
+			return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusOK, Seq: seq})
 		case <-time.After(s.opts.QuorumWriteTimeout):
 			state.mu.Lock()
 			acksReceived := state.ackCount
@@ -329,7 +323,7 @@ func (s *Server) processPrimaryPut(ctx *RequestContext) error {
 			return s.responseStatusError(ctx)
 		}
 	} else {
-		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK, Seq: seq})
+		return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusOK, Seq: seq})
 	}
 }
 
@@ -346,12 +340,12 @@ func (s *Server) computeReplicaAcksNeeded() int {
 // ---------------------------------------------------------------------------
 
 func (s *Server) responseStatusWithPrimaryAddress(ctx *RequestContext, status protocol.Status) error {
-	return s.writeResponse(ctx.Framer, protocol.Response{
+	return s.writeResponse(ctx.Transport, protocol.Response{
 		Status: status,
 		Value:  []byte(s.opts.ReplicaOf), // Primary address for client redirect
 	})
 }
 
 func (s *Server) responseStatusError(ctx *RequestContext) error {
-	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusError})
+	return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusError})
 }

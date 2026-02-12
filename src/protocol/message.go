@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/binary"
 	"errors"
+	"kvgo/transport"
 	"math"
 )
 
@@ -119,7 +120,7 @@ func lenFromU32(u uint32) (int, bool) {
 
 func ensureU32Len(n int) error {
 	if uint64(n) > uint64(^uint32(0)) {
-		return ErrFrameTooLarge
+		return transport.ErrFrameTooLarge
 	}
 	return nil
 }

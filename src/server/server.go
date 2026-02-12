@@ -8,6 +8,7 @@ import (
 	"io"
 	"kvgo/engine"
 	"kvgo/protocol"
+	"kvgo/transport"
 	"kvgo/utils"
 	"log/slog"
 	"net"
@@ -57,6 +58,7 @@ var (
 )
 
 type Options struct {
+	Protocol  string // ProtocolTCP (default); future: QUIC, gRPC, etc.
 	Network   string // NetworkTCP, NetworkTCP4, NetworkTCP6, or NetworkUnix
 	Host      string // address, or socket path when Network is NetworkUnix
 	Port      uint16 // ignored when Network is NetworkUnix
@@ -90,8 +92,8 @@ type quorumWriteState struct {
 	ackCount      int32 // Protected by mu
 	ackCh         chan struct{}
 	closeOnce     sync.Once
-	failed        atomic.Bool           // true if NACK received
-	ackedReplicas map[net.Conn]struct{} // Track which replicas ACK'd (protected by mu)
+	failed        atomic.Bool         // true if NACK received
+	ackedReplicas map[string]struct{} // Track which replicas ACK'd by address (protected by mu)
 }
 
 type Server struct {
@@ -108,19 +110,19 @@ type Server struct {
 	// Connection management
 	mu    sync.Mutex
 	wg    sync.WaitGroup
-	conns map[net.Conn]struct{}
+	conns map[transport.StreamTransport]struct{}
 
 	// Request dispatch
 	requestHandlers map[protocol.Cmd]HandlerFunc
 
 	// Replication state (primary role)
 	seq      atomic.Uint64 // monotonic sequence number for writes
-	replicas map[net.Conn]*replicaConn
+	replicas map[transport.StreamTransport]*replicaConn
 	replid   string
 
 	// Replication state (replica role)
 	isReplica     bool
-	primary       net.Conn
+	primary       transport.StreamTransport
 	lastSeq       atomic.Uint64 // last applied sequence number
 	lastHeartbeat time.Time     // updated from heartbeat messages
 	primarySeq    uint64        // primary's position from heartbeat; compared with lastSeq for staleness detection
@@ -134,9 +136,9 @@ type Server struct {
 	quorumWrites map[string]*quorumWriteState
 	quorumAckCh  chan string // Quorum ack channel
 
-	// Cluster
+	// Cluster (keyed by remote address for quorum reads)
 	clusterMu      sync.RWMutex
-	reachableNodes map[net.Conn]*protocol.Framer
+	reachableNodes map[string]transport.RequestTransport
 
 	// Partial resync backlog
 	backlog       list.List
@@ -188,14 +190,14 @@ func NewServer(opts Options) (*Server, error) {
 
 	s := &Server{
 		opts:            opts,
-		conns:           make(map[net.Conn]struct{}),
+		conns:           make(map[transport.StreamTransport]struct{}),
 		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
 		isReplica:       opts.ReplicaOf != "",
-		replicas:        make(map[net.Conn]*replicaConn),
+		replicas:        make(map[transport.StreamTransport]*replicaConn),
 		lastHeartbeat:   time.Now(), // Initialize heartbeat timer (updated by PING messages)
 		quorumAckCh:     make(chan string),
 		quorumWrites:    make(map[string]*quorumWriteState),
-		reachableNodes:  make(map[net.Conn]*protocol.Framer),
+		reachableNodes:  make(map[string]transport.RequestTransport),
 	}
 
 	s.registerRequestHandlers()
@@ -398,7 +400,7 @@ func (s *Server) closeConnections() {
 	if !s.isReplica {
 		for _, rc := range s.replicas {
 			close(rc.sendCh) // signal writer goroutine to exit
-			_ = rc.conn.Close()
+			_ = rc.transport.Close()
 		}
 	}
 	s.mu.Unlock()
@@ -411,16 +413,19 @@ func (s *Server) acceptLoop() {
 			return
 		}
 
+		// Wrap immediately in transport
+		t := transport.NewStreamTransport(s.opts.Protocol, conn)
+
 		s.mu.Lock()
-		s.conns[conn] = struct{}{}
+		s.conns[t] = struct{}{}
 		s.mu.Unlock()
 
 		s.wg.Go(func() {
-			s.handleRequest(conn)
+			s.handleRequest(t)
 			s.mu.Lock()
-			delete(s.conns, conn)
+			delete(s.conns, t)
 			s.mu.Unlock()
-			_ = conn.Close()
+			_ = t.Close()
 		})
 	}
 }
@@ -431,17 +436,17 @@ func (s *Server) acceptLoop() {
 
 // addReachableNode adds a node to the reachable cluster nodes.
 // Thread-safe: acquires clusterMu.
-func (s *Server) addReachableNode(conn net.Conn, framer *protocol.Framer) {
+func (s *Server) addReachableNode(addr string, t transport.RequestTransport) {
 	s.clusterMu.Lock()
-	s.reachableNodes[conn] = framer
+	s.reachableNodes[addr] = t
 	s.clusterMu.Unlock()
 }
 
 // removeReachableNode removes a node from the reachable cluster nodes.
 // Thread-safe: acquires clusterMu.
-func (s *Server) removeReachableNode(conn net.Conn) {
+func (s *Server) removeReachableNode(addr string) {
 	s.clusterMu.Lock()
-	delete(s.reachableNodes, conn)
+	delete(s.reachableNodes, addr)
 	s.clusterMu.Unlock()
 }
 
@@ -449,20 +454,20 @@ func (s *Server) removeReachableNode(conn net.Conn) {
 // Thread-safe: acquires clusterMu.
 func (s *Server) clearReachableNodes() {
 	s.clusterMu.Lock()
-	s.reachableNodes = make(map[net.Conn]*protocol.Framer)
+	s.reachableNodes = make(map[string]transport.RequestTransport)
 	s.clusterMu.Unlock()
 }
 
 // getReachableNodesSnapshot returns a snapshot of reachable nodes for safe iteration.
 // Thread-safe: acquires clusterMu.RLock.
 // Returns a copy to prevent modification during iteration.
-func (s *Server) getReachableNodesSnapshot() map[net.Conn]*protocol.Framer {
+func (s *Server) getReachableNodesSnapshot() map[string]transport.RequestTransport {
 	s.clusterMu.RLock()
 	defer s.clusterMu.RUnlock()
 
-	snapshot := make(map[net.Conn]*protocol.Framer, len(s.reachableNodes))
-	for conn, framer := range s.reachableNodes {
-		snapshot[conn] = framer
+	snapshot := make(map[string]transport.RequestTransport, len(s.reachableNodes))
+	for addr, t := range s.reachableNodes {
+		snapshot[addr] = t
 	}
 	return snapshot
 }

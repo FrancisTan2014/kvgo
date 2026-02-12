@@ -23,15 +23,16 @@ func (s *Server) handleAck(ctx *RequestContext) error {
 	defer state.mu.Unlock()
 
 	// Check if this specific replica already ACK'd (deduplication)
-	if _, alreadyAcked := state.ackedReplicas[ctx.Conn]; alreadyAcked {
+	remoteAddr := ctx.Transport.RemoteAddr()
+	if _, alreadyAcked := state.ackedReplicas[remoteAddr]; alreadyAcked {
 		s.log().Debug("duplicate ACK from same replica ignored",
 			"request_id", ctx.Request.RequestId,
-			"replica", ctx.Conn.RemoteAddr())
+			"replica", remoteAddr)
 		return nil
 	}
 
 	// Mark this replica as having ACK'd
-	state.ackedReplicas[ctx.Conn] = struct{}{}
+	state.ackedReplicas[remoteAddr] = struct{}{}
 	state.ackCount++
 
 	if state.ackCount >= int32(state.needed) {
@@ -62,19 +63,20 @@ func (s *Server) handleNack(ctx *RequestContext) error {
 	defer state.mu.Unlock()
 
 	// Check if this specific replica already responded (deduplication)
-	if _, alreadyProcessed := state.ackedReplicas[ctx.Conn]; alreadyProcessed {
+	remoteAddr := ctx.Transport.RemoteAddr()
+	if _, alreadyProcessed := state.ackedReplicas[remoteAddr]; alreadyProcessed {
 		s.log().Debug("duplicate NACK from same replica ignored",
 			"request_id", ctx.Request.RequestId,
-			"replica", ctx.Conn.RemoteAddr())
+			"replica", remoteAddr)
 		return nil
 	}
 
 	// Mark this replica as having responded
-	state.ackedReplicas[ctx.Conn] = struct{}{}
+	state.ackedReplicas[remoteAddr] = struct{}{}
 
 	s.log().Warn("replica NACK'd write",
 		"request_id", ctx.Request.RequestId,
-		"replica", ctx.Conn.RemoteAddr())
+		"replica", remoteAddr)
 
 	// NACK means this replica failed - can't reach quorum
 	// Close channel to fail fast instead of waiting for timeout

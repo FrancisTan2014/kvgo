@@ -1,4 +1,4 @@
-package protocol
+package transport
 
 import (
 	"bufio"
@@ -14,10 +14,10 @@ import (
 const DefaultMaxFrameSize = 16 << 20 // 16 MiB
 
 var (
-	ErrFrameTooLarge  = errors.New("protocol: frame too large")
-	ErrInvalidFrame   = errors.New("protocol: invalid frame")
-	ErrInvalidTimeout = errors.New("protocol: invalid timeout")
-	ErrNoDeadline     = errors.New("protocol: reader/writer does not support deadlines")
+	ErrFrameTooLarge  = errors.New("transport: frame too large")
+	ErrInvalidFrame   = errors.New("transport: invalid frame")
+	ErrInvalidTimeout = errors.New("transport: invalid timeout")
+	ErrNoDeadline     = errors.New("transport: reader/writer does not support deadlines")
 )
 
 type deadlineReader interface{ SetReadDeadline(time.Time) error }
@@ -26,6 +26,8 @@ type deadlineWriter interface{ SetWriteDeadline(time.Time) error }
 // Framer reads and writes length-prefixed frames.
 //
 // Framing is required because TCP is a byte stream; it does not preserve message boundaries.
+// This is a transport-layer concern - it defines HOW to delimit messages on a stream,
+// independent of WHAT those messages contain (see protocol package for message format).
 type Framer struct {
 	r          *bufio.Reader
 	w          *bufio.Writer
@@ -181,4 +183,14 @@ func writeFrame(w io.Writer, payload []byte) error {
 	}
 	_, err := w.Write(payload)
 	return err
+}
+
+// WriteFrameForTest is exported for protocol test helpers.
+func WriteFrameForTest(w io.Writer, payload []byte) error {
+	return writeFrame(w, payload)
+}
+
+// ReadFrameMaxForTest is exported for protocol test helpers.
+func ReadFrameMaxForTest(r io.Reader, maxPayload int) ([]byte, error) {
+	return readFrameMax(r, maxPayload)
 }

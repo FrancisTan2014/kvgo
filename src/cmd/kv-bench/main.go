@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"kvgo/protocol"
+	"kvgo/transport"
 	"math/rand"
 	"net"
 	"sort"
@@ -81,7 +82,7 @@ func runWorker(id int, keys []string, values [][]byte, st *stats) {
 	}
 	defer conn.Close()
 
-	f := protocol.NewConnFramer(conn)
+	f := transport.NewConnFramer(conn)
 	lats := make([]time.Duration, 0, len(keys))
 	errs := 0
 

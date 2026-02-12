@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"kvgo/protocol"
+	"kvgo/transport"
 	"net"
 	"os"
 	"strings"
@@ -32,7 +33,7 @@ func main() {
 	fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
 	fmt.Println()
 
-	f := protocol.NewConnFramer(conn)
+	f := transport.NewConnFramer(conn)
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
@@ -167,7 +168,7 @@ func main() {
 	}
 }
 
-func doPromote(f *protocol.Framer, timeout time.Duration) error {
+func doPromote(f *transport.Framer, timeout time.Duration) error {
 	req := protocol.Request{Cmd: protocol.CmdPromote}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
@@ -199,7 +200,7 @@ func doPromote(f *protocol.Framer, timeout time.Duration) error {
 	return nil
 }
 
-func doGet(f *protocol.Framer, key string, quorum bool, timeout time.Duration) error {
+func doGet(f *transport.Framer, key string, quorum bool, timeout time.Duration) error {
 	req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key), RequireQuorum: quorum}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
@@ -249,7 +250,7 @@ func doGet(f *protocol.Framer, key string, quorum bool, timeout time.Duration) e
 	return nil
 }
 
-func doPut(f *protocol.Framer, key, value string, quorum bool, timeout time.Duration) (uint64, error) {
+func doPut(f *transport.Framer, key, value string, quorum bool, timeout time.Duration) (uint64, error) {
 	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value), RequireQuorum: quorum}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
@@ -299,7 +300,7 @@ func doPutToPrimary(key, value string, quorum bool, primaryAddr string, timeout 
 	}
 	defer conn.Close()
 
-	f := protocol.NewConnFramer(conn)
+	f := transport.NewConnFramer(conn)
 	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value), RequireQuorum: quorum}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
@@ -336,7 +337,7 @@ func doPutToPrimary(key, value string, quorum bool, primaryAddr string, timeout 
 	return 0, nil
 }
 
-func doReplicaOf(f *protocol.Framer, primaryAddr string, timeout time.Duration) error {
+func doReplicaOf(f *transport.Framer, primaryAddr string, timeout time.Duration) error {
 	req := protocol.Request{Cmd: protocol.CmdReplicaOf, Value: []byte(primaryAddr)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
@@ -368,7 +369,7 @@ func doReplicaOf(f *protocol.Framer, primaryAddr string, timeout time.Duration) 
 	return nil
 }
 
-func doCleanup(f *protocol.Framer, timeout time.Duration) error {
+func doCleanup(f *transport.Framer, timeout time.Duration) error {
 	req := protocol.Request{Cmd: protocol.CmdCleanup}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {

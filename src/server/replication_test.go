@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"kvgo/protocol"
+	"kvgo/transport"
 	"net"
 	"testing"
 	"time"
@@ -169,24 +170,28 @@ func TestReplicaConnectionIdentity(t *testing.T) {
 	}
 	defer serverClientConn.Close()
 
+	// Wrap connections in transports
+	serverPrimaryTransport := transport.NewStreamTransport(transport.ProtocolTCP, serverPrimaryConn)
+
 	// Create replica server with primary connection set
 	s := &Server{
 		isReplica: true,
-		primary:   serverPrimaryConn,
+		primary:   serverPrimaryTransport,
 	}
 
 	// Test 1: Connection identity check for primary connection
 	s.mu.Lock()
-	isPrimaryConn := (s.primary != nil && serverPrimaryConn == s.primary)
+	isPrimaryConn := (s.primary != nil && serverPrimaryTransport == s.primary)
 	s.mu.Unlock()
 
 	if !isPrimaryConn {
 		t.Error("failed to identify primary connection")
 	}
 
-	// Test 2: Connection identity check for client connection
+	// Test 2: Connection identity check for client connection (won't match)
+	serverClientTransport := transport.NewStreamTransport(transport.ProtocolTCP, serverClientConn)
 	s.mu.Lock()
-	isClientPrimaryConn := (s.primary != nil && serverClientConn == s.primary)
+	isClientPrimaryConn := (s.primary != nil && serverClientTransport == s.primary)
 	s.mu.Unlock()
 
 	if isClientPrimaryConn {
@@ -215,13 +220,16 @@ func TestReplicationStateCleanup(t *testing.T) {
 		t.Fatalf("failed to accept: %v", err)
 	}
 
+	// Wrap in transport
+	serverTransport := transport.NewStreamTransport(transport.ProtocolTCP, serverConn)
+
 	s := &Server{
-		replicas: make(map[net.Conn]*replicaConn),
+		replicas: make(map[transport.StreamTransport]*replicaConn),
 	}
 
 	// Add replica connection
-	rc := newReplicaConn(serverConn, 0, "test-replid")
-	s.replicas[serverConn] = rc
+	rc := newReplicaConn(serverTransport, 0, "test-replid")
+	s.replicas[serverTransport] = rc
 
 	if len(s.replicas) != 1 {
 		t.Fatalf("expected 1 replica, got %d", len(s.replicas))
@@ -229,9 +237,9 @@ func TestReplicationStateCleanup(t *testing.T) {
 
 	// Simulate cleanup (what serveReplicaWriter does in defer)
 	s.mu.Lock()
-	delete(s.replicas, serverConn)
+	delete(s.replicas, serverTransport)
 	s.mu.Unlock()
-	serverConn.Close()
+	serverTransport.Close()
 	conn.Close()
 
 	if len(s.replicas) != 0 {

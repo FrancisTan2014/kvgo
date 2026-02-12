@@ -2,14 +2,13 @@ package server
 
 import (
 	"kvgo/protocol"
-	"net"
+	"kvgo/transport"
 )
 
 type HandlerFunc func(*Server, *RequestContext) error
 
 type RequestContext struct {
-	Conn      net.Conn
-	Framer    *protocol.Framer
+	Transport transport.StreamTransport
 	Request   protocol.Request // Decoded request (replaces raw Payload)
 	takenOver bool
 }
@@ -27,26 +26,14 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdNack] = (*Server).handleNack
 }
 
-func (s *Server) handleRequest(conn net.Conn) {
-	s.handleRequestWithFramer(conn, nil)
-}
-
-func (s *Server) handleRequestWithFramer(conn net.Conn, existingFramer *protocol.Framer) {
-	var f *protocol.Framer
-	if existingFramer != nil {
-		f = existingFramer
-	} else {
-		f = protocol.NewConnFramer(conn)
-		f.SetMaxPayload(s.opts.MaxFrameSize)
-	}
-
+func (s *Server) handleRequest(t transport.StreamTransport) {
 	for {
 		var payload []byte
 		var err error
 		if s.opts.ReadTimeout > 0 {
-			payload, err = f.ReadWithTimeout(s.opts.ReadTimeout)
+			payload, err = t.ReceiveWithTimeout(s.opts.ReadTimeout)
 		} else {
-			payload, err = f.Read()
+			payload, err = t.Receive()
 		}
 		if err != nil {
 			return
@@ -65,9 +52,8 @@ func (s *Server) handleRequestWithFramer(conn net.Conn, existingFramer *protocol
 		}
 
 		ctx := &RequestContext{
-			Conn:    conn,
-			Framer:  f,
-			Request: req,
+			Transport: t,
+			Request:   req,
 		}
 
 		if err := handler(s, ctx); err != nil {
@@ -81,13 +67,13 @@ func (s *Server) handleRequestWithFramer(conn net.Conn, existingFramer *protocol
 	}
 }
 
-func (s *Server) writeResponse(f *protocol.Framer, resp protocol.Response) error {
+func (s *Server) writeResponse(t transport.StreamTransport, resp protocol.Response) error {
 	payload, err := protocol.EncodeResponse(resp)
 	if err != nil {
 		return err
 	}
 	if s.opts.WriteTimeout > 0 {
-		return f.WriteWithTimeout(payload, s.opts.WriteTimeout)
+		return t.SendWithTimeout(payload, s.opts.WriteTimeout)
 	}
-	return f.Write(payload)
+	return t.Send(payload)
 }

@@ -13,14 +13,14 @@ import (
 func (s *Server) handleCleanup(ctx *RequestContext) error {
 	if s.cleanupInProgress.Load() {
 		s.log().Warn("cleanup already in progress, rejecting new CLEANUP request",
-			"remote_addr", ctx.Conn.RemoteAddr(),
+			"remote_addr", ctx.Transport.RemoteAddr(),
 			"action", "rejected",
 		)
-		return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusCleaning})
+		return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusCleaning})
 	}
 
 	s.log().Info("starting value file cleanup",
-		"remote_addr", ctx.Conn.RemoteAddr(),
+		"remote_addr", ctx.Transport.RemoteAddr(),
 		"action", "cleanup_initiated",
 		"data_dir", s.opts.DataDir,
 	)
@@ -28,7 +28,7 @@ func (s *Server) handleCleanup(ctx *RequestContext) error {
 	// Return immediately and run cleanup asynchronously to free connection resources.
 	// Cleanup can take minutes for large databases, don't block the handler.
 	go s.StartCleanup()
-	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK})
+	return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusOK})
 }
 
 func (s *Server) StartCleanup() {

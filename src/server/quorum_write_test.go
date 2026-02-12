@@ -1,7 +1,7 @@
 package server
 
 import (
-	"net"
+	"kvgo/transport"
 	"sync"
 	"testing"
 	"time"
@@ -25,10 +25,10 @@ func TestComputeReplicaAcksNeeded(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				replicas: make(map[net.Conn]*replicaConn),
+				replicas: make(map[transport.StreamTransport]*replicaConn),
 			}
 			// Populate fake replicas with distinct pointers
-			fakeConns := make([]fakeConn, tt.replicas)
+			fakeConns := make([]fakeStreamTransport, tt.replicas)
 			for i := 0; i < tt.replicas; i++ {
 				s.replicas[&fakeConns[i]] = &replicaConn{}
 			}
@@ -47,7 +47,7 @@ func TestQuorumStateThreadSafety(t *testing.T) {
 	state := &quorumWriteState{
 		needed:        2,
 		ackCh:         make(chan struct{}),
-		ackedReplicas: make(map[net.Conn]struct{}),
+		ackedReplicas: make(map[string]struct{}),
 	}
 
 	// Simulate 10 concurrent ACKs arriving
@@ -87,17 +87,3 @@ func TestQuorumStateThreadSafety(t *testing.T) {
 		t.Errorf("ackCount = %d, want 10", finalCount)
 	}
 }
-
-// Fake conn for unit tests
-type fakeConn struct {
-	id int // Make non-zero-sized so each instance gets unique address
-}
-
-func (f *fakeConn) Read(b []byte) (n int, err error)   { return 0, nil }
-func (f *fakeConn) Write(b []byte) (n int, err error)  { return len(b), nil }
-func (f *fakeConn) Close() error                       { return nil }
-func (f *fakeConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
-func (f *fakeConn) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
-func (f *fakeConn) SetDeadline(t time.Time) error      { return nil }
-func (f *fakeConn) SetReadDeadline(t time.Time) error  { return nil }
-func (f *fakeConn) SetWriteDeadline(t time.Time) error { return nil }

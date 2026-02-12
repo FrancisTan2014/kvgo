@@ -55,17 +55,16 @@ func TestHandleGet_BasicOperation(t *testing.T) {
 				db:        db,
 				isReplica: false,
 			}
-			s.lastSeq.Store(10)
+			s.seq.Store(10) // Primary uses seq, not lastSeq
 
 			req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(tt.key)}
 
-			// Use mock buffer for framer
-			mockBuf := &mockBuffer{}
-			mockFramer := protocol.NewFramer(mockBuf, mockBuf)
+			// Use mock transport
+			mockTransport := &mockStreamTransport{}
 
 			ctx := &RequestContext{
-				Framer:  mockFramer,
-				Request: req,
+				Transport: mockTransport,
+				Request:   req,
 			}
 
 			err := s.handleGet(ctx)
@@ -74,7 +73,7 @@ func TestHandleGet_BasicOperation(t *testing.T) {
 			}
 
 			// Decode captured response
-			capturedResp, err := protocol.DecodeResponse(mockBuf.written)
+			capturedResp, err := protocol.DecodeResponse(mockTransport.written)
 			if err != nil {
 				t.Fatalf("DecodeResponse: %v", err)
 			}
@@ -148,12 +147,11 @@ func TestHandlePut_BasicOperation(t *testing.T) {
 				Value: []byte(tt.value),
 			}
 
-			mockBuf := &mockBuffer{}
-			mockFramer := protocol.NewFramer(mockBuf, mockBuf)
+			mockTransport := &mockStreamTransport{}
 
 			ctx := &RequestContext{
-				Framer:  mockFramer,
-				Request: req,
+				Transport: mockTransport,
+				Request:   req,
 			}
 
 			err := s.handlePut(ctx)
@@ -162,7 +160,7 @@ func TestHandlePut_BasicOperation(t *testing.T) {
 			}
 
 			// Decode captured response
-			capturedResp, err := protocol.DecodeResponse(mockBuf.written)
+			capturedResp, err := protocol.DecodeResponse(mockTransport.written)
 			if err != nil {
 				t.Fatalf("DecodeResponse: %v", err)
 			}
@@ -208,12 +206,11 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 		Value: []byte("value"),
 	}
 
-	mockBuf := &mockBuffer{}
-	mockFramer := protocol.NewFramer(mockBuf, mockBuf)
+	mockTransport := &mockStreamTransport{}
 
 	ctx := &RequestContext{
-		Framer:  mockFramer,
-		Request: req,
+		Transport: mockTransport,
+		Request:   req,
 	}
 
 	err = s.handlePut(ctx)
@@ -221,7 +218,7 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 		t.Fatalf("handlePut: %v", err)
 	}
 
-	capturedResp, err := protocol.DecodeResponse(mockBuf.written)
+	capturedResp, err := protocol.DecodeResponse(mockTransport.written)
 	if err != nil {
 		t.Fatalf("DecodeResponse: %v", err)
 	}
@@ -280,12 +277,11 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 
 			req := protocol.Request{Cmd: protocol.CmdPing, Seq: tt.pingSeq}
 
-			mockBuf := &mockBuffer{}
-			mockFramer := protocol.NewFramer(mockBuf, mockBuf)
+			mockTransport := &mockStreamTransport{}
 
 			ctx := &RequestContext{
-				Framer:  mockFramer,
-				Request: req,
+				Transport: mockTransport,
+				Request:   req,
 			}
 
 			beforeHeartbeat := s.lastHeartbeat
@@ -294,15 +290,23 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 				t.Fatalf("handlePing: %v", err)
 			}
 
-			// Decode captured response
-			capturedResp, err := protocol.DecodeResponse(mockBuf.written)
-			if err != nil {
-				t.Fatalf("DecodeResponse: %v", err)
-			}
+			// Replica sends PONG, primary doesn't send anything
+			if tt.isReplica {
+				// Decode captured response (PONG is sent as a Request, not Response)
+				capturedReq, err := protocol.DecodeRequest(mockTransport.written)
+				if err != nil {
+					t.Fatalf("DecodeRequest: %v", err)
+				}
 
-			// Verify response
-			if capturedResp.Status != protocol.StatusPong {
-				t.Errorf("status = %v, want StatusPong", capturedResp.Status)
+				// Verify response
+				if capturedReq.Cmd != protocol.CmdPong {
+					t.Errorf("cmd = %v, want CmdPong", capturedReq.Cmd)
+				}
+			} else {
+				// Primary shouldn't send anything
+				if mockTransport.written != nil {
+					t.Errorf("primary should not send response, but sent: %v", mockTransport.written)
+				}
 			}
 
 			// Verify heartbeat update

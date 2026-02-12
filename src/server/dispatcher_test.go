@@ -2,7 +2,7 @@ package server
 
 import (
 	"kvgo/protocol"
-	"net"
+	"kvgo/transport"
 	"testing"
 )
 
@@ -86,7 +86,7 @@ func TestUnknownCommandHandling(t *testing.T) {
 	}
 }
 
-//TestHandlerErrorPropagation verifies error responses are properly formatted.
+// TestHandlerErrorPropagation verifies error responses are properly formatted.
 // (Full error propagation tested in handler_test.go with real DB)
 func TestHandlerErrorPropagation(t *testing.T) {
 	// Verify replica mode flag works correctly
@@ -174,7 +174,7 @@ func TestHandlerTakeoverFlag(t *testing.T) {
 func TestComputeReplicaAcksNeeded_EdgeCases(t *testing.T) {
 	// Create server with known replica count
 	s := &Server{
-		replicas: make(map[net.Conn]*replicaConn),
+		replicas: make(map[transport.StreamTransport]*replicaConn),
 	}
 
 	// Test with zero replicas

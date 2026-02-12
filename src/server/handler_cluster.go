@@ -2,6 +2,7 @@ package server
 
 import (
 	"kvgo/protocol"
+	"kvgo/transport"
 	"kvgo/utils"
 )
 
@@ -20,12 +21,12 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 	req := &ctx.Request
 
 	replid := string(req.Value)
-	rc := newReplicaConn(ctx.Conn, req.Seq, replid)
+	rc := newReplicaConn(ctx.Transport, req.Seq, replid)
 	s.mu.Lock()
-	s.replicas[ctx.Conn] = rc
+	s.replicas[ctx.Transport] = rc
 	s.mu.Unlock()
 
-	s.addReachableNode(ctx.Conn, rc.framer)
+	s.addReachableNode(ctx.Transport.RemoteAddr(), transport.WrapStreamAsRequest(ctx.Transport, s.opts.QuorumReadTimeout))
 
 	// Perform initial sync (blocks), then spawn writer goroutine.
 	// Connection continues through handleRequest loop for ACK/NACK/PONG.
@@ -46,7 +47,7 @@ func (s *Server) handleReplicaOf(ctx *RequestContext) error {
 		s.log().Error("REPLICAOF failed", "error", err)
 		return s.responseStatusError(ctx)
 	}
-	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK})
+	return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusOK})
 }
 
 func (s *Server) relocate(primaryAddr string) error {
@@ -68,7 +69,7 @@ func (s *Server) relocate(primaryAddr string) error {
 
 		for c, r := range s.replicas {
 			close(r.sendCh)
-			_ = r.conn.Close()
+			_ = r.transport.Close()
 			delete(s.replicas, c)
 		}
 
@@ -108,7 +109,7 @@ func (s *Server) handlePromote(ctx *RequestContext) error {
 	}
 
 	s.log().Info("promoted to primary")
-	return s.writeResponse(ctx.Framer, protocol.Response{Status: protocol.StatusOK})
+	return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusOK})
 }
 
 func (s *Server) promote() error {

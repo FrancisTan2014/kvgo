@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"kvgo/transport"
 	"sync"
 )
 
@@ -20,14 +21,14 @@ func NewTestFramer() *TestFramer {
 func (f *TestFramer) Write(payload []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return writeFrame(&f.buf, payload)
+	return transport.WriteFrameForTest(&f.buf, payload)
 }
 
 // Read reads a frame from the internal buffer.
 func (f *TestFramer) Read() ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return readFrameMax(&f.buf, DefaultMaxFrameSize)
+	return transport.ReadFrameMaxForTest(&f.buf, transport.DefaultMaxFrameSize)
 }
 
 // ReadWithTimeout reads a frame with a timeout (not implemented for testing).
