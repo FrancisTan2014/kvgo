@@ -19,7 +19,9 @@ func (s *Server) handleGet(ctx *RequestContext) error {
 		return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReplicaTooStale)
 	}
 
-	if ctx.Request.RequireQuorum {
+	// Quorum reads only make sense for replicas in single-primary systems.
+	// Primary is the authoritative source, always reads locally.
+	if ctx.Request.RequireQuorum && s.isReplica {
 		return s.doQuorumGet(ctx)
 	}
 
