@@ -22,7 +22,7 @@ func (s *Server) handlePing(ctx *RequestContext) error {
 		// Send PONG as a Request (not Response) so primary's handleRequest can decode it
 		pongReq := protocol.Request{Cmd: protocol.CmdPong}
 		pongPayload, _ := protocol.EncodeRequest(pongReq)
-		return ctx.Transport.Send(pongPayload)
+		return ctx.StreamTransport.Send(pongPayload)
 	}
 
 	// Primary shouldn't receive PING (replicas send PONG)

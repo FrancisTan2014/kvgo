@@ -23,7 +23,7 @@ func (s *Server) handleAck(ctx *RequestContext) error {
 	defer state.mu.Unlock()
 
 	// Check if this specific replica already ACK'd (deduplication)
-	remoteAddr := ctx.Transport.RemoteAddr()
+	remoteAddr := ctx.StreamTransport.RemoteAddr()
 	if _, alreadyAcked := state.ackedReplicas[remoteAddr]; alreadyAcked {
 		s.log().Debug("duplicate ACK from same replica ignored",
 			"request_id", ctx.Request.RequestId,
@@ -63,7 +63,7 @@ func (s *Server) handleNack(ctx *RequestContext) error {
 	defer state.mu.Unlock()
 
 	// Check if this specific replica already responded (deduplication)
-	remoteAddr := ctx.Transport.RemoteAddr()
+	remoteAddr := ctx.StreamTransport.RemoteAddr()
 	if _, alreadyProcessed := state.ackedReplicas[remoteAddr]; alreadyProcessed {
 		s.log().Debug("duplicate NACK from same replica ignored",
 			"request_id", ctx.Request.RequestId,

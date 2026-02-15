@@ -85,7 +85,7 @@ func (s *Server) replicationLoop(ctx context.Context) {
 func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 	s.log().Info("connecting to primary", "address", s.opts.ReplicaOf)
 
-	t, err := transport.DialStreamTransport(s.opts.Protocol, s.network(), s.opts.ReplicaOf, 10*time.Second)
+	st, err := transport.DialStreamTransport(s.opts.Protocol, s.network(), s.opts.ReplicaOf, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect to primary %s: %w", s.opts.ReplicaOf, err)
 	}
@@ -97,25 +97,25 @@ func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 	req := protocol.Request{Cmd: protocol.CmdReplicate, Seq: lastSeq, Value: []byte(s.replid)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
-		_ = t.Close()
+		_ = st.Close()
 		return nil, fmt.Errorf("encode replicate request: %w", err)
 	}
 
-	if err := t.Send(payload); err != nil {
-		_ = t.Close()
+	if err := st.Send(payload); err != nil {
+		_ = st.Close()
 		return nil, fmt.Errorf("send replicate request: %w", err)
 	}
 
 	// Wait for ack from primary.
-	respPayload, err := t.Receive()
+	respPayload, err := st.Receive()
 	if err != nil {
-		_ = t.Close()
+		_ = st.Close()
 		return nil, fmt.Errorf("read replicate response: %w", err)
 	}
 
 	resp, err := protocol.DecodeResponse(respPayload)
 	if err != nil {
-		_ = t.Close()
+		_ = st.Close()
 		return nil, fmt.Errorf("decode replicate response: %w", err)
 	}
 
@@ -128,7 +128,7 @@ func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 		// Initialize primarySeq from response to avoid initial staleness
 		s.primarySeq = resp.Seq
 	} else if resp.Status != protocol.StatusOK {
-		_ = t.Close()
+		_ = st.Close()
 		return nil, fmt.Errorf("primary rejected replication: status %d", resp.Status)
 	} else {
 		// Partial sync - update primarySeq for accurate lag tracking
@@ -138,12 +138,12 @@ func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 	s.log().Info("replication handshake complete")
 
 	s.mu.Lock()
-	s.primary = t
+	s.primary = st
 	s.lastHeartbeat = time.Now() // Initialize heartbeat timer on successful connection
 	s.mu.Unlock()
 
-	s.addReachableNode(t.RemoteAddr(), transport.WrapStreamAsRequest(t, s.opts.QuorumReadTimeout))
-	return t, nil
+	s.addReachableNode(st.RemoteAddr(), transport.AsRequestTransport(st, 5*time.Second))
+	return st, nil
 }
 
 // receiveFromPrimary receives replication stream from primary.

@@ -63,7 +63,7 @@ func TestHandleGet_BasicOperation(t *testing.T) {
 			mockTransport := &mockStreamTransport{}
 
 			ctx := &RequestContext{
-				Transport: mockTransport,
+				StreamTransport: mockTransport,
 				Request:   req,
 			}
 
@@ -150,7 +150,7 @@ func TestHandlePut_BasicOperation(t *testing.T) {
 			mockTransport := &mockStreamTransport{}
 
 			ctx := &RequestContext{
-				Transport: mockTransport,
+				StreamTransport: mockTransport,
 				Request:   req,
 			}
 
@@ -209,7 +209,7 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 	mockTransport := &mockStreamTransport{}
 
 	ctx := &RequestContext{
-		Transport: mockTransport,
+		StreamTransport: mockTransport,
 		Request:   req,
 	}
 
@@ -280,7 +280,7 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 			mockTransport := &mockStreamTransport{}
 
 			ctx := &RequestContext{
-				Transport: mockTransport,
+				StreamTransport: mockTransport,
 				Request:   req,
 			}
 

@@ -46,7 +46,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 		}
 
 		ctx := &RequestContext{
-			Transport: &mockStreamTransport{},
+			StreamTransport: &mockStreamTransport{},
 			Request:   req,
 		}
 
@@ -98,7 +98,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 		}
 
 		ctx := &RequestContext{
-			Transport: &mockStreamTransport{},
+			StreamTransport: &mockStreamTransport{},
 			Request:   req,
 		}
 
@@ -110,7 +110,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 				RequestId: replica1.lastRequestId,
 			}
 			s.handleNack(&RequestContext{
-				Transport: replica1,
+				StreamTransport: replica1,
 				Request:   nackReq,
 			})
 		}()
@@ -153,7 +153,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 		}
 
 		ctx := &RequestContext{
-			Transport: &mockStreamTransport{},
+			StreamTransport: &mockStreamTransport{},
 			Request:   req,
 		}
 
@@ -204,7 +204,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 		}
 
 		ctx := &RequestContext{
-			Transport: &mockStreamTransport{},
+			StreamTransport: &mockStreamTransport{},
 			Request:   req,
 		}
 
@@ -214,7 +214,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 		}
 
 		// Verify response sent (mock transport captured it)
-		mockTrans := ctx.Transport.(*mockStreamTransport)
+		mockTrans := ctx.StreamTransport.(*mockStreamTransport)
 		if mockTrans.written == nil {
 			t.Fatal("no response written")
 		}
@@ -267,7 +267,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 		}
 
 		ctx := &RequestContext{
-			Transport: &mockStreamTransport{},
+			StreamTransport: &mockStreamTransport{},
 			Request:   req,
 		}
 
@@ -276,7 +276,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 			t.Fatalf("handleGet: %v", err)
 		}
 
-		mockTrans := ctx.Transport.(*mockStreamTransport)
+		mockTrans := ctx.StreamTransport.(*mockStreamTransport)
 		resp, _ := protocol.DecodeResponse(mockTrans.written)
 		if resp.Status != protocol.StatusOK {
 			t.Errorf("status = %v, want StatusOK (quorum reached despite 1 failure)", resp.Status)
@@ -309,7 +309,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 		}
 
 		ctx := &RequestContext{
-			Transport: &mockStreamTransport{},
+			StreamTransport: &mockStreamTransport{},
 			Request:   req,
 		}
 
@@ -318,7 +318,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 			t.Fatalf("handleGet: %v", err)
 		}
 
-		mockTrans := ctx.Transport.(*mockStreamTransport)
+		mockTrans := ctx.StreamTransport.(*mockStreamTransport)
 		resp, _ := protocol.DecodeResponse(mockTrans.written)
 		if resp.Status != protocol.StatusQuorumFailed {
 			t.Errorf("status = %v, want StatusQuorumFailed", resp.Status)

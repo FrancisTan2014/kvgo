@@ -25,6 +25,16 @@ func WrapStreamAsRequest(stream StreamTransport, defaultTimeout time.Duration) R
 	}
 }
 
+// AsRequestTransport returns the RequestTransport interface for a StreamTransport.
+// If the transport implements both (like MultiplexedTransport), returns it directly.
+// Otherwise, wraps it with an adapter. This hides implementation details from callers.
+func AsRequestTransport(stream StreamTransport, defaultTimeout time.Duration) RequestTransport {
+	if rt, ok := stream.(RequestTransport); ok {
+		return rt
+	}
+	return WrapStreamAsRequest(stream, defaultTimeout)
+}
+
 func (s *streamAsRequest) Request(payload []byte, timeout time.Duration) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

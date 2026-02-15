@@ -8,9 +8,10 @@ import (
 type HandlerFunc func(*Server, *RequestContext) error
 
 type RequestContext struct {
-	Transport transport.StreamTransport
-	Request   protocol.Request // Decoded request (replaces raw Payload)
-	takenOver bool
+	StreamTransport  transport.StreamTransport
+	RequestTransport transport.RequestTransport // Same object as StreamTransport (MultiplexedTransport)
+	Request          protocol.Request           // Decoded request (replaces raw Payload)
+	takenOver        bool
 }
 
 func (s *Server) registerRequestHandlers() {
@@ -52,8 +53,9 @@ func (s *Server) handleRequest(t transport.StreamTransport) {
 		}
 
 		ctx := &RequestContext{
-			Transport: t,
-			Request:   req,
+			StreamTransport:  t,
+			RequestTransport: transport.AsRequestTransport(t, s.opts.ReadTimeout),
+			Request:          req,
 		}
 
 		if err := handler(s, ctx); err != nil {

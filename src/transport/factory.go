@@ -12,7 +12,8 @@ const (
 )
 
 // NewStreamTransport creates a StreamTransport from an existing connection.
-// Currently only supports TCP protocol. Will panic for unsupported protocols.
+// Returns MultiplexedTransport which supports both streaming (Receive/Send)
+// and request-response (Request). The readLoop starts lazily only if Request() is called.
 func NewStreamTransport(protocol string, conn net.Conn) StreamTransport {
 	if protocol == "" {
 		protocol = ProtocolTCP
@@ -20,7 +21,7 @@ func NewStreamTransport(protocol string, conn net.Conn) StreamTransport {
 
 	switch protocol {
 	case ProtocolTCP:
-		return NewTcpStream(conn)
+		return NewMultiplexedTransport(conn)
 	default:
 		panic(fmt.Sprintf("transport: unsupported protocol %q (only %q is implemented)", protocol, ProtocolTCP))
 	}
@@ -35,7 +36,8 @@ func DialStreamTransport(protocol, network, addr string, timeout time.Duration) 
 
 	switch protocol {
 	case ProtocolTCP:
-		return DialTcpStream(network, addr, timeout)
+		st, _, err := DialMultiplexedTransport(network, addr, timeout)
+		return st, err
 	default:
 		panic(fmt.Sprintf("transport: unsupported protocol %q (only %q is implemented)", protocol, ProtocolTCP))
 	}
@@ -50,7 +52,7 @@ func NewRequestTransport(protocol string, conn net.Conn) RequestTransport {
 
 	switch protocol {
 	case ProtocolTCP:
-		return NewTcpRequest(conn)
+		return NewMultiplexedTransport(conn)
 	default:
 		panic(fmt.Sprintf("transport: unsupported protocol %q (only %q is implemented)", protocol, ProtocolTCP))
 	}
@@ -65,7 +67,8 @@ func DialRequestTransport(protocol, network, addr string, timeout time.Duration)
 
 	switch protocol {
 	case ProtocolTCP:
-		return DialTcpRequest(network, addr, timeout)
+		_, rt, err := DialMultiplexedTransport(network, addr, timeout)
+		return rt, err
 	default:
 		panic(fmt.Sprintf("transport: unsupported protocol %q (only %q is implemented)", protocol, ProtocolTCP))
 	}

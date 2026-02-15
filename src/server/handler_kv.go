@@ -59,7 +59,7 @@ func (s *Server) doGet(ctx *RequestContext) error {
 		resp = protocol.Response{Status: protocol.StatusOK, Value: copyVal, Seq: seq}
 	}
 
-	return s.writeResponse(ctx.Transport, resp)
+	return s.writeResponse(ctx.StreamTransport, resp)
 }
 
 func (s *Server) doQuorumGet(ctx *RequestContext) error {
@@ -88,7 +88,7 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		s.log().Error("quorum read: failed to encode request", "error", err)
-		return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusError})
+		return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: protocol.StatusError})
 	}
 
 	// Get snapshot of reachable nodes for safe iteration
@@ -139,7 +139,7 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 		resp = protocol.Response{Status: protocol.StatusQuorumFailed}
 	}
 
-	return s.writeResponse(ctx.Transport, resp)
+	return s.writeResponse(ctx.StreamTransport, resp)
 }
 
 func (s *Server) quorumReadFromReplica(t transport.RequestTransport, payload []byte, remoteAddr string) (value []byte, seq uint64, ok bool) {
@@ -173,19 +173,19 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 	req := &ctx.Request
 	key := string(req.Key)
 
-	s.log().Debug("handlePut called", "key", key, "is_replica", s.isReplica, "from_conn", ctx.Transport.RemoteAddr())
+	s.log().Debug("handlePut called", "key", key, "is_replica", s.isReplica, "from_conn", ctx.StreamTransport.RemoteAddr())
 
 	if s.isReplica {
 		// Check if this PUT is from our primary (replication stream)
 		s.mu.Lock()
-		isPrimaryConn := (s.primary != nil && ctx.Transport == s.primary)
+		isPrimaryConn := (s.primary != nil && ctx.StreamTransport == s.primary)
 		primaryAddr := ""
 		if s.primary != nil {
 			primaryAddr = s.primary.RemoteAddr()
 		}
 		s.mu.Unlock()
 
-		s.log().Debug("replica PUT check", "is_primary_conn", isPrimaryConn, "primary_addr", primaryAddr, "from_addr", ctx.Transport.RemoteAddr())
+		s.log().Debug("replica PUT check", "is_primary_conn", isPrimaryConn, "primary_addr", primaryAddr, "from_addr", ctx.StreamTransport.RemoteAddr())
 
 		if isPrimaryConn {
 			// Replicated write from primary - apply locally
@@ -218,7 +218,7 @@ func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 				RequestId: req.RequestId,
 			}
 			nackPayload, _ := protocol.EncodeRequest(nackReq)
-			if err := ctx.Transport.Send(nackPayload); err != nil {
+			if err := ctx.StreamTransport.Send(nackPayload); err != nil {
 				s.log().Error("failed to NACK quorum write",
 					"request_id", req.RequestId,
 					"error", err)
@@ -234,7 +234,7 @@ func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 			RequestId: req.RequestId,
 		}
 		ackPayload, _ := protocol.EncodeRequest(ackReq)
-		if err := ctx.Transport.Send(ackPayload); err != nil {
+		if err := ctx.StreamTransport.Send(ackPayload); err != nil {
 			s.log().Error("failed to ACK quorum write",
 				"request_id", req.RequestId,
 				"error", err)
@@ -307,7 +307,7 @@ func (s *Server) processPrimaryPut(ctx *RequestContext) error {
 					"seq", seq)
 				return s.responseStatusError(ctx)
 			}
-			return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusOK, Seq: seq})
+			return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: protocol.StatusOK, Seq: seq})
 		case <-time.After(s.opts.QuorumWriteTimeout):
 			state.mu.Lock()
 			acksReceived := state.ackCount
@@ -323,7 +323,7 @@ func (s *Server) processPrimaryPut(ctx *RequestContext) error {
 			return s.responseStatusError(ctx)
 		}
 	} else {
-		return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusOK, Seq: seq})
+		return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: protocol.StatusOK, Seq: seq})
 	}
 }
 
@@ -340,12 +340,12 @@ func (s *Server) computeReplicaAcksNeeded() int {
 // ---------------------------------------------------------------------------
 
 func (s *Server) responseStatusWithPrimaryAddress(ctx *RequestContext, status protocol.Status) error {
-	return s.writeResponse(ctx.Transport, protocol.Response{
+	return s.writeResponse(ctx.StreamTransport, protocol.Response{
 		Status: status,
 		Value:  []byte(s.opts.ReplicaOf), // Primary address for client redirect
 	})
 }
 
 func (s *Server) responseStatusError(ctx *RequestContext) error {
-	return s.writeResponse(ctx.Transport, protocol.Response{Status: protocol.StatusError})
+	return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: protocol.StatusError})
 }
