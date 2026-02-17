@@ -31,7 +31,7 @@ type replicaConn struct {
 func newReplicaConn(t transport.StreamTransport, replicaLastSeq uint64, lastReplid string, listenAddr string) *replicaConn {
 	return &replicaConn{
 		transport:  t,
-		sendCh:     make(chan []byte),
+		sendCh:     make(chan []byte, replicaSendBuffer),
 		lastReplid: lastReplid,
 		lastSeq:    replicaLastSeq,
 		hb:         time.NewTicker(heartbeatInterval),
