@@ -25,6 +25,13 @@ type MultiplexedTransport struct {
 	closeCh         chan struct{}
 	readLoopOnce    sync.Once // ensures readLoop starts only once
 	closeOnce       sync.Once // ensures cleanup happens only once
+
+	// lastRecvId holds the transport-level requestId from the last Receive() call.
+	// Send() echoes it back (then resets to 0). This enables server-side response
+	// routing: when a client sends via Request() with a non-zero requestId,
+	// the server's Receive() captures it and the subsequent Send() echoes it
+	// so the client's readLoop can route the response.
+	lastRecvId atomic.Uint32
 }
 
 type response struct {
@@ -76,8 +83,13 @@ func (t *MultiplexedTransport) SendWithTimeout(payload []byte, timeout time.Dura
 		return fmt.Errorf("invalid payload")
 	}
 
+	// Echo the requestId from the last Receive() call, then reset.
+	// Streaming messages (no prior Receive) use 0; request-response
+	// messages echo the client's non-zero requestId for readLoop routing.
+	id := t.lastRecvId.Swap(0)
+
 	buf := make([]byte, 4+len(payload))
-	binary.LittleEndian.PutUint32(buf, 0)
+	binary.LittleEndian.PutUint32(buf, id)
 	copy(buf[4:], payload)
 
 	t.writeMu.Lock()
@@ -95,7 +107,10 @@ func (t *MultiplexedTransport) Receive() ([]byte, error) {
 }
 
 func (t *MultiplexedTransport) ReceiveWithTimeout(timeout time.Duration) ([]byte, error) {
-	_, payload, err := t.receiveInternal(timeout)
+	id, payload, err := t.receiveInternal(timeout)
+	if err == nil {
+		t.lastRecvId.Store(id)
+	}
 	return payload, err
 }
 

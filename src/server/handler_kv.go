@@ -17,7 +17,7 @@ func (s *Server) handleGet(ctx *RequestContext) error {
 
 	// Quorum reads only make sense for replicas in single-primary systems.
 	// Primary is the authoritative source, always reads locally.
-	if ctx.Request.RequireQuorum && s.isReplica {
+	if ctx.Request.RequireQuorum && !s.isLeader() {
 		return s.doQuorumGet(ctx)
 	}
 
@@ -25,7 +25,7 @@ func (s *Server) handleGet(ctx *RequestContext) error {
 }
 
 func (s *Server) isStaleness() bool {
-	if !s.isReplica {
+	if s.isLeader() {
 		return false
 	}
 
@@ -42,7 +42,7 @@ func (s *Server) doGet(ctx *RequestContext) error {
 
 	// Determine which sequence number to report
 	seq := s.seq.Load()
-	if s.isReplica {
+	if !s.isLeader() {
 		seq = s.lastSeq.Load()
 	}
 
@@ -66,19 +66,11 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 	req := &ctx.Request
 	key := string(req.Key)
 
-	s.log().Debug("handlePut called", "key", key, "is_replica", s.isReplica, "from_conn", ctx.StreamTransport.RemoteAddr())
-
-	if s.isReplica {
+	if !s.isLeader() {
 		// Check if this PUT is from our primary (replication stream)
 		s.connectionMu.Lock()
 		isPrimaryConn := (s.primary != nil && ctx.StreamTransport == s.primary)
-		primaryAddr := ""
-		if s.primary != nil {
-			primaryAddr = s.primary.RemoteAddr()
-		}
 		s.connectionMu.Unlock()
-
-		s.log().Debug("replica PUT check", "is_primary_conn", isPrimaryConn, "primary_addr", primaryAddr, "from_addr", ctx.StreamTransport.RemoteAddr())
 
 		if isPrimaryConn {
 			// Replicated write from primary - apply locally
@@ -95,7 +87,7 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 }
 
 // applyReplicatedPut applies a write received from primary via replication.
-// Sends ACK for quorum writes, NACK on failure.
+// Sends ACK/NACK through the peer channel (separate connection to primary).
 func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 	req := &ctx.Request
 	key := string(req.Key)
@@ -106,32 +98,14 @@ func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 
 		// Send NACK for quorum writes that failed
 		if req.RequestId != "" {
-			nackReq := protocol.Request{
-				Cmd:       protocol.CmdNack,
-				RequestId: req.RequestId,
-			}
-			nackPayload, _ := protocol.EncodeRequest(nackReq)
-			if err := ctx.StreamTransport.Send(nackPayload); err != nil {
-				s.log().Error("failed to NACK quorum write",
-					"request_id", req.RequestId,
-					"error", err)
-			}
+			s.sendAckViaPeer(protocol.CmdNack, req.RequestId)
 		}
 		return err
 	}
 
 	// Send ACK only for quorum writes (those with RequestId)
 	if req.RequestId != "" {
-		ackReq := protocol.Request{
-			Cmd:       protocol.CmdAck,
-			RequestId: req.RequestId,
-		}
-		ackPayload, _ := protocol.EncodeRequest(ackReq)
-		if err := ctx.StreamTransport.Send(ackPayload); err != nil {
-			s.log().Error("failed to ACK quorum write",
-				"request_id", req.RequestId,
-				"error", err)
-		}
+		s.sendAckViaPeer(protocol.CmdAck, req.RequestId)
 	}
 
 	// Update replica state
@@ -145,6 +119,32 @@ func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 	}
 
 	return nil
+}
+
+// sendAckViaPeer sends an ACK or NACK to the primary through the peer channel.
+// Fire-and-forget semantics: if the peer channel is unavailable the quorum
+// write simply times out on the primary (correct, not catastrophic).
+func (s *Server) sendAckViaPeer(cmd protocol.Cmd, requestId string) {
+	nodeID := s.primaryNodeID
+	if nodeID == "" {
+		s.log().Warn("cannot send ACK/NACK: primary nodeID unknown (TOPOLOGY not received yet)")
+		return
+	}
+
+	t, err := s.peerManager.Get(nodeID)
+	if err != nil {
+		s.log().Warn("cannot send ACK/NACK: peer transport unavailable",
+			"primary", nodeID, "error", err)
+		return
+	}
+
+	req := protocol.Request{Cmd: cmd, RequestId: requestId}
+	payload, _ := protocol.EncodeRequest(req)
+
+	if _, err := t.Request(payload, 2*time.Second); err != nil {
+		s.log().Warn("ACK/NACK send failed",
+			"cmd", cmd, "request_id", requestId, "error", err)
+	}
 }
 
 // ---------------------------------------------------------------------------

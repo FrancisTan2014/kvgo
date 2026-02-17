@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"kvgo/engine"
 	"kvgo/protocol"
+	"os"
 	"testing"
 	"time"
 )
@@ -52,9 +54,9 @@ func TestHandleGet_BasicOperation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				db:        db,
-				isReplica: false,
+				db: db,
 			}
+			s.role.Store(uint32(RoleLeader))
 			s.seq.Store(10) // Primary uses seq, not lastSeq
 
 			req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(tt.key)}
@@ -64,7 +66,7 @@ func TestHandleGet_BasicOperation(t *testing.T) {
 
 			ctx := &RequestContext{
 				StreamTransport: mockTransport,
-				Request:   req,
+				Request:         req,
 			}
 
 			err := s.handleGet(ctx)
@@ -101,10 +103,10 @@ func TestHandlePut_BasicOperation(t *testing.T) {
 	defer db.Close()
 
 	s := &Server{
-		db:        db,
-		isReplica: false,
-		opts:      Options{},
+		db:   db,
+		opts: Options{},
 	}
+	s.role.Store(uint32(RoleLeader))
 	s.seq.Store(100)
 
 	tests := []struct {
@@ -151,7 +153,7 @@ func TestHandlePut_BasicOperation(t *testing.T) {
 
 			ctx := &RequestContext{
 				StreamTransport: mockTransport,
-				Request:   req,
+				Request:         req,
 			}
 
 			err := s.handlePut(ctx)
@@ -195,9 +197,8 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 	defer db.Close()
 
 	s := &Server{
-		db:        db,
-		isReplica: true,
-		opts:      Options{ReplicaOf: "primary:6379"},
+		db:   db,
+		opts: Options{ReplicaOf: "primary:6379"},
 	}
 
 	req := protocol.Request{
@@ -210,7 +211,7 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 
 	ctx := &RequestContext{
 		StreamTransport: mockTransport,
-		Request:   req,
+		Request:         req,
 	}
 
 	err = s.handlePut(ctx)
@@ -243,24 +244,36 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 
 // TestHandlePing_HeartbeatUpdate tests PING updates heartbeat and primarySeq
 func TestHandlePing_HeartbeatUpdate(t *testing.T) {
+	termBytes := func(term uint64) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, term)
+		return b
+	}
+
 	tests := []struct {
 		name           string
-		isReplica      bool
+		role           Role
+		myTerm         uint64
 		pingSeq        uint64
+		pingTerm       uint64
 		wantSeqUpdated bool
 		wantHeartbeat  bool
 	}{
 		{
-			name:           "replica updates heartbeat and seq",
-			isReplica:      true,
+			name:           "replica updates heartbeat and seq (same term)",
+			role:           RoleFollower,
+			myTerm:         5,
 			pingSeq:        123,
+			pingTerm:       5,
 			wantSeqUpdated: true,
 			wantHeartbeat:  true,
 		},
 		{
 			name:           "primary doesn't update heartbeat",
-			isReplica:      false,
+			role:           RoleLeader,
+			myTerm:         5,
 			pingSeq:        456,
+			pingTerm:       5,
 			wantSeqUpdated: false,
 			wantHeartbeat:  false,
 		},
@@ -269,19 +282,20 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				isReplica:     tt.isReplica,
 				lastHeartbeat: time.Now().Add(-1 * time.Hour), // Old timestamp
 				primarySeq:    0,
 				opts:          Options{Logger: nil}, // Use noop logger
 			}
+			s.role.Store(uint32(tt.role))
+			s.term.Store(tt.myTerm)
 
-			req := protocol.Request{Cmd: protocol.CmdPing, Seq: tt.pingSeq}
+			req := protocol.Request{Cmd: protocol.CmdPing, Seq: tt.pingSeq, Value: termBytes(tt.pingTerm)}
 
 			mockTransport := &mockStreamTransport{}
 
 			ctx := &RequestContext{
 				StreamTransport: mockTransport,
-				Request:   req,
+				Request:         req,
 			}
 
 			beforeHeartbeat := s.lastHeartbeat
@@ -290,17 +304,17 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 				t.Fatalf("handlePing: %v", err)
 			}
 
-			// Replica sends PONG, primary doesn't send anything
-			if tt.isReplica {
-				// Decode captured response (PONG is sent as a Request, not Response)
-				capturedReq, err := protocol.DecodeRequest(mockTransport.written)
+			// Replica sends PONG as Response, primary doesn't send anything
+			if tt.role == RoleFollower {
+				// Decode captured response (PONG is now a Response with StatusPong)
+				capturedResp, err := protocol.DecodeResponse(mockTransport.written)
 				if err != nil {
-					t.Fatalf("DecodeRequest: %v", err)
+					t.Fatalf("DecodeResponse: %v", err)
 				}
 
 				// Verify response
-				if capturedReq.Cmd != protocol.CmdPong {
-					t.Errorf("cmd = %v, want CmdPong", capturedReq.Cmd)
+				if capturedResp.Status != protocol.StatusPong {
+					t.Errorf("status = %v, want StatusPong", capturedResp.Status)
 				}
 			} else {
 				// Primary shouldn't send anything
@@ -324,6 +338,193 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 				if s.primarySeq != 0 {
 					t.Errorf("primarySeq = %d, want 0 (should not update)", s.primarySeq)
 				}
+			}
+		})
+	}
+}
+
+// TestHandlePing_TermFencing tests stale primary fencing via PING term check
+func TestHandlePing_TermFencing(t *testing.T) {
+	termBytes := func(term uint64) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, term)
+		return b
+	}
+
+	tests := []struct {
+		name          string
+		myTerm        uint64
+		myRole        Role
+		pingTerm      uint64
+		wantHeartbeat bool   // should lastHeartbeat be updated?
+		wantTerm      uint64 // expected term after handling
+		wantRole      Role
+	}{
+		{
+			name:          "reject stale term — no heartbeat update",
+			myTerm:        10,
+			myRole:        RoleFollower,
+			pingTerm:      5,
+			wantHeartbeat: false,
+			wantTerm:      10,
+			wantRole:      RoleFollower,
+		},
+		{
+			name:          "higher term — adopt and update heartbeat",
+			myTerm:        3,
+			myRole:        RoleFollower,
+			pingTerm:      7,
+			wantHeartbeat: true,
+			wantTerm:      7,
+			wantRole:      RoleFollower,
+		},
+		{
+			name:          "higher term — candidate steps down",
+			myTerm:        3,
+			myRole:        RoleCandidate,
+			pingTerm:      7,
+			wantHeartbeat: true,
+			wantTerm:      7,
+			wantRole:      RoleFollower,
+		},
+		{
+			name:          "no term in value — treated as term 0",
+			myTerm:        5,
+			myRole:        RoleFollower,
+			pingTerm:      0, // empty Value
+			wantHeartbeat: false,
+			wantTerm:      5,
+			wantRole:      RoleFollower,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{
+				lastHeartbeat: time.Now().Add(-1 * time.Hour),
+				opts:          Options{Logger: nil},
+			}
+			s.role.Store(uint32(tt.myRole))
+			s.term.Store(tt.myTerm)
+
+			var value []byte
+			if tt.pingTerm > 0 {
+				value = termBytes(tt.pingTerm)
+			}
+
+			req := protocol.Request{Cmd: protocol.CmdPing, Seq: 100, Value: value}
+			mock := &mockStreamTransport{}
+			ctx := &RequestContext{StreamTransport: mock, Request: req}
+
+			before := s.lastHeartbeat
+			err := s.handlePing(ctx)
+			if err != nil {
+				t.Fatalf("handlePing: %v", err)
+			}
+
+			heartbeatUpdated := s.lastHeartbeat.After(before)
+			if heartbeatUpdated != tt.wantHeartbeat {
+				t.Errorf("heartbeat updated = %v, want %v", heartbeatUpdated, tt.wantHeartbeat)
+			}
+			if s.term.Load() != tt.wantTerm {
+				t.Errorf("term = %d, want %d", s.term.Load(), tt.wantTerm)
+			}
+			if s.currentRole() != tt.wantRole {
+				t.Errorf("role = %s, want %s", s.currentRole(), tt.wantRole)
+			}
+
+			// PONG is always sent as Response (even on stale rejection, carrying our higher term)
+			if mock.written != nil {
+				pong, err := protocol.DecodeResponse(mock.written)
+				if err != nil {
+					t.Fatalf("DecodeResponse: %v", err)
+				}
+				if pong.Status != protocol.StatusPong {
+					t.Errorf("response status = %v, want StatusPong", pong.Status)
+				}
+				// PONG carries our term
+				if len(pong.Value) >= 8 {
+					pongTerm := binary.LittleEndian.Uint64(pong.Value[:8])
+					if pongTerm != tt.wantTerm {
+						t.Errorf("pong term = %d, want %d", pongTerm, tt.wantTerm)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestProcessPongResponse_TermFencing tests stale primary steps down on higher-term PONG
+func TestProcessPongResponse_TermFencing(t *testing.T) {
+	termBytes := func(term uint64) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, term)
+		return b
+	}
+
+	tests := []struct {
+		name     string
+		myTerm   uint64
+		myRole   Role
+		pongTerm uint64
+		wantTerm uint64
+		wantRole Role
+	}{
+		{
+			name:     "same term — no change",
+			myTerm:   5,
+			myRole:   RoleLeader,
+			pongTerm: 5,
+			wantTerm: 5,
+			wantRole: RoleLeader,
+		},
+		{
+			name:     "lower term — no change",
+			myTerm:   5,
+			myRole:   RoleLeader,
+			pongTerm: 3,
+			wantTerm: 5,
+			wantRole: RoleLeader,
+		},
+		{
+			name:     "higher term — leader steps down",
+			myTerm:   5,
+			myRole:   RoleLeader,
+			pongTerm: 10,
+			wantTerm: 10,
+			wantRole: RoleFollower,
+		},
+		{
+			name:     "higher term — candidate steps down",
+			myTerm:   5,
+			myRole:   RoleCandidate,
+			pongTerm: 8,
+			wantTerm: 8,
+			wantRole: RoleFollower,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{
+				opts:        Options{Logger: nil},
+				peerManager: NewPeerManager(nil, noopLogger),
+			}
+			s.role.Store(uint32(tt.myRole))
+			s.term.Store(tt.myTerm)
+			s.roleChanged = make(chan struct{})
+
+			resp := protocol.Response{Status: protocol.StatusPong, Value: termBytes(tt.pongTerm)}
+			payload, _ := protocol.EncodeResponse(resp)
+
+			rc := &replicaConn{listenAddr: "127.0.0.1:9999"}
+			s.processPongResponse(payload, rc)
+
+			if s.term.Load() != tt.wantTerm {
+				t.Errorf("term = %d, want %d", s.term.Load(), tt.wantTerm)
+			}
+			if s.currentRole() != tt.wantRole {
+				t.Errorf("role = %s, want %s", s.currentRole(), tt.wantRole)
 			}
 		})
 	}
@@ -355,8 +556,8 @@ func TestRequestDispatch(t *testing.T) {
 	s := &Server{
 		db:              db,
 		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
-		isReplica:       false,
 	}
+	s.role.Store(uint32(RoleLeader))
 	s.registerRequestHandlers()
 
 	for _, tt := range tests {
@@ -366,6 +567,153 @@ func TestRequestDispatch(t *testing.T) {
 				t.Errorf("no handler registered for %v", tt.cmd)
 			}
 		})
+	}
+}
+
+func TestStoreRestoreState_Peers(t *testing.T) {
+	dir := t.TempDir()
+	pm := NewPeerManager(nil, noopLogger)
+	pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "10.0.0.1:4000"}, {NodeID: "n2", Addr: "10.0.0.2:4001"}})
+
+	s := &Server{
+		opts:        Options{DataDir: dir},
+		peerManager: pm,
+	}
+	s.nodeID = "self"
+	s.replid = "rid1"
+	s.lastSeq.Store(42)
+	s.term.Store(5)
+	s.votedFor = "n1"
+
+	if err := s.storeState(); err != nil {
+		t.Fatalf("storeState: %v", err)
+	}
+	if s.metaFile != nil {
+		_ = s.metaFile.Close()
+	}
+
+	// Create a fresh server and restore
+	pm2 := NewPeerManager(nil, noopLogger)
+	s2 := &Server{
+		opts:        Options{DataDir: dir},
+		peerManager: pm2,
+	}
+	if err := s2.restoreState(); err != nil {
+		t.Fatalf("restoreState: %v", err)
+	}
+
+	if s2.nodeID != "self" {
+		t.Errorf("nodeID = %q, want self", s2.nodeID)
+	}
+	if s2.term.Load() != 5 {
+		t.Errorf("term = %d, want 5", s2.term.Load())
+	}
+	if s2.votedFor != "n1" {
+		t.Errorf("votedFor = %q, want n1", s2.votedFor)
+	}
+
+	// Verify peers were restored
+	restoredPeers := pm2.PeerInfos()
+	if len(restoredPeers) != 2 {
+		t.Fatalf("restored peers = %d, want 2", len(restoredPeers))
+	}
+	peerMap := make(map[string]string)
+	for _, pi := range restoredPeers {
+		peerMap[pi.NodeID] = pi.Addr
+	}
+	if peerMap["n1"] != "10.0.0.1:4000" || peerMap["n2"] != "10.0.0.2:4001" {
+		t.Errorf("restored peers = %v, want n1->10.0.0.1:4000 n2->10.0.0.2:4001", peerMap)
+	}
+}
+
+func TestStoreRestoreState_EmptyPeers(t *testing.T) {
+	dir := t.TempDir()
+	pm := NewPeerManager(nil, noopLogger)
+	// No peers saved — peerManager is empty
+
+	s := &Server{
+		opts:        Options{DataDir: dir},
+		peerManager: pm,
+	}
+	s.nodeID = "self"
+	s.replid = "rid1"
+	s.term.Store(3)
+
+	if err := s.storeState(); err != nil {
+		t.Fatalf("storeState: %v", err)
+	}
+	if s.metaFile != nil {
+		_ = s.metaFile.Close()
+	}
+
+	pm2 := NewPeerManager(nil, noopLogger)
+	s2 := &Server{
+		opts:        Options{DataDir: dir},
+		peerManager: pm2,
+	}
+	if err := s2.restoreState(); err != nil {
+		t.Fatalf("restoreState: %v", err)
+	}
+
+	if len(pm2.PeerInfos()) != 0 {
+		t.Errorf("restored peers = %v, want empty", pm2.PeerInfos())
+	}
+}
+
+func TestRestoreState_MalformedPeers(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a meta file with malformed peer entries
+	content := "nodeID:self\nreplid:rid1\nlastSeq:10\nterm:2\nvotedFor:\npeers:n1@a:1,,@bad,noatsign,n2@b:2"
+	if err := os.WriteFile(dir+"/replication.meta", []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	pm := NewPeerManager(nil, noopLogger)
+	s := &Server{
+		opts:        Options{DataDir: dir},
+		peerManager: pm,
+	}
+	if err := s.restoreState(); err != nil {
+		t.Fatalf("restoreState: %v", err)
+	}
+
+	// Only n1 and n2 should survive
+	infos := pm.PeerInfos()
+	if len(infos) != 2 {
+		t.Fatalf("restored peers = %d, want 2", len(infos))
+	}
+	peerMap := make(map[string]string)
+	for _, pi := range infos {
+		peerMap[pi.NodeID] = pi.Addr
+	}
+	if peerMap["n1"] != "a:1" || peerMap["n2"] != "b:2" {
+		t.Errorf("restored peers = %v, want n1->a:1 n2->b:2", peerMap)
+	}
+}
+
+func TestRestoreState_NilPeerManager(t *testing.T) {
+	dir := t.TempDir()
+
+	content := "nodeID:self\nreplid:rid1\nlastSeq:10\nterm:2\nvotedFor:\npeers:n1@a:1,n2@b:2"
+	if err := os.WriteFile(dir+"/replication.meta", []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	s := &Server{
+		opts:        Options{DataDir: dir},
+		peerManager: nil, // nil peerManager — should not panic
+	}
+	if err := s.restoreState(); err != nil {
+		t.Fatalf("restoreState: %v", err)
+	}
+
+	// Just verify no panic and other fields restored
+	if s.nodeID != "self" {
+		t.Errorf("nodeID = %q, want self", s.nodeID)
+	}
+	if s.term.Load() != 2 {
+		t.Errorf("term = %d, want 2", s.term.Load())
 	}
 }
 

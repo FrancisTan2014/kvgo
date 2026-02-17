@@ -20,7 +20,6 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdPut] = (*Server).handlePut
 	s.requestHandlers[protocol.CmdReplicate] = (*Server).handleReplicate
 	s.requestHandlers[protocol.CmdPing] = (*Server).handlePing
-	s.requestHandlers[protocol.CmdPong] = (*Server).handlePong
 	s.requestHandlers[protocol.CmdPromote] = (*Server).handlePromote
 	s.requestHandlers[protocol.CmdReplicaOf] = (*Server).handleReplicaOf
 	s.requestHandlers[protocol.CmdCleanup] = (*Server).handleCleanup
@@ -28,6 +27,7 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdNack] = (*Server).handleNack
 	s.requestHandlers[protocol.CmdTopology] = (*Server).handleTopology
 	s.requestHandlers[protocol.CmdPeerHandshake] = (*Server).handlePeerHandshake
+	s.requestHandlers[protocol.CmdVoteRequest] = (*Server).handleVoteRequest
 }
 
 func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duration) (takenOver bool) {

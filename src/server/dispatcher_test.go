@@ -22,7 +22,6 @@ func TestCommandRegistration(t *testing.T) {
 		{protocol.CmdPut, "PUT"},
 		{protocol.CmdReplicate, "REPLICATE"},
 		{protocol.CmdPing, "PING"},
-		{protocol.CmdPong, "PONG"},
 		{protocol.CmdPromote, "PROMOTE"},
 		{protocol.CmdReplicaOf, "REPLICAOF"},
 		{protocol.CmdCleanup, "CLEANUP"},
@@ -30,6 +29,7 @@ func TestCommandRegistration(t *testing.T) {
 		{protocol.CmdNack, "NACK"},
 		{protocol.CmdTopology, "TOPOLOGY"},
 		{protocol.CmdPeerHandshake, "PEER"},
+		{protocol.CmdVoteRequest, "VOTE"},
 	}
 
 	for _, tc := range expectedCommands {
@@ -92,8 +92,8 @@ func TestUnknownCommandHandling(t *testing.T) {
 // (Full error propagation tested in handler_test.go with real DB)
 func TestHandlerErrorPropagation(t *testing.T) {
 	// Verify replica mode flag works correctly
-	s := &Server{isReplica: true}
-	if !s.isReplica {
+	s := &Server{}
+	if s.isLeader() {
 		t.Error("expected replica mode")
 	}
 }

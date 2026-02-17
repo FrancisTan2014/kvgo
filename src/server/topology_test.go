@@ -16,11 +16,11 @@ func TestHandleTopology(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
 		s := &Server{
 			peerManager: pm,
+			nodeID:      "self-node",
 			opts:        Options{Host: "127.0.0.1", Port: 5000},
 		}
 
-		self := s.listenAddr() // "127.0.0.1:5000"
-		topology := "10.0.0.1:5001" + protocol.Delimiter + self + protocol.Delimiter + "10.0.0.2:5002"
+		topology := "n1@10.0.0.1:5001" + protocol.Delimiter + "self-node@127.0.0.1:5000" + protocol.Delimiter + "n2@10.0.0.2:5002"
 
 		ctx := &RequestContext{
 			StreamTransport: &mockStreamTransport{},
@@ -35,21 +35,48 @@ func TestHandleTopology(t *testing.T) {
 			t.Fatalf("handleTopology: %v", err)
 		}
 
-		addrs := pm.Addrs()
-		sort.Strings(addrs)
-		if len(addrs) != 2 {
-			t.Fatalf("len = %d, want 2", len(addrs))
+		ids := pm.NodeIDs()
+		sort.Strings(ids)
+		if len(ids) != 2 {
+			t.Fatalf("len = %d, want 2", len(ids))
 		}
-		if addrs[0] != "10.0.0.1:5001" || addrs[1] != "10.0.0.2:5002" {
-			t.Errorf("addrs = %v, want [10.0.0.1:5001 10.0.0.2:5002]", addrs)
+		if ids[0] != "n1" || ids[1] != "n2" {
+			t.Errorf("ids = %v, want [n1 n2]", ids)
+		}
+	})
+
+	t.Run("malformed entries are skipped", func(t *testing.T) {
+		pm := NewPeerManager(nil, noopLogger)
+		s := &Server{peerManager: pm, nodeID: "self"}
+
+		// Mix of valid, missing-@, empty-nodeID, empty-addr
+		topology := "n1@10.0.0.1:5001" + protocol.Delimiter + "garbage-no-at" + protocol.Delimiter + "@empty-id" + protocol.Delimiter + "no-addr@" + protocol.Delimiter + "n2@10.0.0.2:5002"
+
+		ctx := &RequestContext{
+			StreamTransport: &mockStreamTransport{},
+			Request:         protocol.Request{Cmd: protocol.CmdTopology, Value: []byte(topology)},
+		}
+
+		err := s.handleTopology(ctx)
+		if err != nil {
+			t.Fatalf("handleTopology: %v", err)
+		}
+
+		ids := pm.NodeIDs()
+		sort.Strings(ids)
+		if len(ids) != 2 {
+			t.Fatalf("len = %d, want 2, got %v", len(ids), ids)
+		}
+		if ids[0] != "n1" || ids[1] != "n2" {
+			t.Errorf("ids = %v, want [n1 n2]", ids)
 		}
 	})
 
 	t.Run("empty topology clears peers", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		pm.SavePeers([]string{"a:1", "b:2"})
+		pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
 
-		s := &Server{peerManager: pm}
+		s := &Server{peerManager: pm, nodeID: "self"}
 
 		ctx := &RequestContext{
 			StreamTransport: &mockStreamTransport{},
@@ -61,21 +88,24 @@ func TestHandleTopology(t *testing.T) {
 			t.Fatalf("handleTopology: %v", err)
 		}
 
-		if len(pm.Addrs()) != 0 {
-			t.Errorf("peers not cleared, got %v", pm.Addrs())
+		if len(pm.NodeIDs()) != 0 {
+			t.Errorf("peers not cleared, got %v", pm.NodeIDs())
 		}
 	})
 }
 
 func TestBuildTopologyRequest(t *testing.T) {
-	s := &Server{}
+	s := &Server{
+		nodeID: "primary-node",
+		opts:   Options{Host: "10.0.0.100", Port: 4000},
+	}
 
 	t1 := &fakeStreamTransport{id: 1}
 	t2 := &fakeStreamTransport{id: 2}
 
 	replicas := map[transport.StreamTransport]*replicaConn{
-		t1: {transport: t1, listenAddr: "10.0.0.1:5001"},
-		t2: {transport: t2, listenAddr: "10.0.0.2:5002"},
+		t1: {transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001"},
+		t2: {transport: t2, nodeID: "n2", listenAddr: "10.0.0.2:5002"},
 	}
 
 	req := s.buildTopologyRequest(replicas)
@@ -83,37 +113,98 @@ func TestBuildTopologyRequest(t *testing.T) {
 		t.Errorf("cmd = %d, want CmdTopology", req.Cmd)
 	}
 
-	// Value contains all addresses delimited by newline
+	// Value contains nodeID@addr entries delimited by newline
 	val := string(req.Value)
-	// Map iteration order is random, so check both addresses are present
-	for _, addr := range []string{"10.0.0.1:5001", "10.0.0.2:5002"} {
+	wantEntries := []string{"primary-node@10.0.0.100:4000", "n1@10.0.0.1:5001", "n2@10.0.0.2:5002"}
+	for _, want := range wantEntries {
 		found := false
 		for _, part := range splitTopology(val) {
-			if part == addr {
+			if part == want {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("topology %q missing %s", val, addr)
+			t.Errorf("topology %q missing %s", val, want)
 		}
 	}
 }
 
 func TestBroadcastTopology(t *testing.T) {
+	t.Run("saves peers to primary peerManager", func(t *testing.T) {
+		pm := NewPeerManager(nil, noopLogger)
+		s := &Server{
+			replicas:    make(map[transport.StreamTransport]*replicaConn),
+			nodeID:      "primary",
+			opts:        Options{Host: "10.0.0.100", Port: 4000},
+			peerManager: pm,
+		}
+		s.role.Store(uint32(RoleLeader))
+
+		ch1 := make(chan []byte, 1)
+		t1 := &fakeStreamTransport{id: 1}
+		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
+
+		s.broadcastTopology()
+
+		// Primary should have saved n1 as a peer
+		infos := pm.PeerInfos()
+		if len(infos) != 1 {
+			t.Fatalf("PeerInfos len = %d, want 1", len(infos))
+		}
+		if infos[0].NodeID != "n1" || infos[0].Addr != "10.0.0.1:5001" {
+			t.Errorf("peer = %+v, want {n1 10.0.0.1:5001}", infos[0])
+		}
+	})
+
+	t.Run("filters replicas with empty nodeID or listenAddr", func(t *testing.T) {
+		pm := NewPeerManager(nil, noopLogger)
+		s := &Server{
+			replicas:    make(map[transport.StreamTransport]*replicaConn),
+			nodeID:      "primary",
+			opts:        Options{Host: "10.0.0.100", Port: 4000},
+			peerManager: pm,
+		}
+		s.role.Store(uint32(RoleLeader))
+
+		ch1 := make(chan []byte, 1)
+		ch2 := make(chan []byte, 1)
+		ch3 := make(chan []byte, 1)
+		t1 := &fakeStreamTransport{id: 1}
+		t2 := &fakeStreamTransport{id: 2}
+		t3 := &fakeStreamTransport{id: 3}
+
+		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
+		s.replicas[t2] = &replicaConn{transport: t2, nodeID: "", listenAddr: "10.0.0.2:5002", sendCh: ch2} // empty nodeID
+		s.replicas[t3] = &replicaConn{transport: t3, nodeID: "n3", listenAddr: "", sendCh: ch3}            // empty addr
+
+		s.broadcastTopology()
+
+		infos := pm.PeerInfos()
+		if len(infos) != 1 {
+			t.Fatalf("PeerInfos len = %d, want 1 (only n1)", len(infos))
+		}
+		if infos[0].NodeID != "n1" {
+			t.Errorf("peer = %+v, want n1", infos[0])
+		}
+	})
+
 	t.Run("sends to all replicas", func(t *testing.T) {
 		s := &Server{
-			isReplica: false,
-			replicas:  make(map[transport.StreamTransport]*replicaConn),
+			replicas:    make(map[transport.StreamTransport]*replicaConn),
+			nodeID:      "primary",
+			opts:        Options{Host: "10.0.0.100", Port: 4000},
+			peerManager: NewPeerManager(nil, noopLogger),
 		}
+		s.role.Store(uint32(RoleLeader))
 
 		ch1 := make(chan []byte, 1)
 		ch2 := make(chan []byte, 1)
 		t1 := &fakeStreamTransport{id: 1}
 		t2 := &fakeStreamTransport{id: 2}
 
-		s.replicas[t1] = &replicaConn{transport: t1, listenAddr: "r1:5001", sendCh: ch1}
-		s.replicas[t2] = &replicaConn{transport: t2, listenAddr: "r2:5002", sendCh: ch2}
+		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "r1:5001", sendCh: ch1}
+		s.replicas[t2] = &replicaConn{transport: t2, nodeID: "n2", listenAddr: "r2:5002", sendCh: ch2}
 
 		s.broadcastTopology()
 
@@ -141,13 +232,12 @@ func TestBroadcastTopology(t *testing.T) {
 
 	t.Run("skipped on replica", func(t *testing.T) {
 		s := &Server{
-			isReplica: true,
-			replicas:  make(map[transport.StreamTransport]*replicaConn),
+			replicas: make(map[transport.StreamTransport]*replicaConn),
 		}
 
 		ch := make(chan []byte, 1)
 		t1 := &fakeStreamTransport{id: 1}
-		s.replicas[t1] = &replicaConn{transport: t1, listenAddr: "r:1", sendCh: ch}
+		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "r:1", sendCh: ch}
 
 		s.broadcastTopology()
 
@@ -159,12 +249,14 @@ func TestBroadcastTopology(t *testing.T) {
 		}
 	})
 
-	t.Run("topology contains primary and all replica addresses", func(t *testing.T) {
+	t.Run("topology contains primary and all replica entries", func(t *testing.T) {
 		s := &Server{
-			isReplica: false,
-			replicas:  make(map[transport.StreamTransport]*replicaConn),
-			opts:      Options{Host: "10.0.0.100", Port: 4000},
+			replicas:    make(map[transport.StreamTransport]*replicaConn),
+			nodeID:      "primary",
+			opts:        Options{Host: "10.0.0.100", Port: 4000},
+			peerManager: NewPeerManager(nil, noopLogger),
 		}
+		s.role.Store(uint32(RoleLeader))
 
 		ch1 := make(chan []byte, 1)
 		ch2 := make(chan []byte, 1)
@@ -173,9 +265,9 @@ func TestBroadcastTopology(t *testing.T) {
 		t2 := &fakeStreamTransport{id: 2}
 		t3 := &fakeStreamTransport{id: 3}
 
-		s.replicas[t1] = &replicaConn{transport: t1, listenAddr: "10.0.0.1:5001", sendCh: ch1}
-		s.replicas[t2] = &replicaConn{transport: t2, listenAddr: "10.0.0.2:5002", sendCh: ch2}
-		s.replicas[t3] = &replicaConn{transport: t3, listenAddr: "10.0.0.3:5003", sendCh: ch3}
+		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
+		s.replicas[t2] = &replicaConn{transport: t2, nodeID: "n2", listenAddr: "10.0.0.2:5002", sendCh: ch2}
+		s.replicas[t3] = &replicaConn{transport: t3, nodeID: "n3", listenAddr: "10.0.0.3:5003", sendCh: ch3}
 
 		s.broadcastTopology()
 
@@ -185,7 +277,7 @@ func TestBroadcastTopology(t *testing.T) {
 		parts := splitTopology(string(req.Value))
 		sort.Strings(parts)
 
-		want := []string{"10.0.0.100:4000", "10.0.0.1:5001", "10.0.0.2:5002", "10.0.0.3:5003"}
+		want := []string{"n1@10.0.0.1:5001", "n2@10.0.0.2:5002", "n3@10.0.0.3:5003", "primary@10.0.0.100:4000"}
 		if len(parts) != len(want) {
 			t.Fatalf("parts = %v, want %v", parts, want)
 		}

@@ -153,9 +153,9 @@ func TestResponseEncodeValidation(t *testing.T) {
 			wantErr: ErrInvalidMessage,
 		},
 		{
-			name:    "StatusPong with value (invalid)",
+			name:    "StatusPong with value (valid — carries term)",
 			resp:    Response{Status: StatusPong, Value: []byte("x")},
-			wantErr: ErrInvalidMessage,
+			wantErr: nil,
 		},
 		{
 			name:    "StatusCleaning with value (invalid)",

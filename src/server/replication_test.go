@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"kvgo/protocol"
 	"kvgo/transport"
 	"net"
@@ -34,7 +35,6 @@ func TestPrimarySeqInitialization(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				isReplica:  true,
 				primarySeq: 0, // Initially 0
 			}
 
@@ -79,7 +79,6 @@ func TestPrimarySeqInitialization(t *testing.T) {
 // when applying replicated PUTs, reducing the staleness window between heartbeats.
 func TestReplicatedWritePrimarySeqUpdate(t *testing.T) {
 	s := &Server{
-		isReplica:  true,
 		primarySeq: 10,
 	}
 	s.lastSeq.Store(10)
@@ -104,29 +103,31 @@ func TestReplicatedWritePrimarySeqUpdate(t *testing.T) {
 	}
 }
 
-// TestHandlePong verifies PONG handler correctly processes heartbeat responses.
-// This is a regression test for the protocol bug where replicas sent Response
-// instead of Request, causing connection closures.
-func TestHandlePong(t *testing.T) {
-	s := &Server{}
-
-	// Create mock connection
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
+// TestProcessPongResponse verifies PONG response processing for heartbeats.
+// processPongResponse extracts the term from a Response and steps down if needed.
+func TestProcessPongResponse(t *testing.T) {
+	s := &Server{
+		peerManager: NewPeerManager(nil, noopLogger),
 	}
-	defer listener.Close()
+	s.role.Store(uint32(RoleLeader))
+	s.term.Store(5)
+	s.roleChanged = make(chan struct{})
 
-	// PONG handler should simply return nil (acknowledges heartbeat)
-	ctx := &RequestContext{
-		Request: protocol.Request{
-			Cmd: protocol.CmdPong,
-		},
+	// Encode a PONG Response with term 0 (lower than server's term 5 → no step-down)
+	termBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(termBuf, 0)
+	resp := protocol.Response{Status: protocol.StatusPong, Value: termBuf}
+	payload, _ := protocol.EncodeResponse(resp)
+
+	rc := &replicaConn{listenAddr: "127.0.0.1:9999"}
+	s.processPongResponse(payload, rc)
+
+	// Term and role should be unchanged (0 < 5)
+	if s.term.Load() != 5 {
+		t.Errorf("term = %d, want 5", s.term.Load())
 	}
-
-	err = s.handlePong(ctx)
-	if err != nil {
-		t.Errorf("handlePong should return nil, got error: %v", err)
+	if s.currentRole() != RoleLeader {
+		t.Errorf("role = %s, want leader", s.currentRole())
 	}
 }
 
@@ -175,8 +176,7 @@ func TestReplicaConnectionIdentity(t *testing.T) {
 
 	// Create replica server with primary connection set
 	s := &Server{
-		isReplica: true,
-		primary:   serverPrimaryTransport,
+		primary: serverPrimaryTransport,
 	}
 
 	// Test 1: Connection identity check for primary connection
@@ -228,7 +228,7 @@ func TestReplicationStateCleanup(t *testing.T) {
 	}
 
 	// Add replica connection
-	rc := newReplicaConn(serverTransport, 0, "test-replid", s.listenAddr())
+	rc := newReplicaConn(serverTransport, 0, "test-replid", "test-node-id", s.listenAddr())
 	s.replicas[serverTransport] = rc
 
 	if len(s.replicas) != 1 {
@@ -249,9 +249,7 @@ func TestReplicationStateCleanup(t *testing.T) {
 
 // TestReplicaReconnectionFlow verifies that replicas can reconnect after disconnect.
 func TestReplicaReconnectionFlow(t *testing.T) {
-	s := &Server{
-		isReplica: true,
-	}
+	s := &Server{}
 	s.opts.ReplicaOf = "127.0.0.1:9999" // Non-existent, will fail to connect
 
 	ctx, cancel := context.WithCancel(context.Background())

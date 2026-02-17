@@ -33,13 +33,13 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		s := &Server{
 			db:           db,
-			isReplica:    false,
 			replicas:     make(map[transport.StreamTransport]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
 				QuorumWriteTimeout: 500 * time.Millisecond,
 			},
 		}
+		s.role.Store(uint32(RoleLeader))
 		s.seq.Store(100)
 
 		// 3 replicas → 4-node cluster → quorum=3 → need 2 replica ACKs
@@ -101,13 +101,13 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		s := &Server{
 			db:           db,
-			isReplica:    false,
 			replicas:     make(map[transport.StreamTransport]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
 				QuorumWriteTimeout: 500 * time.Millisecond,
 			},
 		}
+		s.role.Store(uint32(RoleLeader))
 		s.seq.Store(100)
 
 		replica1 := &mockStreamTransport{address: "r1:6379"}
@@ -157,13 +157,13 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		s := &Server{
 			db:           db,
-			isReplica:    false,
 			replicas:     make(map[transport.StreamTransport]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
 				QuorumWriteTimeout: 50 * time.Millisecond,
 			},
 		}
+		s.role.Store(uint32(RoleLeader))
 		s.seq.Store(100)
 
 		// 2 replicas, neither ACKs → timeout
@@ -225,11 +225,13 @@ func TestQuorumReadCoordination(t *testing.T) {
 		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
 			return mocks[addr], nil
 		}, noopLogger)
-		pm.SavePeers([]string{"r1", "r2"})
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "r1"},
+			{NodeID: "n2", Addr: "r2"},
+		})
 
 		s := &Server{
 			db:            db,
-			isReplica:     true,
 			peerManager:   pm,
 			lastHeartbeat: time.Now(),
 			primarySeq:    100,
@@ -302,11 +304,14 @@ func TestQuorumReadCoordination(t *testing.T) {
 			}
 			return m, nil
 		}, noopLogger)
-		pm.SavePeers([]string{"r1", "r2", "r3"})
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "r1"},
+			{NodeID: "n2", Addr: "r2"},
+			{NodeID: "n3", Addr: "r3"},
+		})
 
 		s := &Server{
 			db:            db,
-			isReplica:     true,
 			peerManager:   pm,
 			lastHeartbeat: time.Now(),
 			primarySeq:    100,
@@ -353,11 +358,13 @@ func TestQuorumReadCoordination(t *testing.T) {
 		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
 			return mocks[addr], nil
 		}, noopLogger)
-		pm.SavePeers([]string{"r1", "r2"})
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "r1"},
+			{NodeID: "n2", Addr: "r2"},
+		})
 
 		s := &Server{
 			db:            db,
-			isReplica:     true,
 			peerManager:   pm,
 			lastHeartbeat: time.Now(),
 			primarySeq:    100,

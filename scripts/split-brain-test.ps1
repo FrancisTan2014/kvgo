@@ -1,4 +1,7 @@
 # split-brain-test.ps1 - Observe data loss from split brain scenario
+# DEPRECATED: Uses manual `promote` to simulate split brain. With automatic
+# elections, split brain is prevented by term-based fencing.
+# Replaced by: stale-primary-fencing-test.ps1 (partitioned primary steps down)
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $srcDir = Join-Path $scriptDir "..\src"

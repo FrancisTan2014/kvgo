@@ -12,7 +12,7 @@ import (
 func TestIsStaleness(t *testing.T) {
 	tests := []struct {
 		name                  string
-		isReplica             bool
+		role                  Role
 		primarySeq            uint64
 		lastSeq               uint64
 		heartbeatAge          time.Duration
@@ -22,7 +22,7 @@ func TestIsStaleness(t *testing.T) {
 	}{
 		{
 			name:                  "primary never stale",
-			isReplica:             false,
+			role:                  RoleLeader,
 			primarySeq:            100,
 			lastSeq:               0,
 			heartbeatAge:          10 * time.Hour,
@@ -32,7 +32,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica fresh, no lag",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            100,
 			lastSeq:               100,
 			heartbeatAge:          1 * time.Second,
@@ -42,7 +42,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica stale by heartbeat",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            100,
 			lastSeq:               100,
 			heartbeatAge:          10 * time.Second,
@@ -52,7 +52,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica stale by sequence lag",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            2000,
 			lastSeq:               100,
 			heartbeatAge:          1 * time.Second,
@@ -62,7 +62,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica stale by both",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            2000,
 			lastSeq:               100,
 			heartbeatAge:          10 * time.Second,
@@ -72,7 +72,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica at exact heartbeat threshold (not stale)",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            100,
 			lastSeq:               100,
 			heartbeatAge:          5 * time.Second,
@@ -82,7 +82,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica at exact sequence threshold (not stale)",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            1100,
 			lastSeq:               100,
 			heartbeatAge:          1 * time.Second,
@@ -92,7 +92,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica one over heartbeat threshold (stale)",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            100,
 			lastSeq:               100,
 			heartbeatAge:          5*time.Second + 1*time.Nanosecond,
@@ -102,7 +102,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica one over sequence threshold (stale)",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            1101,
 			lastSeq:               100,
 			heartbeatAge:          1 * time.Second,
@@ -112,7 +112,7 @@ func TestIsStaleness(t *testing.T) {
 		},
 		{
 			name:                  "replica zero lag is not stale",
-			isReplica:             true,
+			role:                  RoleFollower,
 			primarySeq:            100,
 			lastSeq:               100,
 			heartbeatAge:          100 * time.Millisecond,
@@ -125,7 +125,6 @@ func TestIsStaleness(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				isReplica:     tt.isReplica,
 				primarySeq:    tt.primarySeq,
 				lastHeartbeat: time.Now().Add(-tt.heartbeatAge),
 				opts: Options{
@@ -133,6 +132,7 @@ func TestIsStaleness(t *testing.T) {
 					ReplicaStaleLag:       tt.replicaStaleLag,
 				},
 			}
+			s.role.Store(uint32(tt.role))
 			s.lastSeq = atomic.Uint64{}
 			s.lastSeq.Store(tt.lastSeq)
 

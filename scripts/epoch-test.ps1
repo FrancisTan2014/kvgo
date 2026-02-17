@@ -1,4 +1,7 @@
 # epoch-test.ps1 - Verify epoch detection during split-brain reconnection
+# DEPRECATED: Uses manual `promote` + `replicaof` to trigger epoch mismatch.
+# With automatic elections, epoch detection is tested implicitly by:
+#   primary-rejoin-test.ps1 (crashed primary does full resync on rejoin)
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $srcDir = Join-Path $scriptDir "..\src"

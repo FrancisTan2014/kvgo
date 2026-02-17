@@ -14,6 +14,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // handleAck processes ACK messages from replicas for quorum writes.
+// ACKs arrive via the peer channel (Request), so we respond with OK.
 // Uses per-request locking to avoid global serialization across concurrent writes.
 func (s *Server) handleAck(ctx *RequestContext) error {
 	// Fast path: lookup state with read lock
@@ -24,7 +25,7 @@ func (s *Server) handleAck(ctx *RequestContext) error {
 	if !ok {
 		s.log().Warn("ACK arrived after quorum timeout or for unknown request",
 			"request_id", ctx.Request.RequestId)
-		return nil
+		return s.responseStatusOk(ctx)
 	}
 
 	// Per-request lock - different writes don't block each other
@@ -37,7 +38,7 @@ func (s *Server) handleAck(ctx *RequestContext) error {
 		s.log().Debug("duplicate ACK from same replica ignored",
 			"request_id", ctx.Request.RequestId,
 			"replica", remoteAddr)
-		return nil
+		return s.responseStatusOk(ctx)
 	}
 
 	// Mark this replica as having ACK'd
@@ -50,10 +51,11 @@ func (s *Server) handleAck(ctx *RequestContext) error {
 		})
 	}
 
-	return nil
+	return s.responseStatusOk(ctx)
 }
 
 // handleNack processes NACK messages from replicas for failed quorum writes.
+// NACKs arrive via the peer channel (Request), so we respond with OK.
 // NACK triggers immediate failure without waiting for timeout.
 func (s *Server) handleNack(ctx *RequestContext) error {
 	// Fast path: lookup state with read lock
@@ -64,7 +66,7 @@ func (s *Server) handleNack(ctx *RequestContext) error {
 	if !ok {
 		s.log().Warn("NACK arrived after quorum timeout or for unknown request",
 			"request_id", ctx.Request.RequestId)
-		return nil
+		return s.responseStatusOk(ctx)
 	}
 
 	// Per-request lock - different writes don't block each other
@@ -77,7 +79,7 @@ func (s *Server) handleNack(ctx *RequestContext) error {
 		s.log().Debug("duplicate NACK from same replica ignored",
 			"request_id", ctx.Request.RequestId,
 			"replica", remoteAddr)
-		return nil
+		return s.responseStatusOk(ctx)
 	}
 
 	// Mark this replica as having responded
@@ -94,7 +96,7 @@ func (s *Server) handleNack(ctx *RequestContext) error {
 		close(state.ackCh)
 	})
 
-	return nil
+	return s.responseStatusOk(ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +190,7 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 	key := string(req.Key)
 	localVal, localOk := s.db.Get(key)
 	localSeq := s.seq.Load()
-	if s.isReplica {
+	if !s.isLeader() {
 		localSeq = s.lastSeq.Load()
 	}
 
@@ -212,19 +214,19 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 	}
 
 	// Get snapshot of reachable nodes for safe iteration
-	nodes := s.peerManager.Addrs()
+	nodes := s.peerManager.NodeIDs()
 	n := len(nodes)
 	quorum := utils.ComputeQuorum(n + 1) // +1 for local node
 
-	for _, addr := range nodes {
+	for _, nodeID := range nodes {
 		wg.Go(func() {
-			t, err := s.peerManager.Get(addr)
+			t, err := s.peerManager.Get(nodeID)
 			if err != nil {
-				s.log().Warn("quorum read: peer unavailable", "addr", addr, "error", err)
+				s.log().Warn("quorum read: peer unavailable", "node_id", nodeID, "error", err)
 				return
 			}
 
-			value, seq, ok := s.quorumReadFromReplica(t, payload, addr)
+			value, seq, ok := s.quorumReadFromReplica(t, payload, nodeID)
 			if !ok {
 				return
 			}
@@ -268,22 +270,22 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 	return s.writeResponse(ctx.StreamTransport, resp)
 }
 
-func (s *Server) quorumReadFromReplica(t transport.RequestTransport, payload []byte, remoteAddr string) (value []byte, seq uint64, ok bool) {
+func (s *Server) quorumReadFromReplica(t transport.RequestTransport, payload []byte, nodeID string) (value []byte, seq uint64, ok bool) {
 	resp, err := t.Request(payload, s.opts.QuorumReadTimeout)
 	if err != nil {
-		s.log().Warn("quorum read: failed to get response", "remote_addr", remoteAddr, "error", err)
+		s.log().Warn("quorum read: failed to get response", "node_id", nodeID, "error", err)
 		return nil, 0, false
 	}
 
 	r, err := protocol.DecodeResponse(resp)
 	if err != nil {
-		s.log().Warn("quorum read: decode error", "remote_addr", remoteAddr, "error", err)
+		s.log().Warn("quorum read: decode error", "node_id", nodeID, "error", err)
 		return nil, 0, false
 	}
 
 	if r.Status != protocol.StatusOK && r.Status != protocol.StatusNotFound {
 		s.log().Warn("quorum read: non-OK response from replica",
-			"remote_addr", remoteAddr,
+			"node_id", nodeID,
 			"status", r.Status)
 		return nil, 0, false
 	}

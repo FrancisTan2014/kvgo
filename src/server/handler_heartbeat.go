@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"kvgo/protocol"
 	"time"
 )
@@ -11,29 +12,132 @@ import (
 
 // handlePing processes PING requests, which serve as heartbeat messages in replication.
 //
-// Primary → Replica: Sends PING with current seq periodically
+// Primary → Replica: Sends PING with current seq and term via Request().
+// Replica responds with a standard Response carrying its term in Value.
+// Primary reads the term from the Response to detect stale-primary fencing.
 func (s *Server) handlePing(ctx *RequestContext) error {
 	req := &ctx.Request
 
-	if s.isReplica {
-		s.lastHeartbeat = time.Now()
-		s.primarySeq = req.Seq
-
-		// Send PONG as a Request (not Response) so primary's handleRequest can decode it
-		pongReq := protocol.Request{Cmd: protocol.CmdPong}
-		pongPayload, _ := protocol.EncodeRequest(pongReq)
-		return ctx.StreamTransport.Send(pongPayload)
+	if s.isLeader() {
+		// Primary shouldn't receive PING (replicas send PONG)
+		return nil
 	}
 
-	// Primary shouldn't receive PING (replicas send PONG)
-	return nil
+	// Extract sender's term from Value (8 bytes LE).
+	var senderTerm uint64
+	if len(req.Value) >= 8 {
+		senderTerm = binary.LittleEndian.Uint64(req.Value[:8])
+	}
+
+	myTerm := s.term.Load()
+
+	// Reject heartbeats from a stale (lower-term) leader.
+	if senderTerm < myTerm {
+		s.log().Debug("PING rejected: stale term", "senderTerm", senderTerm, "myTerm", myTerm)
+		return s.respondPong(ctx, myTerm)
+	}
+
+	// Higher term from sender — step down (if candidate) and adopt the new term.
+	if senderTerm > myTerm {
+		s.log().Info("PING: discovered higher term, updating", "senderTerm", senderTerm, "myTerm", myTerm)
+		s.roleMu.Lock()
+		s.term.Store(senderTerm)
+		s.votedFor = ""
+		if err := s.storeState(); err != nil {
+			s.log().Error("failed to persist state on term bump", "error", err)
+		}
+		s.roleMu.Unlock()
+		s.becomeFollower()
+	}
+
+	s.lastHeartbeat = time.Now()
+	s.primarySeq = req.Seq
+
+	return s.respondPong(ctx, s.term.Load())
 }
 
-// handlePong processes PONG responses from replicas (heartbeat acknowledgment).
-//
-// Replica → Primary: Sends PONG in response to PING
-func (s *Server) handlePong(ctx *RequestContext) error {
-	// Simply acknowledge the heartbeat - connection is alive
-	// No response needed (PONG is the response)
-	return nil
+// respondPong sends a PONG as a standard Response with term in Value.
+// Using writeResponse (not a CmdPong request) lets the primary use
+// Request() on the multiplexed transport and receive the PONG synchronously.
+func (s *Server) respondPong(ctx *RequestContext, term uint64) error {
+	termBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(termBuf, term)
+	return s.writeResponse(ctx.StreamTransport, protocol.Response{
+		Status: protocol.StatusPong,
+		Value:  termBuf,
+	})
+}
+
+// processPongResponse extracts the replica's term from a PONG Response
+// and steps down if the replica has a higher term (stale primary fencing).
+func (s *Server) processPongResponse(respPayload []byte, rc *replicaConn) {
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		s.log().Warn("failed to decode PONG response", "replica", rc.listenAddr, "error", err)
+		return
+	}
+
+	var respTerm uint64
+	if len(resp.Value) >= 8 {
+		respTerm = binary.LittleEndian.Uint64(resp.Value[:8])
+	}
+
+	myTerm := s.term.Load()
+	if respTerm > myTerm {
+		wasLeader := s.isLeader()
+		s.log().Info("PONG: discovered higher term from replica, stepping down", "respTerm", respTerm, "myTerm", myTerm)
+		s.roleMu.Lock()
+		s.term.Store(respTerm)
+		s.votedFor = ""
+		if err := s.storeState(); err != nil {
+			s.log().Error("failed to persist state after step-down", "error", err)
+		}
+		s.roleMu.Unlock()
+		s.becomeFollower()
+
+		// After stepping down, reconnect to the cluster via any known peer.
+		if wasLeader {
+			if addr, ok := s.peerManager.AnyAddr(); ok {
+				go func() {
+					if err := s.relocate(addr); err != nil {
+						s.log().Warn("post-stepdown relocate failed", "addr", addr, "error", err)
+					}
+				}()
+			}
+		}
+	}
+}
+
+// getRoleChangedCh returns the current role-change notification channel.
+// The caller selects on the returned channel; becomeX() closes it to wake all waiters.
+// Must snapshot under lock — the field is swapped on every role change.
+func (s *Server) getRoleChangedCh() <-chan struct{} {
+	s.roleMu.Lock()
+	defer s.roleMu.Unlock()
+	return s.roleChanged
+}
+
+// monitorHeartbeat runs on followers to detect primary failure.
+// When lastHeartbeat exceeds the election timeout, triggers becomeCandidate.
+func (s *Server) monitorHeartbeat() {
+	for {
+		if s.isLeader() {
+			ch := s.getRoleChangedCh()
+			select {
+			case <-ch: // woken by role change
+				continue
+			case <-s.ctx.Done():
+				return
+			}
+		}
+
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(heartbeatInterval):
+			if time.Since(s.lastHeartbeat) >= randomElectionTimeout() {
+				_ = s.becomeCandidate() // follower → candidate, or candidate retries with new term
+			}
+		}
+	}
 }

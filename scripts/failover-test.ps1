@@ -1,4 +1,7 @@
 # failover-test.ps1 - Verify 3-node failover (P -> R1, R2)
+# DEPRECATED: Uses manual `promote` command which is now disabled.
+# Replaced by: election-test.ps1 (automatic leader election after primary crash)
+#              primary-rejoin-test.ps1 (crashed primary restarts and rejoins)
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $srcDir = Join-Path $scriptDir "..\src"

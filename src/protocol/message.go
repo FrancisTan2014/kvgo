@@ -61,6 +61,7 @@ const (
 	CmdPong          Cmd = 10 // Response to PING
 	CmdTopology      Cmd = 11 // Topology broadcast
 	CmdPeerHandshake Cmd = 12 // Peer handshake
+	CmdVoteRequest   Cmd = 13 // Election request
 )
 
 type Status uint8
@@ -75,6 +76,7 @@ const (
 	StatusCleaning                      // Cleanup in progress, writes temporarily rejected
 	StatusReplicaTooStale               // Replica exceeds staleness bounds; client should retry another replica or primary
 	StatusQuorumFailed                  // Quorum read failed; insufficient replica responses
+	StatusVoteResponse                  // Vote response; Value contains vote granted/denied
 
 	statusMaxKnown // Sentinel: update when adding new status codes
 )
@@ -140,7 +142,7 @@ func putU64LE(buf []byte, off int, v uint64) {
 
 // statusCanCarryValue returns true if the status code is allowed to have a non-empty value field.
 func statusCanCarryValue(st Status) bool {
-	return st == StatusOK || st == StatusFullResync || st == StatusReadOnly || st == StatusReplicaTooStale
+	return st == StatusOK || st == StatusFullResync || st == StatusReadOnly || st == StatusReplicaTooStale || st == StatusVoteResponse || st == StatusPong
 }
 
 // EncodeRequest encodes a Request into a payload (without the outer frameLen).

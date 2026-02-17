@@ -11,7 +11,7 @@ import (
 func TestHandleGet_ReplicaStaleness(t *testing.T) {
 	tests := []struct {
 		name              string
-		isReplica         bool
+		role              Role
 		primarySeq        uint64
 		lastSeq           uint64
 		lastHeartbeat     time.Time
@@ -21,7 +21,7 @@ func TestHandleGet_ReplicaStaleness(t *testing.T) {
 	}{
 		{
 			name:              "primary never checks staleness",
-			isReplica:         false,
+			role:              RoleLeader,
 			primarySeq:        100,
 			lastSeq:           0,
 			lastHeartbeat:     time.Now().Add(-10 * time.Hour),
@@ -31,7 +31,7 @@ func TestHandleGet_ReplicaStaleness(t *testing.T) {
 		},
 		{
 			name:              "replica fresh and caught up",
-			isReplica:         true,
+			role:              RoleFollower,
 			primarySeq:        100,
 			lastSeq:           100,
 			lastHeartbeat:     time.Now(),
@@ -41,7 +41,7 @@ func TestHandleGet_ReplicaStaleness(t *testing.T) {
 		},
 		{
 			name:              "replica stale by heartbeat",
-			isReplica:         true,
+			role:              RoleFollower,
 			primarySeq:        100,
 			lastSeq:           100,
 			lastHeartbeat:     time.Now().Add(-10 * time.Second),
@@ -51,7 +51,7 @@ func TestHandleGet_ReplicaStaleness(t *testing.T) {
 		},
 		{
 			name:              "replica stale by sequence",
-			isReplica:         true,
+			role:              RoleFollower,
 			primarySeq:        2000,
 			lastSeq:           100,
 			lastHeartbeat:     time.Now(),
@@ -64,7 +64,6 @@ func TestHandleGet_ReplicaStaleness(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				isReplica:     tt.isReplica,
 				primarySeq:    tt.primarySeq,
 				lastHeartbeat: tt.lastHeartbeat,
 				opts: Options{
@@ -73,6 +72,7 @@ func TestHandleGet_ReplicaStaleness(t *testing.T) {
 					ReplicaStaleLag:       tt.staleLag,
 				},
 			}
+			s.role.Store(uint32(tt.role))
 			s.lastSeq = atomic.Uint64{}
 			s.lastSeq.Store(tt.lastSeq)
 
@@ -90,17 +90,17 @@ func TestHandleGet_ReplicaStaleness(t *testing.T) {
 func TestHandlePut_ReplicaRejects(t *testing.T) {
 	tests := []struct {
 		name       string
-		isReplica  bool
+		role       Role
 		wantReject bool
 	}{
 		{
 			name:       "primary accepts writes",
-			isReplica:  false,
+			role:       RoleLeader,
 			wantReject: false,
 		},
 		{
 			name:       "replica rejects writes",
-			isReplica:  true,
+			role:       RoleFollower,
 			wantReject: true,
 		},
 	}
@@ -108,18 +108,18 @@ func TestHandlePut_ReplicaRejects(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				isReplica: tt.isReplica,
 				opts: Options{
 					ReplicaOf: "primary:6379",
 				},
 			}
+			s.role.Store(uint32(tt.role))
 
 			// The replica rejection logic is:
-			// if s.isReplica { return responseStatusWithPrimaryAddress(..., StatusReadOnly) }
+			// if !s.isLeader() { return responseStatusWithPrimaryAddress(..., StatusReadOnly) }
 			// We test the condition directly
-			shouldReject := s.isReplica == tt.wantReject
+			shouldReject := !s.isLeader() == tt.wantReject
 			if !shouldReject {
-				t.Errorf("replica rejection check: isReplica=%v, wantReject=%v", s.isReplica, tt.wantReject)
+				t.Errorf("replica rejection check: role=%v, wantReject=%v", s.currentRole(), tt.wantReject)
 			}
 		})
 	}

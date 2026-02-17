@@ -13,17 +13,21 @@ import (
 func TestPeerManager_SavePeers(t *testing.T) {
 	t.Run("adds new peers lazily", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		pm.SavePeers([]string{"a:1", "b:2", "c:3"})
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "a:1"},
+			{NodeID: "n2", Addr: "b:2"},
+			{NodeID: "n3", Addr: "c:3"},
+		})
 
-		addrs := pm.Addrs()
-		sort.Strings(addrs)
-		if len(addrs) != 3 {
-			t.Fatalf("len = %d, want 3", len(addrs))
+		ids := pm.NodeIDs()
+		sort.Strings(ids)
+		if len(ids) != 3 {
+			t.Fatalf("len = %d, want 3", len(ids))
 		}
-		want := []string{"a:1", "b:2", "c:3"}
-		for i, a := range addrs {
-			if a != want[i] {
-				t.Errorf("addrs[%d] = %q, want %q", i, a, want[i])
+		want := []string{"n1", "n2", "n3"}
+		for i, id := range ids {
+			if id != want[i] {
+				t.Errorf("ids[%d] = %q, want %q", i, id, want[i])
 			}
 		}
 
@@ -40,45 +44,56 @@ func TestPeerManager_SavePeers(t *testing.T) {
 			return &mockRequestTransport{address: addr}, nil
 		}, noopLogger)
 
-		pm.SavePeers([]string{"a:1", "b:2"})
-		// Dial a:1 to cache transport
-		pm.Get("a:1")
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "a:1"},
+			{NodeID: "n2", Addr: "b:2"},
+		})
+		// Dial n1 to cache transport
+		pm.Get("n1")
 
 		// Override close to track it
 		pm.mu.Lock()
-		pm.peers["a:1"].transport = &closeTrackingTransport{closed: &closed}
+		pm.peers["n1"].transport = &closeTrackingTransport{closed: &closed}
 		pm.mu.Unlock()
 
-		// New topology drops a:1
-		pm.SavePeers([]string{"b:2"})
+		// New topology drops n1
+		pm.SavePeers([]PeerInfo{{NodeID: "n2", Addr: "b:2"}})
 
 		if !closed {
 			t.Error("removed peer transport not closed")
 		}
-		addrs := pm.Addrs()
-		if len(addrs) != 1 || addrs[0] != "b:2" {
-			t.Errorf("addrs = %v, want [b:2]", addrs)
+		ids := pm.NodeIDs()
+		if len(ids) != 1 || ids[0] != "n2" {
+			t.Errorf("ids = %v, want [n2]", ids)
 		}
 	})
 
 	t.Run("nil topology clears all peers", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		pm.SavePeers([]string{"a:1", "b:2"})
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "a:1"},
+			{NodeID: "n2", Addr: "b:2"},
+		})
 		pm.SavePeers(nil)
 
-		if len(pm.Addrs()) != 0 {
-			t.Errorf("len = %d, want 0 after nil topology", len(pm.Addrs()))
+		if len(pm.NodeIDs()) != 0 {
+			t.Errorf("len = %d, want 0 after nil topology", len(pm.NodeIDs()))
 		}
 	})
 
-	t.Run("skips empty addresses", func(t *testing.T) {
+	t.Run("skips entries with empty nodeID or addr", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		pm.SavePeers([]string{"a:1", "", "b:2", ""})
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "a:1"},
+			{NodeID: "", Addr: "b:2"},
+			{NodeID: "n3", Addr: ""},
+			{NodeID: "n4", Addr: "d:4"},
+		})
 
-		addrs := pm.Addrs()
-		sort.Strings(addrs)
-		if len(addrs) != 2 {
-			t.Fatalf("len = %d, want 2", len(addrs))
+		ids := pm.NodeIDs()
+		sort.Strings(ids)
+		if len(ids) != 2 {
+			t.Fatalf("len = %d, want 2", len(ids))
 		}
 	})
 
@@ -87,17 +102,78 @@ func TestPeerManager_SavePeers(t *testing.T) {
 			return &mockRequestTransport{address: addr}, nil
 		}, noopLogger)
 
-		pm.SavePeers([]string{"a:1", "b:2"})
-		t1, _ := pm.Get("a:1")
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "a:1"},
+			{NodeID: "n2", Addr: "b:2"},
+		})
+		t1, _ := pm.Get("n1")
 
 		// Same topology again
-		pm.SavePeers([]string{"a:1", "b:2"})
-		t2, _ := pm.Get("a:1")
+		pm.SavePeers([]PeerInfo{
+			{NodeID: "n1", Addr: "a:1"},
+			{NodeID: "n2", Addr: "b:2"},
+		})
+		t2, _ := pm.Get("n1")
 
 		if t1 != t2 {
 			t.Error("transport replaced on unchanged topology")
 		}
 	})
+}
+
+func TestPeerManager_Addr(t *testing.T) {
+	pm := NewPeerManager(nil, noopLogger)
+	pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
+
+	addr, ok := pm.Addr("n1")
+	if !ok || addr != "a:1" {
+		t.Errorf("Addr(n1) = (%q, %v), want (a:1, true)", addr, ok)
+	}
+
+	_, ok = pm.Addr("unknown")
+	if ok {
+		t.Error("Addr(unknown) should return false")
+	}
+}
+
+func TestPeerManager_AnyAddr(t *testing.T) {
+	pm := NewPeerManager(nil, noopLogger)
+
+	_, ok := pm.AnyAddr()
+	if ok {
+		t.Error("AnyAddr on empty should return false")
+	}
+
+	pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
+	addr, ok := pm.AnyAddr()
+	if !ok || addr != "a:1" {
+		t.Errorf("AnyAddr = (%q, %v), want (a:1, true)", addr, ok)
+	}
+}
+
+func TestPeerManager_PeerInfos(t *testing.T) {
+	pm := NewPeerManager(nil, noopLogger)
+
+	// Empty manager returns empty slice
+	infos := pm.PeerInfos()
+	if len(infos) != 0 {
+		t.Errorf("PeerInfos on empty = %d, want 0", len(infos))
+	}
+
+	pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
+	infos = pm.PeerInfos()
+	if len(infos) != 2 {
+		t.Fatalf("PeerInfos = %d, want 2", len(infos))
+	}
+
+	// Check both peers are present (order not guaranteed)
+	got := make(map[string]string)
+	for _, pi := range infos {
+		got[pi.NodeID] = pi.Addr
+	}
+	if got["n1"] != "a:1" || got["n2"] != "b:2" {
+		t.Errorf("PeerInfos = %v, want n1->a:1 n2->b:2", got)
+	}
 }
 
 func TestPeerManager_Get(t *testing.T) {
@@ -108,12 +184,12 @@ func TestPeerManager_Get(t *testing.T) {
 			return &mockRequestTransport{address: addr}, nil
 		}, noopLogger)
 
-		pm.SavePeers([]string{"a:1"})
+		pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
 		if dialCount != 0 {
 			t.Fatalf("dial called on SavePeers, count = %d", dialCount)
 		}
 
-		t1, err := pm.Get("a:1")
+		t1, err := pm.Get("n1")
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
@@ -122,7 +198,7 @@ func TestPeerManager_Get(t *testing.T) {
 		}
 
 		// Second Get reuses cached transport
-		t2, err := pm.Get("a:1")
+		t2, err := pm.Get("n1")
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
@@ -136,7 +212,7 @@ func TestPeerManager_Get(t *testing.T) {
 
 	t.Run("unknown peer returns error", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		_, err := pm.Get("unknown:1")
+		_, err := pm.Get("unknown")
 		if err == nil {
 			t.Error("expected error for unknown peer")
 		}
@@ -147,8 +223,8 @@ func TestPeerManager_Get(t *testing.T) {
 			return nil, errors.New("connection refused")
 		}, noopLogger)
 
-		pm.SavePeers([]string{"a:1"})
-		_, err := pm.Get("a:1")
+		pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
+		_, err := pm.Get("n1")
 		if err == nil {
 			t.Error("expected dial error")
 		}
@@ -160,25 +236,29 @@ func TestPeerManager_Snapshot(t *testing.T) {
 		return &mockRequestTransport{address: addr}, nil
 	}, noopLogger)
 
-	pm.SavePeers([]string{"a:1", "b:2", "c:3"})
+	pm.SavePeers([]PeerInfo{
+		{NodeID: "n1", Addr: "a:1"},
+		{NodeID: "n2", Addr: "b:2"},
+		{NodeID: "n3", Addr: "c:3"},
+	})
 
 	// Only dial two
-	pm.Get("a:1")
-	pm.Get("c:3")
+	pm.Get("n1")
+	pm.Get("n3")
 
 	snap := pm.Snapshot()
 	if len(snap) != 2 {
 		t.Fatalf("snapshot len = %d, want 2", len(snap))
 	}
-	if snap["a:1"] == nil || snap["c:3"] == nil {
+	if snap["n1"] == nil || snap["n3"] == nil {
 		t.Error("snapshot missing dialed peers")
 	}
-	if snap["b:2"] != nil {
+	if snap["n2"] != nil {
 		t.Error("snapshot includes undialed peer")
 	}
 
 	// Snapshot is isolated from mutations
-	delete(snap, "a:1")
+	delete(snap, "n1")
 	snap2 := pm.Snapshot()
 	if len(snap2) != 2 {
 		t.Error("mutation leaked into PeerManager")
@@ -197,9 +277,12 @@ func TestPeerManager_Close(t *testing.T) {
 		}, nil
 	}, noopLogger)
 
-	pm.SavePeers([]string{"a:1", "b:2"})
-	pm.Get("a:1")
-	pm.Get("b:2")
+	pm.SavePeers([]PeerInfo{
+		{NodeID: "n1", Addr: "a:1"},
+		{NodeID: "n2", Addr: "b:2"},
+	})
+	pm.Get("n1")
+	pm.Get("n2")
 
 	pm.Close()
 
@@ -210,7 +293,7 @@ func TestPeerManager_Close(t *testing.T) {
 	if closedAddrs[0] != "a:1" || closedAddrs[1] != "b:2" {
 		t.Errorf("closed = %v, want [a:1 b:2]", closedAddrs)
 	}
-	if len(pm.Addrs()) != 0 {
+	if len(pm.NodeIDs()) != 0 {
 		t.Error("peers not cleared after Close")
 	}
 }
@@ -223,21 +306,22 @@ func TestPeerManager_ConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	n := 50
 
-	// Concurrent SavePeers + Get + Addrs
+	// Concurrent SavePeers + Get + NodeIDs
 	wg.Add(n * 3)
 	for i := 0; i < n; i++ {
+		nodeID := fmt.Sprintf("node%d", i)
 		addr := fmt.Sprintf("peer%d:1234", i)
 		go func() {
 			defer wg.Done()
-			pm.SavePeers([]string{addr})
+			pm.SavePeers([]PeerInfo{{NodeID: nodeID, Addr: addr}})
 		}()
 		go func() {
 			defer wg.Done()
-			pm.Get(addr) // may fail — that's fine
+			pm.Get(nodeID) // may fail — that's fine
 		}()
 		go func() {
 			defer wg.Done()
-			_ = pm.Addrs()
+			_ = pm.NodeIDs()
 		}()
 	}
 	wg.Wait()

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"kvgo/protocol"
 	"kvgo/transport"
@@ -13,9 +15,18 @@ import (
 )
 
 const replicaSendBuffer = 1024 // max queued writes per replica
-const heartbeatInterval = 5 * time.Second
-const pongTimeout = 2 * time.Second
+const heartbeatInterval = 200 * time.Millisecond
 const retryInterval = 100 * time.Millisecond
+
+// errRedirect is returned by connectToPrimary when the contacted node
+// is a follower and redirects us to the actual leader.
+type errRedirect struct {
+	addr string
+}
+
+func (e *errRedirect) Error() string {
+	return fmt.Sprintf("redirected to %s", e.addr)
+}
 
 // replicaConn manages a single replica connection with a dedicated write goroutine.
 type replicaConn struct {
@@ -25,16 +36,18 @@ type replicaConn struct {
 	lastSeq    uint64       // last seq reported by this replica on connect
 	hb         *time.Ticker // heartbeat ticker
 	lastWrite  time.Time
-	listenAddr string
+	nodeID     string // replica's unique identity (persisted, stable across restarts)
+	listenAddr string // replica's advertised listen address (for topology broadcast)
 }
 
-func newReplicaConn(t transport.StreamTransport, replicaLastSeq uint64, lastReplid string, listenAddr string) *replicaConn {
+func newReplicaConn(t transport.StreamTransport, replicaLastSeq uint64, lastReplid, nodeID, listenAddr string) *replicaConn {
 	return &replicaConn{
 		transport:  t,
 		sendCh:     make(chan []byte, replicaSendBuffer),
 		lastReplid: lastReplid,
 		lastSeq:    replicaLastSeq,
 		hb:         time.NewTicker(heartbeatInterval),
+		nodeID:     nodeID,
 		listenAddr: listenAddr,
 	}
 }
@@ -63,12 +76,21 @@ func (s *Server) replicationLoop(ctx context.Context) {
 		default:
 		}
 
-		if !s.isReplica {
+		if s.isLeader() {
 			return // promoted
 		}
 
 		f, err := s.connectToPrimary()
 		if err != nil {
+			var redir *errRedirect
+			if errors.As(err, &redir) {
+				s.log().Info("redirected to new primary", "address", redir.addr)
+				s.connectionMu.Lock()
+				s.opts.ReplicaOf = redir.addr
+				s.connectionMu.Unlock()
+				continue // retry immediately, no backoff
+			}
+
 			s.log().Warn("connect failed", "error", err)
 
 			// Backoff with cancellation support
@@ -128,6 +150,11 @@ func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 		}
 		// Initialize primarySeq from response to avoid initial staleness
 		s.primarySeq = resp.Seq
+	} else if resp.Status == protocol.StatusReadOnly && len(resp.Value) > 0 {
+		// Redirect: the node we contacted is a follower; it told us who the leader is.
+		leaderAddr := string(resp.Value)
+		_ = st.Close()
+		return nil, &errRedirect{addr: leaderAddr}
 	} else if resp.Status != protocol.StatusOK {
 		_ = st.Close()
 		return nil, fmt.Errorf("primary rejected replication: status %d", resp.Status)
@@ -180,8 +207,9 @@ func (s *Server) forwardToReplicas(payload []byte, seq uint64) {
 }
 
 // serveReplica performs initial sync, then spawns a writer goroutine.
-// After this returns, the connection continues through normal handleRequest loop.
-func (s *Server) serveReplica(rc *replicaConn, ctx *RequestContext) {
+// The writer forwards replicated writes and heartbeats to the replica.
+// ACK/NACK/PONG travel back through the peer channel (separate connection).
+func (s *Server) serveReplica(rc *replicaConn) bool {
 	// Check timeline compatibility
 	if rc.lastReplid != "" && rc.lastReplid != s.replid {
 		s.log().Error("incompatible replid detected — replica was following different primary",
@@ -195,9 +223,9 @@ func (s *Server) serveReplica(rc *replicaConn, ctx *RequestContext) {
 	fullSyncMode, err := s.respondSyncMode(rc)
 	if err != nil {
 		s.log().Error("Failed to send sync mode response", "replica", rc.listenAddr)
-		return
+		return false
 	} else {
-		s.addNewReplica(rc, ctx)
+		s.addNewReplica(rc)
 	}
 
 	if fullSyncMode {
@@ -209,15 +237,18 @@ func (s *Server) serveReplica(rc *replicaConn, ctx *RequestContext) {
 	// Spawn writer goroutine to handle async write forwarding + heartbeats
 	s.wg.Go(func() {
 		s.serveReplicaWriter(rc)
-		s.broadcastTopology()
 	})
+
+	// Broadcast updated topology so all replicas (including new one) learn peers.
+	s.broadcastTopology()
+
+	return true
 }
 
-func (s *Server) addNewReplica(rc *replicaConn, ctx *RequestContext) {
+func (s *Server) addNewReplica(rc *replicaConn) {
 	s.connectionMu.Lock()
 	s.replicas[rc.transport] = rc
 	s.connectionMu.Unlock()
-
 }
 
 func (s *Server) respondSyncMode(rc *replicaConn) (bool, error) {
@@ -271,15 +302,30 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 			rc.lastWrite = time.Now()
 
 		case <-rc.hb.C:
-			// Send PING if idle to detect dead connections
+			// Send PING if idle to detect dead connections.
+			// Uses Request() so the PONG comes back as a Response on the
+			// same multiplexed stream — no reader goroutine needed.
 			if time.Since(rc.lastWrite) > heartbeatInterval {
-				ping, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing, Seq: s.seq.Load()})
-				if err := rc.transport.Send(ping); err != nil {
+				termBuf := make([]byte, 8)
+				binary.LittleEndian.PutUint64(termBuf, s.term.Load())
+				ping, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing, Seq: s.seq.Load(), Value: termBuf})
+
+				// Type-assert to RequestTransport (MultiplexedTransport implements both).
+				rt, ok := rc.transport.(transport.RequestTransport)
+				if !ok {
+					s.log().Error("replica transport does not support Request")
+					return
+				}
+
+				resp, err := rt.Request(ping, 5*time.Second)
+				if err != nil {
 					s.log().Error("replica ping failed", "replica", rc.listenAddr, "error", err)
 					return
 				}
 				rc.lastWrite = time.Now()
-				s.log().Debug("replica ping sent", "replica", rc.listenAddr)
+
+				// Process PONG (encoded as Response with term in Value).
+				s.processPongResponse(resp, rc)
 			}
 		}
 	}
@@ -346,6 +392,9 @@ func (s *Server) restoreState() error {
 
 	// Parse lines: replid:xxx\nlastSeq:yyy
 	for line := range strings.SplitSeq(string(data), "\n") {
+		if nodeID, ok := strings.CutPrefix(line, "nodeID:"); ok {
+			s.nodeID = nodeID
+		}
 		if replid, ok := strings.CutPrefix(line, "replid:"); ok {
 			s.replid = replid
 		}
@@ -353,9 +402,30 @@ func (s *Server) restoreState() error {
 			seq, _ := strconv.ParseUint(lastSeqStr, 10, 64)
 			s.lastSeq.Store(seq)
 		}
+		if lastTermStr, ok := strings.CutPrefix(line, "term:"); ok {
+			term, _ := strconv.ParseUint(lastTermStr, 10, 64)
+			s.term.Store(term)
+		}
+		if votedFor, ok := strings.CutPrefix(line, "votedFor:"); ok {
+			s.votedFor = votedFor
+		}
+		if peersStr, ok := strings.CutPrefix(line, "peers:"); ok {
+			if peersStr != "" {
+				var peers []PeerInfo
+				for _, entry := range strings.Split(peersStr, ",") {
+					nodeID, addr, found := strings.Cut(entry, "@")
+					if found && nodeID != "" && addr != "" {
+						peers = append(peers, PeerInfo{NodeID: nodeID, Addr: addr})
+					}
+				}
+				if s.peerManager != nil {
+					s.peerManager.SavePeers(peers)
+				}
+			}
+		}
 	}
 
-	s.log().Info("restored state", "replid", s.replid, "last_seq", s.lastSeq.Load())
+	s.log().Info("restored state", "node_id", s.nodeID, "replid", s.replid, "last_seq", s.lastSeq.Load(), "term", s.term.Load(), "voted_for", s.votedFor)
 	return nil
 }
 
@@ -376,7 +446,16 @@ func (s *Server) storeState() error {
 		return err
 	}
 
-	content := fmt.Sprintf("replid:%s\nlastSeq:%d", s.replid, s.lastSeq.Load())
+	var peerStr string
+	if s.peerManager != nil {
+		var parts []string
+		for _, pi := range s.peerManager.PeerInfos() {
+			parts = append(parts, pi.NodeID+"@"+pi.Addr)
+		}
+		peerStr = strings.Join(parts, ",")
+	}
+
+	content := fmt.Sprintf("nodeID:%s\nreplid:%s\nlastSeq:%d\nterm:%d\nvotedFor:%s\npeers:%s", s.nodeID, s.replid, s.lastSeq.Load(), s.term.Load(), s.votedFor, peerStr)
 	_, err = s.metaFile.Write([]byte(content))
 	if err != nil {
 		return err

@@ -80,7 +80,7 @@ type Options struct {
 	SyncInterval time.Duration
 
 	// Staleness bounds (Episode 025): replica rejects reads when exceeding thresholds
-	ReplicaStaleHeartbeat time.Duration // time-based: reject if no heartbeat for N seconds (partition detection), default 5s
+	ReplicaStaleHeartbeat time.Duration // time-based: reject if no heartbeat for this duration (partition detection), default 1s
 	ReplicaStaleLag       int           // sequence-based: reject if > N operations behind (backlog limit), default 1000
 
 	Logger *slog.Logger // optional debug logger; nil disables logging
@@ -121,8 +121,8 @@ type Server struct {
 	replid   string
 
 	// Replication state (replica role)
-	isReplica     bool
 	primary       transport.StreamTransport
+	primaryNodeID string        // primary's nodeID (set from TOPOLOGY, used for ACK via peer channel)
 	lastSeq       atomic.Uint64 // last applied sequence number
 	lastHeartbeat time.Time     // updated from heartbeat messages
 	primarySeq    uint64        // primary's position from heartbeat; compared with lastSeq for staleness detection
@@ -136,8 +136,14 @@ type Server struct {
 	quorumWrites map[string]*quorumWriteState
 	quorumAckCh  chan string // Quorum ack channel
 
-	// Cluster
+	// Cluster management
 	peerManager *PeerManager
+	nodeID      string
+	term        atomic.Uint64
+	votedFor    string
+	role        atomic.Uint32
+	roleChanged chan struct{}
+	roleMu      sync.Mutex
 
 	// Partial resync backlog
 	backlog       list.List
@@ -181,7 +187,7 @@ func NewServer(opts Options) (*Server, error) {
 		opts.QuorumReadTimeout = 500 * time.Millisecond
 	}
 	if opts.ReplicaStaleHeartbeat <= 0 {
-		opts.ReplicaStaleHeartbeat = 5 * time.Second
+		opts.ReplicaStaleHeartbeat = 1 * time.Second
 	}
 	if opts.ReplicaStaleLag <= 0 {
 		opts.ReplicaStaleLag = 1000
@@ -191,11 +197,15 @@ func NewServer(opts Options) (*Server, error) {
 		opts:            opts,
 		conns:           make(map[transport.StreamTransport]struct{}),
 		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
-		isReplica:       opts.ReplicaOf != "",
 		replicas:        make(map[transport.StreamTransport]*replicaConn),
 		lastHeartbeat:   time.Now(), // Initialize heartbeat timer (updated by PING messages)
 		quorumAckCh:     make(chan string),
 		quorumWrites:    make(map[string]*quorumWriteState),
+		roleChanged:     make(chan struct{}),
+	}
+
+	if opts.ReplicaOf == "" {
+		s.role.Store(uint32(RoleLeader))
 	}
 
 	s.peerManager = NewPeerManager(
@@ -248,8 +258,18 @@ func (s *Server) Start() (err error) {
 		return err
 	}
 
+	if s.nodeID == "" {
+		s.nodeID = utils.GenerateUniqueID()
+	}
+
 	if s.replid == "" {
-		s.replid = utils.GenerateUniqueID()
+		// First boot as primary — reuse nodeID as the initial replication lineage ID.
+		// A separate replid is only needed after failover (new primary, new lineage).
+		s.replid = s.nodeID
+	}
+
+	if s.term.Load() == 0 && s.isLeader() {
+		s.term.Store(1)
 	}
 
 	lock, err = acquireDataDirLock(s.opts.DataDir)
@@ -271,7 +291,7 @@ func (s *Server) Start() (err error) {
 	s.db = db // Assign now so startReplicationLoop can use it
 
 	// Start replication loop only for replicas
-	if s.isReplica {
+	if !s.isLeader() {
 		s.startReplicationLoop()
 	} else {
 		s.startBacklogTrimmer()
@@ -285,6 +305,7 @@ func (s *Server) Start() (err error) {
 	s.lock, s.ln = lock, ln
 	go s.acceptLoop()
 	go s.monitorDBHealth()
+	go s.monitorHeartbeat()
 	return nil
 }
 
@@ -402,7 +423,7 @@ func (s *Server) closeConnections() {
 	for c := range s.conns {
 		_ = c.Close()
 	}
-	if !s.isReplica {
+	if s.isLeader() {
 		for _, rc := range s.replicas {
 			close(rc.sendCh) // signal writer goroutine to exit
 			_ = rc.transport.Close()

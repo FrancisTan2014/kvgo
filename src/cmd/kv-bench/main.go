@@ -82,7 +82,8 @@ func runWorker(id int, keys []string, values [][]byte, st *stats) {
 	}
 	defer conn.Close()
 
-	f := transport.NewConnFramer(conn)
+	t := transport.NewMultiplexedTransport(conn)
+	defer t.Close()
 	lats := make([]time.Duration, 0, len(keys))
 	errs := 0
 
@@ -106,12 +107,12 @@ func runWorker(id int, keys []string, values [][]byte, st *stats) {
 			continue
 		}
 
-		if err := f.WriteWithTimeout(payload, *timeout); err != nil {
+		if err := t.SendWithTimeout(payload, *timeout); err != nil {
 			errs++
 			continue
 		}
 
-		respPayload, err := f.ReadWithTimeout(*timeout)
+		respPayload, err := t.ReceiveWithTimeout(*timeout)
 		if err != nil {
 			errs++
 			continue

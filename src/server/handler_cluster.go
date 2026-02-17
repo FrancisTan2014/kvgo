@@ -16,33 +16,34 @@ import (
 // handleReplicate handles the REPLICATE command from a replica wanting to sync.
 // After initial sync, connection returns to normal request loop for ACK/NACK/PONG.
 func (s *Server) handleReplicate(ctx *RequestContext) error {
-	if s.isReplica {
-		s.log().Warn("REPLICATE rejected: node is replica")
-		return s.responseStatusError(ctx)
+	if !s.isLeader() {
+		s.log().Warn("REPLICATE rejected: node is not leader")
+		return s.responseStatusWithPrimaryAddress(ctx, protocol.StatusReadOnly)
 	}
 
 	req := &ctx.Request
 
 	strs := strings.Split(string(req.Value), protocol.Delimiter)
-	if len(strs) != 2 || strs[0] == "" || strs[1] == "" {
-		s.log().Warn("REPLICATE rejected: invalid value format, expected replid and listenAddr")
+	if len(strs) != 3 || strs[0] == "" || strs[1] == "" || strs[2] == "" {
+		s.log().Warn("REPLICATE rejected: invalid value format, expected replid, listenAddr, and nodeID")
 		return s.responseStatusError(ctx)
 	}
 
 	replid := strs[0]
 	listenAddr := strs[1]
+	nodeID := strs[2]
 
-	rc := newReplicaConn(ctx.StreamTransport, req.Seq, replid, listenAddr)
+	rc := newReplicaConn(ctx.StreamTransport, req.Seq, replid, nodeID, listenAddr)
 
 	// Perform initial sync (blocks), then spawn writer goroutine.
-	// Connection continues through handleRequest loop for ACK/NACK/PONG.
-	s.serveReplica(rc, ctx)
+	// Connection ownership transfers to serveReplica — caller must not close it.
+	ctx.takenOver = s.serveReplica(rc)
 
 	return nil
 }
 
 func (s *Server) buildReplicateRequest() protocol.Request {
-	val := s.replid + protocol.Delimiter + s.listenAddr()
+	val := s.replid + protocol.Delimiter + s.listenAddr() + protocol.Delimiter + s.nodeID
 	return protocol.Request{
 		Cmd:   protocol.CmdReplicate,
 		Seq:   s.lastSeq.Load(),
@@ -68,9 +69,14 @@ func (s *Server) handleReplicaOf(ctx *RequestContext) error {
 func (s *Server) relocate(primaryAddr string) error {
 	s.log().Info("switching primary", "address", primaryAddr)
 
+	if s.currentRole() != RoleFollower {
+		if !s.becomeFollower() {
+			return fmt.Errorf("relocate: invalid transition from %s to follower", s.currentRole())
+		}
+	}
+
 	// Update config immediately
 	s.connectionMu.Lock()
-	s.isReplica = true
 	s.opts.ReplicaOf = primaryAddr
 	s.connectionMu.Unlock()
 
@@ -101,7 +107,6 @@ func (s *Server) relocate(primaryAddr string) error {
 		}
 		s.connectionMu.Unlock()
 
-		s.db.Clear()
 		s.startReplicationLoop()
 	}()
 
@@ -113,26 +118,14 @@ func (s *Server) relocate(primaryAddr string) error {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handlePromote(ctx *RequestContext) error {
-	if !s.isReplica {
-		s.log().Warn("PROMOTE rejected: already primary")
-		return s.responseStatusError(ctx)
-	}
-
-	if err := s.promote(); err != nil {
-		s.log().Error("PROMOTE failed", "error", err)
-		return s.responseStatusError(ctx)
-	}
-
-	s.log().Info("promoted to primary")
-	return s.responseStatusOk(ctx)
+	s.log().Warn("PROMOTE is deprecated; use election instead")
+	return s.responseStatusError(ctx)
 }
 
 func (s *Server) promote() error {
-	s.isReplica = false
-
 	// Generate new replid — this node is starting a new timeline
 	s.replid = utils.GenerateUniqueID()
-	s.seq.Store(0)
+	s.seq.Store(s.lastSeq.Load()) // continue from replica's position
 
 	if s.replCancel != nil {
 		s.replCancel() // signal loop to exit
@@ -148,7 +141,33 @@ func (s *Server) promote() error {
 		s.log().Error("failed to store new replid after promotion", "error", err)
 	}
 
+	s.broadcastPromotion()
+
 	return nil
+}
+
+// broadcastPromotion tells all peers to replicate from this node.
+// Fire-and-forget: peers that miss this will self-heal via election timeout.
+func (s *Server) broadcastPromotion() {
+	req := protocol.Request{
+		Cmd:   protocol.CmdReplicaOf,
+		Value: []byte(s.listenAddr()),
+	}
+	payload, _ := protocol.EncodeRequest(req)
+
+	peerIds := s.peerManager.NodeIDs()
+	for _, pid := range peerIds {
+		go func() {
+			t, err := s.peerManager.Get(pid)
+			if err != nil {
+				s.log().Debug("broadcastPromotion: peer unreachable", "peer", pid, "error", err)
+				return
+			}
+			if _, err := t.Request(payload, 2*time.Second); err != nil {
+				s.log().Debug("broadcastPromotion: request failed", "peer", pid, "error", err)
+			}
+		}()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -156,28 +175,41 @@ func (s *Server) promote() error {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleTopology(ctx *RequestContext) error {
-	var peers []string
+	var peers []PeerInfo
 	if len(ctx.Request.Value) > 0 {
-		self := s.listenAddr()
-		for _, addr := range strings.Split(string(ctx.Request.Value), protocol.Delimiter) {
-			if addr != self {
-				peers = append(peers, addr)
+		selfID := s.nodeID
+		replicaOf := s.opts.ReplicaOf
+		for _, entry := range strings.Split(string(ctx.Request.Value), protocol.Delimiter) {
+			nodeID, addr, ok := strings.Cut(entry, "@")
+			if !ok || nodeID == "" || addr == "" {
+				continue
+			}
+			// Identify the primary by matching the listen address we replicate from.
+			if addr == replicaOf {
+				s.primaryNodeID = nodeID
+			}
+			if nodeID != selfID {
+				peers = append(peers, PeerInfo{NodeID: nodeID, Addr: addr})
 			}
 		}
 	}
 
 	s.peerManager.SavePeers(peers)
-	return s.responseStatusOk(ctx)
+	return nil // TOPOLOGY is a one-way notification; no response expected by primary's reader.
 }
 
 func (s *Server) buildTopologyRequest(replicas map[transport.StreamTransport]*replicaConn) protocol.Request {
 	var sb strings.Builder
 
 	// Include the primary itself so replicas can reach it (e.g. for elections)
+	sb.WriteString(s.nodeID)
+	sb.WriteString("@")
 	sb.WriteString(s.listenAddr())
 	sb.WriteString(protocol.Delimiter)
 
 	for _, rc := range replicas {
+		sb.WriteString(rc.nodeID)
+		sb.WriteString("@")
 		sb.WriteString(rc.listenAddr)
 		sb.WriteString(protocol.Delimiter)
 	}
@@ -190,13 +222,23 @@ func (s *Server) buildTopologyRequest(replicas map[transport.StreamTransport]*re
 }
 
 func (s *Server) broadcastTopology() {
-	if s.isReplica {
+	if !s.isLeader() {
 		return
 	}
 
 	snapshot := s.getReplicaSnapshot()
 	req := s.buildTopologyRequest(snapshot)
 	payload, _ := protocol.EncodeRequest(req)
+
+	// Save peers on the primary itself so they survive a crash.
+	// Replicas receive this via TOPOLOGY; the primary must self-save.
+	peers := make([]PeerInfo, 0, len(snapshot))
+	for _, rc := range snapshot {
+		if rc.nodeID != "" && rc.listenAddr != "" {
+			peers = append(peers, PeerInfo{NodeID: rc.nodeID, Addr: rc.listenAddr})
+		}
+	}
+	s.peerManager.SavePeers(peers)
 
 	for _, rc := range snapshot {
 		rc.sendCh <- payload
@@ -251,4 +293,91 @@ func DialPeer(proto, network string, timeout time.Duration) DialFunc {
 
 		return t, nil
 	}
+}
+
+// ---------------------------------------------------------------------------
+// VOTE Command Handler (Candidate requests votes during leader election)
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleVoteRequest(ctx *RequestContext) error {
+	vr, err := parseVoteRequest(ctx.Request.Value)
+	if err != nil {
+		s.log().Warn("VOTE rejected: malformed request", "error", err)
+		return s.writeResponse(ctx.StreamTransport, s.buildVoteResponse(false))
+	}
+
+	wasLeader := s.isLeader()
+
+	s.roleMu.Lock()
+	resp, stepped := s.evaluateVoteLocked(vr)
+	s.roleMu.Unlock()
+
+	if stepped {
+		s.notifyRoleChanged()
+
+		// After stepping down from leader, reconnect to the cluster
+		// via the candidate (or any known peer).
+		if wasLeader {
+			if addr, ok := s.peerManager.Addr(vr.nodeID); ok {
+				go func() {
+					if err := s.relocate(addr); err != nil {
+						s.log().Warn("post-stepdown relocate failed", "addr", addr, "error", err)
+					}
+				}()
+			}
+		}
+	}
+
+	return s.writeResponse(ctx.StreamTransport, resp)
+}
+
+// evaluateVoteLocked decides whether to grant a vote.
+// Caller must hold s.roleMu.
+// Returns the response and whether a step-down occurred (caller must notify).
+func (s *Server) evaluateVoteLocked(vr voteRequest) (protocol.Response, bool) {
+	myTerm := s.term.Load()
+	stepped := false
+
+	// Stale term — reject without updating anything.
+	if vr.term < myTerm {
+		s.log().Debug("VOTE rejected: stale term", "candidate", vr.nodeID, "candidateTerm", vr.term, "myTerm", myTerm)
+		return s.buildVoteResponse(false), false
+	}
+
+	// Higher term — step down and update our term before evaluating the vote.
+	if vr.term > myTerm {
+		s.term.Store(vr.term)
+		s.votedFor = ""
+		cur := s.currentRole()
+		if cur != RoleFollower {
+			s.role.Store(uint32(RoleFollower))
+			s.log().Info("became follower", "term", s.term.Load())
+			stepped = true
+		}
+		if err := s.storeState(); err != nil {
+			s.log().Error("failed to persist state on term bump", "error", err)
+		}
+	}
+
+	// Already voted for someone else this term.
+	if s.votedFor != "" && s.votedFor != vr.nodeID {
+		s.log().Debug("VOTE rejected: already voted", "candidate", vr.nodeID, "votedFor", s.votedFor)
+		return s.buildVoteResponse(false), stepped
+	}
+
+	// Log completeness check — candidate must be at least as up-to-date.
+	if vr.lastSeq < s.lastSeq.Load() {
+		s.log().Debug("VOTE rejected: candidate log behind", "candidate", vr.nodeID, "candidateLastSeq", vr.lastSeq, "myLastSeq", s.lastSeq.Load())
+		return s.buildVoteResponse(false), stepped
+	}
+
+	// Grant the vote.
+	s.votedFor = vr.nodeID
+	s.lastHeartbeat = time.Now() // reset election timer so we don't immediately campaign
+	if err := s.storeState(); err != nil {
+		s.log().Error("failed to persist votedFor", "error", err)
+	}
+
+	s.log().Info("VOTE granted", "candidate", vr.nodeID, "term", vr.term)
+	return s.buildVoteResponse(true), stepped
 }
