@@ -159,10 +159,11 @@ func TestBroadcastTopology(t *testing.T) {
 		}
 	})
 
-	t.Run("topology contains all replica addresses", func(t *testing.T) {
+	t.Run("topology contains primary and all replica addresses", func(t *testing.T) {
 		s := &Server{
 			isReplica: false,
 			replicas:  make(map[transport.StreamTransport]*replicaConn),
+			opts:      Options{Host: "10.0.0.100", Port: 4000},
 		}
 
 		ch1 := make(chan []byte, 1)
@@ -184,7 +185,7 @@ func TestBroadcastTopology(t *testing.T) {
 		parts := splitTopology(string(req.Value))
 		sort.Strings(parts)
 
-		want := []string{"10.0.0.1:5001", "10.0.0.2:5002", "10.0.0.3:5003"}
+		want := []string{"10.0.0.100:4000", "10.0.0.1:5001", "10.0.0.2:5002", "10.0.0.3:5003"}
 		if len(parts) != len(want) {
 			t.Fatalf("parts = %v, want %v", parts, want)
 		}

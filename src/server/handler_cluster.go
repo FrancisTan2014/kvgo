@@ -172,6 +172,11 @@ func (s *Server) handleTopology(ctx *RequestContext) error {
 
 func (s *Server) buildTopologyRequest(replicas map[transport.StreamTransport]*replicaConn) protocol.Request {
 	var sb strings.Builder
+
+	// Include the primary itself so replicas can reach it (e.g. for elections)
+	sb.WriteString(s.listenAddr())
+	sb.WriteString(protocol.Delimiter)
+
 	for _, rc := range replicas {
 		sb.WriteString(rc.listenAddr)
 		sb.WriteString(protocol.Delimiter)
