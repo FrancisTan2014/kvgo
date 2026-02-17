@@ -28,7 +28,7 @@ func (s *Server) handleCleanup(ctx *RequestContext) error {
 	// Return immediately and run cleanup asynchronously to free connection resources.
 	// Cleanup can take minutes for large databases, don't block the handler.
 	go s.StartCleanup()
-	return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: protocol.StatusOK})
+	return s.responseStatusOk(ctx)
 }
 
 func (s *Server) StartCleanup() {

@@ -3,6 +3,7 @@ package server
 import (
 	"kvgo/protocol"
 	"kvgo/transport"
+	"time"
 )
 
 type HandlerFunc func(*Server, *RequestContext) error
@@ -11,7 +12,7 @@ type RequestContext struct {
 	StreamTransport  transport.StreamTransport
 	RequestTransport transport.RequestTransport // Same object as StreamTransport (MultiplexedTransport)
 	Request          protocol.Request           // Decoded request (replaces raw Payload)
-	takenOver        bool
+	takenOver        bool                       // If true, connection ownership transferred to handler; caller should not close connection
 }
 
 func (s *Server) registerRequestHandlers() {
@@ -25,31 +26,33 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdCleanup] = (*Server).handleCleanup
 	s.requestHandlers[protocol.CmdAck] = (*Server).handleAck
 	s.requestHandlers[protocol.CmdNack] = (*Server).handleNack
+	s.requestHandlers[protocol.CmdTopology] = (*Server).handleTopology
+	s.requestHandlers[protocol.CmdPeerHandshake] = (*Server).handlePeerHandshake
 }
 
-func (s *Server) handleRequest(t transport.StreamTransport) {
+func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duration) (takenOver bool) {
 	for {
 		var payload []byte
 		var err error
-		if s.opts.ReadTimeout > 0 {
-			payload, err = t.ReceiveWithTimeout(s.opts.ReadTimeout)
+		if timeout > 0 {
+			payload, err = t.ReceiveWithTimeout(timeout)
 		} else {
 			payload, err = t.Receive()
 		}
 		if err != nil {
-			return
+			return false
 		}
 
 		req, err := protocol.DecodeRequest(payload)
 		if err != nil {
 			s.log().Error("failed to decode request", "error", err)
-			return
+			return false
 		}
 
 		handler := s.requestHandlers[req.Cmd]
 		if handler == nil {
 			s.log().Error("unsupported request detected", "cmd", req.Cmd)
-			return
+			return false
 		}
 
 		ctx := &RequestContext{
@@ -60,11 +63,11 @@ func (s *Server) handleRequest(t transport.StreamTransport) {
 
 		if err := handler(s, ctx); err != nil {
 			s.log().Error("failed to process the request", "cmd", req.Cmd, "error", err)
-			return
+			return false
 		}
 
 		if ctx.takenOver {
-			return // Handler owns connection now, exit loop
+			return true // Handler owns connection now, exit loop
 		}
 	}
 }

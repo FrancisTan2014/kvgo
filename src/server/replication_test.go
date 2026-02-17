@@ -180,9 +180,9 @@ func TestReplicaConnectionIdentity(t *testing.T) {
 	}
 
 	// Test 1: Connection identity check for primary connection
-	s.mu.Lock()
+	s.connectionMu.Lock()
 	isPrimaryConn := (s.primary != nil && serverPrimaryTransport == s.primary)
-	s.mu.Unlock()
+	s.connectionMu.Unlock()
 
 	if !isPrimaryConn {
 		t.Error("failed to identify primary connection")
@@ -190,9 +190,9 @@ func TestReplicaConnectionIdentity(t *testing.T) {
 
 	// Test 2: Connection identity check for client connection (won't match)
 	serverClientTransport := transport.NewStreamTransport(transport.ProtocolTCP, serverClientConn)
-	s.mu.Lock()
+	s.connectionMu.Lock()
 	isClientPrimaryConn := (s.primary != nil && serverClientTransport == s.primary)
-	s.mu.Unlock()
+	s.connectionMu.Unlock()
 
 	if isClientPrimaryConn {
 		t.Error("incorrectly identified client connection as primary")
@@ -228,7 +228,7 @@ func TestReplicationStateCleanup(t *testing.T) {
 	}
 
 	// Add replica connection
-	rc := newReplicaConn(serverTransport, 0, "test-replid")
+	rc := newReplicaConn(serverTransport, 0, "test-replid", s.listenAddr())
 	s.replicas[serverTransport] = rc
 
 	if len(s.replicas) != 1 {
@@ -236,9 +236,9 @@ func TestReplicationStateCleanup(t *testing.T) {
 	}
 
 	// Simulate cleanup (what serveReplicaWriter does in defer)
-	s.mu.Lock()
+	s.connectionMu.Lock()
 	delete(s.replicas, serverTransport)
-	s.mu.Unlock()
+	s.connectionMu.Unlock()
 	serverTransport.Close()
 	conn.Close()
 
@@ -264,9 +264,9 @@ func TestReplicaReconnectionFlow(t *testing.T) {
 	}
 
 	// Verify server state remains stable after failed connection
-	s.mu.Lock()
+	s.connectionMu.Lock()
 	primaryIsNil := s.primary == nil
-	s.mu.Unlock()
+	s.connectionMu.Unlock()
 
 	if !primaryIsNil {
 		t.Error("primary connection should be nil after failed connection")

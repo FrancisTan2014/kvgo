@@ -108,9 +108,9 @@ type Server struct {
 	lock *dataDirLock
 
 	// Connection management
-	mu    sync.Mutex
-	wg    sync.WaitGroup
-	conns map[transport.StreamTransport]struct{}
+	connectionMu sync.RWMutex
+	wg           sync.WaitGroup
+	conns        map[transport.StreamTransport]struct{}
 
 	// Request dispatch
 	requestHandlers map[protocol.Cmd]HandlerFunc
@@ -136,9 +136,8 @@ type Server struct {
 	quorumWrites map[string]*quorumWriteState
 	quorumAckCh  chan string // Quorum ack channel
 
-	// Cluster (keyed by remote address for quorum reads)
-	clusterMu      sync.RWMutex
-	reachableNodes map[string]transport.RequestTransport
+	// Cluster
+	peerManager *PeerManager
 
 	// Partial resync backlog
 	backlog       list.List
@@ -197,8 +196,12 @@ func NewServer(opts Options) (*Server, error) {
 		lastHeartbeat:   time.Now(), // Initialize heartbeat timer (updated by PING messages)
 		quorumAckCh:     make(chan string),
 		quorumWrites:    make(map[string]*quorumWriteState),
-		reachableNodes:  make(map[string]transport.RequestTransport),
 	}
+
+	s.peerManager = NewPeerManager(
+		DialPeer(opts.Protocol, s.network(), opts.ReadTimeout),
+		s.log(),
+	)
 
 	s.registerRequestHandlers()
 	return s, nil
@@ -367,6 +370,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		<-done // wait for handlers to exit after force close
 	}
 
+	s.peerManager.Close()
+
 	var err error
 	if s.db != nil {
 		s.log().Info("closing database")
@@ -393,7 +398,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) closeConnections() {
 	// Force close active connections to unblock handlers.
-	s.mu.Lock()
+	s.connectionMu.Lock()
 	for c := range s.conns {
 		_ = c.Close()
 	}
@@ -403,7 +408,7 @@ func (s *Server) closeConnections() {
 			_ = rc.transport.Close()
 		}
 	}
-	s.mu.Unlock()
+	s.connectionMu.Unlock()
 }
 
 func (s *Server) acceptLoop() {
@@ -416,58 +421,30 @@ func (s *Server) acceptLoop() {
 		// Wrap immediately in transport
 		t := transport.NewStreamTransport(s.opts.Protocol, conn)
 
-		s.mu.Lock()
+		s.connectionMu.Lock()
 		s.conns[t] = struct{}{}
-		s.mu.Unlock()
+		s.connectionMu.Unlock()
 
 		s.wg.Go(func() {
-			s.handleRequest(t)
-			s.mu.Lock()
+			takenOver := s.handleRequest(t, s.opts.ReadTimeout)
+			s.connectionMu.Lock()
 			delete(s.conns, t)
-			s.mu.Unlock()
-			_ = t.Close()
+			s.connectionMu.Unlock()
+			if !takenOver {
+				_ = t.Close()
+			}
+			// If takenOver=true, connection ownership transferred to handler (e.g., replication)
 		})
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Cluster Management Helpers
-// ---------------------------------------------------------------------------
+func (s *Server) getReplicaSnapshot() map[transport.StreamTransport]*replicaConn {
+	s.connectionMu.RLock()
+	defer s.connectionMu.RUnlock()
 
-// addReachableNode adds a node to the reachable cluster nodes.
-// Thread-safe: acquires clusterMu.
-func (s *Server) addReachableNode(addr string, t transport.RequestTransport) {
-	s.clusterMu.Lock()
-	s.reachableNodes[addr] = t
-	s.clusterMu.Unlock()
-}
-
-// removeReachableNode removes a node from the reachable cluster nodes.
-// Thread-safe: acquires clusterMu.
-func (s *Server) removeReachableNode(addr string) {
-	s.clusterMu.Lock()
-	delete(s.reachableNodes, addr)
-	s.clusterMu.Unlock()
-}
-
-// clearReachableNodes removes all nodes from the reachable cluster nodes.
-// Thread-safe: acquires clusterMu.
-func (s *Server) clearReachableNodes() {
-	s.clusterMu.Lock()
-	s.reachableNodes = make(map[string]transport.RequestTransport)
-	s.clusterMu.Unlock()
-}
-
-// getReachableNodesSnapshot returns a snapshot of reachable nodes for safe iteration.
-// Thread-safe: acquires clusterMu.RLock.
-// Returns a copy to prevent modification during iteration.
-func (s *Server) getReachableNodesSnapshot() map[string]transport.RequestTransport {
-	s.clusterMu.RLock()
-	defer s.clusterMu.RUnlock()
-
-	snapshot := make(map[string]transport.RequestTransport, len(s.reachableNodes))
-	for addr, t := range s.reachableNodes {
-		snapshot[addr] = t
+	snapshot := make(map[transport.StreamTransport]*replicaConn, len(s.replicas))
+	for st, rc := range s.replicas {
+		snapshot[st] = rc
 	}
 	return snapshot
 }

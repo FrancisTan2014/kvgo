@@ -28,6 +28,8 @@ func TestCommandRegistration(t *testing.T) {
 		{protocol.CmdCleanup, "CLEANUP"},
 		{protocol.CmdAck, "ACK"},
 		{protocol.CmdNack, "NACK"},
+		{protocol.CmdTopology, "TOPOLOGY"},
+		{protocol.CmdPeerHandshake, "PEER"},
 	}
 
 	for _, tc := range expectedCommands {

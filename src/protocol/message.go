@@ -13,6 +13,8 @@ var (
 	ErrUnknownStatus  = errors.New("protocol: unknown status")
 )
 
+const Delimiter = "\n"
+
 const (
 	u8Size  = 1
 	u32Size = 4
@@ -47,16 +49,18 @@ const (
 type Cmd uint8
 
 const (
-	CmdGet       Cmd = 1  // Retrieve value by key
-	CmdPut       Cmd = 2  // Store key-value pair
-	CmdReplicate Cmd = 3  // Establish replication connection
-	CmdPing      Cmd = 4  // Health check
-	CmdPromote   Cmd = 5  // Promote replica to primary
-	CmdReplicaOf Cmd = 6  // Configure as replica of primary
-	CmdCleanup   Cmd = 7  // Trigger value file compaction
-	CmdAck       Cmd = 8  // Replica ACKs
-	CmdNack      Cmd = 9  // Replica negative ACK (write failed)
-	CmdPong      Cmd = 10 // Response to PING
+	CmdGet           Cmd = 1  // Retrieve value by key
+	CmdPut           Cmd = 2  // Store key-value pair
+	CmdReplicate     Cmd = 3  // Establish replication connection
+	CmdPing          Cmd = 4  // Health check
+	CmdPromote       Cmd = 5  // Promote replica to primary
+	CmdReplicaOf     Cmd = 6  // Configure as replica of primary
+	CmdCleanup       Cmd = 7  // Trigger value file compaction
+	CmdAck           Cmd = 8  // Replica ACKs
+	CmdNack          Cmd = 9  // Replica negative ACK (write failed)
+	CmdPong          Cmd = 10 // Response to PING
+	CmdTopology      Cmd = 11 // Topology broadcast
+	CmdPeerHandshake Cmd = 12 // Peer handshake
 )
 
 type Status uint8
@@ -90,6 +94,7 @@ type Request struct {
 	// - CmdPut: the value to store in the database
 	// - CmdReplicaOf: the target primary address (host:port format)
 	// - CmdReplicate: optionally contains replid for replica identification
+	// - CmdTopology: newline-delimited list of replica addresses for cluster membership
 	// - Others: unused (must be empty)
 	Value         []byte
 	Seq           uint64 // Sequence number (meaningful if FlagHasSeq set: CmdPut, CmdReplicate)

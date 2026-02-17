@@ -11,6 +11,20 @@ import (
 )
 
 // TestQuorumWriteCoordination tests the full quorum write flow with mock transports
+// waitForQuorumWrite polls until a quorum write state is registered, returning its request ID.
+func waitForQuorumWrite(s *Server) string {
+	for i := 0; i < 200; i++ {
+		time.Sleep(1 * time.Millisecond)
+		s.quorumMu.Lock()
+		for id := range s.quorumWrites {
+			s.quorumMu.Unlock()
+			return id
+		}
+		s.quorumMu.Unlock()
+	}
+	return ""
+}
+
 func TestQuorumWriteCoordination(t *testing.T) {
 	t.Run("majority ACKs → success", func(t *testing.T) {
 		dir := t.TempDir()
@@ -23,21 +37,31 @@ func TestQuorumWriteCoordination(t *testing.T) {
 			replicas:     make(map[transport.StreamTransport]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
-				QuorumWriteTimeout: 200 * time.Millisecond,
+				QuorumWriteTimeout: 500 * time.Millisecond,
 			},
 		}
 		s.seq.Store(100)
 
-		// Create 3 mock replicas (need 2 ACKs for quorum in 4-node cluster)
-		replica1 := &mockStreamTransport{shouldACK: true}
-		replica2 := &mockStreamTransport{shouldACK: true}
-		replica3 := &mockStreamTransport{shouldACK: false, delay: 500 * time.Millisecond} // slow, won't ACK in time
+		// 3 replicas → 4-node cluster → quorum=3 → need 2 replica ACKs
+		replica1 := &mockStreamTransport{address: "r1:6379"}
+		replica2 := &mockStreamTransport{address: "r2:6379"}
+		replica3 := &mockStreamTransport{address: "r3:6379"}
 
 		s.replicas[replica1] = &replicaConn{transport: replica1}
 		s.replicas[replica2] = &replicaConn{transport: replica2}
 		s.replicas[replica3] = &replicaConn{transport: replica3}
 
-		// Quorum write
+		// Send 2 ACKs once quorum write state is registered
+		go func() {
+			requestId := waitForQuorumWrite(s)
+			if requestId == "" {
+				return
+			}
+			ackReq := protocol.Request{Cmd: protocol.CmdAck, RequestId: requestId}
+			s.handleAck(&RequestContext{StreamTransport: replica1, Request: ackReq})
+			s.handleAck(&RequestContext{StreamTransport: replica2, Request: ackReq})
+		}()
+
 		req := protocol.Request{
 			Cmd:           protocol.CmdPut,
 			Key:           []byte("key1"),
@@ -47,7 +71,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		ctx := &RequestContext{
 			StreamTransport: &mockStreamTransport{},
-			Request:   req,
+			Request:         req,
 		}
 
 		err := s.handlePut(ctx)
@@ -55,13 +79,16 @@ func TestQuorumWriteCoordination(t *testing.T) {
 			t.Fatalf("handlePut: %v", err)
 		}
 
-		// Verify data written
-		val, ok := db.Get("key1")
-		if !ok || string(val) != "value1" {
-			t.Errorf("PUT failed: got %q, want %q", val, "value1")
+		mockTrans := ctx.StreamTransport.(*mockStreamTransport)
+		resp, _ := protocol.DecodeResponse(mockTrans.written)
+		if resp.Status != protocol.StatusOK {
+			t.Errorf("status = %d, want StatusOK", resp.Status)
 		}
 
-		// Verify seq incremented
+		val, ok := db.Get("key1")
+		if !ok || string(val) != "value1" {
+			t.Errorf("db.Get = %q, want %q", val, "value1")
+		}
 		if s.seq.Load() != 101 {
 			t.Errorf("seq = %d, want 101", s.seq.Load())
 		}
@@ -78,17 +105,26 @@ func TestQuorumWriteCoordination(t *testing.T) {
 			replicas:     make(map[transport.StreamTransport]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
-				QuorumWriteTimeout: 200 * time.Millisecond,
+				QuorumWriteTimeout: 500 * time.Millisecond,
 			},
 		}
 		s.seq.Store(100)
 
-		// One replica sends NACK
-		replica1 := &mockStreamTransport{shouldACK: false, sendNACK: true}
-		replica2 := &mockStreamTransport{shouldACK: true}
+		replica1 := &mockStreamTransport{address: "r1:6379"}
+		replica2 := &mockStreamTransport{address: "r2:6379"}
 
 		s.replicas[replica1] = &replicaConn{transport: replica1}
 		s.replicas[replica2] = &replicaConn{transport: replica2}
+
+		// Send NACK once quorum write state is registered
+		go func() {
+			requestId := waitForQuorumWrite(s)
+			if requestId == "" {
+				return
+			}
+			nackReq := protocol.Request{Cmd: protocol.CmdNack, RequestId: requestId}
+			s.handleNack(&RequestContext{StreamTransport: replica1, Request: nackReq})
+		}()
 
 		req := protocol.Request{
 			Cmd:           protocol.CmdPut,
@@ -99,26 +135,18 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		ctx := &RequestContext{
 			StreamTransport: &mockStreamTransport{},
-			Request:   req,
+			Request:         req,
 		}
 
-		// Start NACK sender
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			nackReq := protocol.Request{
-				Cmd:       protocol.CmdNack,
-				RequestId: replica1.lastRequestId,
-			}
-			s.handleNack(&RequestContext{
-				StreamTransport: replica1,
-				Request:   nackReq,
-			})
-		}()
-
 		err := s.handlePut(ctx)
-		// Should timeout or get NACK
-		if err == nil {
-			t.Error("expected error for NACK, got nil")
+		if err != nil {
+			t.Fatalf("handlePut: %v", err)
+		}
+
+		mockTrans := ctx.StreamTransport.(*mockStreamTransport)
+		resp, _ := protocol.DecodeResponse(mockTrans.written)
+		if resp.Status != protocol.StatusError {
+			t.Errorf("status = %d, want StatusError after NACK", resp.Status)
 		}
 	})
 
@@ -133,14 +161,14 @@ func TestQuorumWriteCoordination(t *testing.T) {
 			replicas:     make(map[transport.StreamTransport]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
-				QuorumWriteTimeout: 50 * time.Millisecond, // short timeout
+				QuorumWriteTimeout: 50 * time.Millisecond,
 			},
 		}
 		s.seq.Store(100)
 
-		// All replicas slow (won't ACK in time)
-		replica1 := &mockStreamTransport{shouldACK: true, delay: 200 * time.Millisecond}
-		replica2 := &mockStreamTransport{shouldACK: true, delay: 200 * time.Millisecond}
+		// 2 replicas, neither ACKs → timeout
+		replica1 := &mockStreamTransport{address: "r1:6379"}
+		replica2 := &mockStreamTransport{address: "r2:6379"}
 
 		s.replicas[replica1] = &replicaConn{transport: replica1}
 		s.replicas[replica2] = &replicaConn{transport: replica2}
@@ -154,12 +182,18 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		ctx := &RequestContext{
 			StreamTransport: &mockStreamTransport{},
-			Request:   req,
+			Request:         req,
 		}
 
 		err := s.handlePut(ctx)
-		if err == nil {
-			t.Error("expected timeout error, got nil")
+		if err != nil {
+			t.Fatalf("handlePut: %v", err)
+		}
+
+		mockTrans := ctx.StreamTransport.(*mockStreamTransport)
+		resp, _ := protocol.DecodeResponse(mockTrans.written)
+		if resp.Status != protocol.StatusError {
+			t.Errorf("status = %d, want StatusError after timeout", resp.Status)
 		}
 	})
 }
@@ -171,16 +205,6 @@ func TestQuorumReadCoordination(t *testing.T) {
 		db, _ := engine.NewDB(dir, context.Background())
 		defer db.Close()
 		db.Put("key1", []byte("value1"))
-
-		s := &Server{
-			db:             db,
-			isReplica:      true,
-			reachableNodes: make(map[string]transport.RequestTransport),
-			opts: Options{
-				QuorumReadTimeout: 200 * time.Millisecond,
-			},
-		}
-		s.lastSeq.Store(100)
 
 		// Mock 2 replicas with different seqs
 		r1Response, _ := protocol.EncodeResponse(protocol.Response{
@@ -194,8 +218,28 @@ func TestQuorumReadCoordination(t *testing.T) {
 			Seq:    103,
 		})
 
-		s.addReachableNode("r1", &mockRequestTransport{response: r1Response})
-		s.addReachableNode("r2", &mockRequestTransport{response: r2Response})
+		mocks := map[string]transport.RequestTransport{
+			"r1": &mockRequestTransport{response: r1Response},
+			"r2": &mockRequestTransport{response: r2Response},
+		}
+		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
+			return mocks[addr], nil
+		}, noopLogger)
+		pm.SavePeers([]string{"r1", "r2"})
+
+		s := &Server{
+			db:            db,
+			isReplica:     true,
+			peerManager:   pm,
+			lastHeartbeat: time.Now(),
+			primarySeq:    100,
+			opts: Options{
+				QuorumReadTimeout:     200 * time.Millisecond,
+				ReplicaStaleHeartbeat: 5 * time.Second,
+				ReplicaStaleLag:       1000,
+			},
+		}
+		s.lastSeq.Store(100)
 
 		req := protocol.Request{
 			Cmd:           protocol.CmdGet,
@@ -205,7 +249,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 
 		ctx := &RequestContext{
 			StreamTransport: &mockStreamTransport{},
-			Request:   req,
+			Request:         req,
 		}
 
 		err := s.handleGet(ctx)
@@ -234,16 +278,6 @@ func TestQuorumReadCoordination(t *testing.T) {
 		defer db.Close()
 		db.Put("key1", []byte("value1"))
 
-		s := &Server{
-			db:             db,
-			isReplica:      true,
-			reachableNodes: make(map[string]transport.RequestTransport),
-			opts: Options{
-				QuorumReadTimeout: 200 * time.Millisecond,
-			},
-		}
-		s.lastSeq.Store(100)
-
 		// 3 replicas: 2 succeed, 1 fails
 		r1Response, _ := protocol.EncodeResponse(protocol.Response{
 			Status: protocol.StatusOK,
@@ -256,9 +290,33 @@ func TestQuorumReadCoordination(t *testing.T) {
 			Seq:    104,
 		})
 
-		s.addReachableNode("r1", &mockRequestTransport{response: r1Response})
-		s.addReachableNode("r2", &mockRequestTransport{response: r2Response})
-		s.addReachableNode("r3", &mockRequestTransport{err: errors.New("network error")})
+		mocks := map[string]transport.RequestTransport{
+			"r1": &mockRequestTransport{response: r1Response},
+			"r2": &mockRequestTransport{response: r2Response},
+			"r3": &mockRequestTransport{err: errors.New("network error")},
+		}
+		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
+			m := mocks[addr]
+			if m.(*mockRequestTransport).err != nil {
+				return nil, m.(*mockRequestTransport).err
+			}
+			return m, nil
+		}, noopLogger)
+		pm.SavePeers([]string{"r1", "r2", "r3"})
+
+		s := &Server{
+			db:            db,
+			isReplica:     true,
+			peerManager:   pm,
+			lastHeartbeat: time.Now(),
+			primarySeq:    100,
+			opts: Options{
+				QuorumReadTimeout:     200 * time.Millisecond,
+				ReplicaStaleHeartbeat: 5 * time.Second,
+				ReplicaStaleLag:       1000,
+			},
+		}
+		s.lastSeq.Store(100)
 
 		req := protocol.Request{
 			Cmd:           protocol.CmdGet,
@@ -268,7 +326,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 
 		ctx := &RequestContext{
 			StreamTransport: &mockStreamTransport{},
-			Request:   req,
+			Request:         req,
 		}
 
 		err := s.handleGet(ctx)
@@ -288,19 +346,28 @@ func TestQuorumReadCoordination(t *testing.T) {
 		db, _ := engine.NewDB(dir, context.Background())
 		defer db.Close()
 
+		mocks := map[string]transport.RequestTransport{
+			"r1": &mockRequestTransport{delay: 200 * time.Millisecond},
+			"r2": &mockRequestTransport{delay: 200 * time.Millisecond},
+		}
+		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
+			return mocks[addr], nil
+		}, noopLogger)
+		pm.SavePeers([]string{"r1", "r2"})
+
 		s := &Server{
-			db:             db,
-			isReplica:      true,
-			reachableNodes: make(map[string]transport.RequestTransport),
+			db:            db,
+			isReplica:     true,
+			peerManager:   pm,
+			lastHeartbeat: time.Now(),
+			primarySeq:    100,
 			opts: Options{
-				QuorumReadTimeout: 50 * time.Millisecond, // short
+				QuorumReadTimeout:     50 * time.Millisecond, // short
+				ReplicaStaleHeartbeat: 5 * time.Second,
+				ReplicaStaleLag:       1000,
 			},
 		}
 		s.lastSeq.Store(100)
-
-		// All replicas timeout
-		s.addReachableNode("r1", &mockRequestTransport{delay: 200 * time.Millisecond})
-		s.addReachableNode("r2", &mockRequestTransport{delay: 200 * time.Millisecond})
 
 		req := protocol.Request{
 			Cmd:           protocol.CmdGet,
@@ -310,7 +377,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 
 		ctx := &RequestContext{
 			StreamTransport: &mockStreamTransport{},
-			Request:   req,
+			Request:         req,
 		}
 
 		err := s.handleGet(ctx)

@@ -19,6 +19,7 @@ type mockStreamTransport struct {
 	lastRequestId string
 	receiveData   []byte
 	receiveErr    error
+	address       string
 }
 
 func (m *mockStreamTransport) Send(payload []byte) error {
@@ -66,6 +67,9 @@ func (m *mockStreamTransport) Close() error {
 }
 
 func (m *mockStreamTransport) RemoteAddr() string {
+	if m.address != "" {
+		return m.address
+	}
 	return "mock:6379"
 }
 

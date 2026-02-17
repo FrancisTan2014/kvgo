@@ -25,15 +25,17 @@ type replicaConn struct {
 	lastSeq    uint64       // last seq reported by this replica on connect
 	hb         *time.Ticker // heartbeat ticker
 	lastWrite  time.Time
+	listenAddr string
 }
 
-func newReplicaConn(t transport.StreamTransport, replicaLastSeq uint64, lastReplid string) *replicaConn {
+func newReplicaConn(t transport.StreamTransport, replicaLastSeq uint64, lastReplid string, listenAddr string) *replicaConn {
 	return &replicaConn{
 		transport:  t,
 		sendCh:     make(chan []byte),
 		lastReplid: lastReplid,
 		lastSeq:    replicaLastSeq,
 		hb:         time.NewTicker(heartbeatInterval),
+		listenAddr: listenAddr,
 	}
 }
 
@@ -94,11 +96,10 @@ func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 	s.log().Info("connected to primary, sending handshake", "last_seq", lastSeq)
 
 	// Send replicate handshake to register as a replica.
-	req := protocol.Request{Cmd: protocol.CmdReplicate, Seq: lastSeq, Value: []byte(s.replid)}
+	req := s.buildReplicateRequest()
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
-		_ = st.Close()
-		return nil, fmt.Errorf("encode replicate request: %w", err)
+		panic("encode error")
 	}
 
 	if err := st.Send(payload); err != nil {
@@ -137,12 +138,11 @@ func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 
 	s.log().Info("replication handshake complete")
 
-	s.mu.Lock()
+	s.connectionMu.Lock()
 	s.primary = st
 	s.lastHeartbeat = time.Now() // Initialize heartbeat timer on successful connection
-	s.mu.Unlock()
+	s.connectionMu.Unlock()
 
-	s.addReachableNode(st.RemoteAddr(), transport.AsRequestTransport(st, 5*time.Second))
 	return st, nil
 }
 
@@ -159,14 +159,14 @@ func (s *Server) receiveFromPrimary(t transport.StreamTransport) {
 	}()
 
 	// Use standard request handler
-	s.handleRequest(t)
+	s.handleRequest(t, s.opts.ReadTimeout)
 	s.log().Info("handleRequest returned")
 }
 
 // forwardToReplicas sends a write to all connected replicas (non-blocking).
 func (s *Server) forwardToReplicas(payload []byte, seq uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.connectionMu.Lock()
+	defer s.connectionMu.Unlock()
 
 	for _, rc := range s.replicas {
 		select {
@@ -174,26 +174,33 @@ func (s *Server) forwardToReplicas(payload []byte, seq uint64) {
 			// queued
 		default:
 			// channel full, replica is slow — drop the write
-			s.log().Warn("replica send buffer full, dropping write", "replica", rc.transport.RemoteAddr(), "seq", seq)
+			s.log().Warn("replica send buffer full, dropping write", "replica", rc.listenAddr, "seq", seq)
 		}
 	}
 }
 
 // serveReplica performs initial sync, then spawns a writer goroutine.
 // After this returns, the connection continues through normal handleRequest loop.
-func (s *Server) serveReplica(rc *replicaConn) {
+func (s *Server) serveReplica(rc *replicaConn, ctx *RequestContext) {
 	// Check timeline compatibility
 	if rc.lastReplid != "" && rc.lastReplid != s.replid {
 		s.log().Error("incompatible replid detected — replica was following different primary",
-			"replica", rc.transport.RemoteAddr(),
+			"replica", rc.listenAddr,
 			"replica_replid", rc.lastReplid,
 			"primary_replid", s.replid,
 			"replica_lastSeq", rc.lastSeq)
 		// For now, force full resync on incompatible timeline
 	}
 
-	exists := s.existsInBacklog(rc.lastSeq)
-	if rc.lastReplid != s.replid || !exists {
+	fullSyncMode, err := s.respondSyncMode(rc)
+	if err != nil {
+		s.log().Error("Failed to send sync mode response", "replica", rc.listenAddr)
+		return
+	} else {
+		s.addNewReplica(rc, ctx)
+	}
+
+	if fullSyncMode {
 		s.fullResync(rc)
 	} else {
 		s.partialSync(rc)
@@ -202,22 +209,52 @@ func (s *Server) serveReplica(rc *replicaConn) {
 	// Spawn writer goroutine to handle async write forwarding + heartbeats
 	s.wg.Go(func() {
 		s.serveReplicaWriter(rc)
+		s.broadcastTopology()
 	})
+}
+
+func (s *Server) addNewReplica(rc *replicaConn, ctx *RequestContext) {
+	s.connectionMu.Lock()
+	s.replicas[rc.transport] = rc
+	s.connectionMu.Unlock()
+
+}
+
+func (s *Server) respondSyncMode(rc *replicaConn) (bool, error) {
+	exists := s.existsInBacklog(rc.lastSeq)
+	fullSyncMode := rc.lastReplid != s.replid || !exists
+
+	status := protocol.StatusOK
+	if fullSyncMode {
+		status = protocol.StatusFullResync
+	}
+
+	resp, err := protocol.EncodeResponse(protocol.Response{
+		Status: status,
+		Value:  []byte(s.replid),
+		Seq:    s.seq.Load(), // Include primary's current seq so replica can track lag immediately
+	})
+
+	if err != nil {
+		panic("encode error")
+	}
+
+	return fullSyncMode, rc.transport.Send(resp)
 }
 
 // serveReplicaWriter handles async write forwarding and heartbeats for a replica.
 // Runs in a dedicated goroutine until connection closes or channel is closed.
 func (s *Server) serveReplicaWriter(rc *replicaConn) {
-	s.log().Info("serveReplicaWriter started", "replica", rc.transport.RemoteAddr())
+	s.log().Info("serveReplicaWriter started", "replica", rc.listenAddr)
 	defer rc.hb.Stop()
 	defer func() {
 		// Clean up: remove from replicas map and close connection.
-		s.mu.Lock()
+		s.connectionMu.Lock()
 		delete(s.replicas, rc.transport)
-		s.mu.Unlock()
-		s.removeReachableNode(rc.transport.RemoteAddr())
+		s.connectionMu.Unlock()
 		_ = rc.transport.Close()
-		s.log().Info("replica disconnected", "replica", rc.transport.RemoteAddr())
+		s.broadcastTopology()
+		s.log().Info("replica disconnected", "replica", rc.listenAddr)
 	}()
 
 	for {
@@ -228,7 +265,7 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 				return
 			}
 			if err := rc.transport.SendWithTimeout(payload, 5*time.Second); err != nil {
-				s.log().Error("replica write failed", "replica", rc.transport.RemoteAddr(), "error", err)
+				s.log().Error("replica write failed", "replica", rc.listenAddr, "error", err)
 				return
 			}
 			rc.lastWrite = time.Now()
@@ -238,72 +275,58 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 			if time.Since(rc.lastWrite) > heartbeatInterval {
 				ping, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing, Seq: s.seq.Load()})
 				if err := rc.transport.Send(ping); err != nil {
-					s.log().Error("replica ping failed", "replica", rc.transport.RemoteAddr(), "error", err)
+					s.log().Error("replica ping failed", "replica", rc.listenAddr, "error", err)
 					return
 				}
 				rc.lastWrite = time.Now()
-				s.log().Debug("replica ping sent", "replica", rc.transport.RemoteAddr())
+				s.log().Debug("replica ping sent", "replica", rc.listenAddr)
 			}
 		}
 	}
 }
 
 func (s *Server) fullResync(rc *replicaConn) {
-	s.log().Info("full sync started", "replica", rc.transport.RemoteAddr())
+	s.log().Info("full sync started", "replica", rc.listenAddr)
 
-	seq := s.seq.Load()
-	fullSyncResp, _ := protocol.EncodeResponse(protocol.Response{
-		Status: protocol.StatusFullResync,
-		Value:  []byte(s.replid),
-		Seq:    seq, // Include primary's current seq so replica can track lag immediately
-	})
-	_ = rc.transport.Send(fullSyncResp)
 	s.db.Range(func(key string, value []byte) bool {
 		req := protocol.Request{
 			Cmd:   protocol.CmdPut,
 			Key:   []byte(key),
 			Value: value,
-			Seq:   seq,
+			Seq:   s.seq.Load(),
 		}
 		payload, err := protocol.EncodeRequest(req)
 		if err != nil {
-			s.log().Error("replica encode failed", "replica", rc.transport.RemoteAddr(), "error", err)
+			s.log().Error("replica encode failed", "replica", rc.listenAddr, "error", err)
 			return false
 		}
 
 		if err := rc.transport.Send(payload); err != nil {
-			s.log().Error("replica write failed", "replica", rc.transport.RemoteAddr(), "error", err)
+			s.log().Error("replica write failed", "replica", rc.listenAddr, "error", err)
 			return false
 		}
 
 		return true
 	})
 
-	s.log().Info("full sync completed", "replica", rc.transport.RemoteAddr())
+	s.log().Info("full sync completed", "replica", rc.listenAddr)
 }
 
 func (s *Server) partialSync(rc *replicaConn) {
-	s.log().Info("partial sync started", "replica", rc.transport.RemoteAddr())
-
-	seq := s.seq.Load()
-	psyncResp, _ := protocol.EncodeResponse(protocol.Response{
-		Status: protocol.StatusOK,
-		Seq:    seq, // Include primary's current seq for replica lag tracking
-	})
-	_ = rc.transport.Send(psyncResp)
+	s.log().Info("partial sync started", "replica", rc.listenAddr)
 
 	err := s.forwardBacklog(rc.lastSeq, func(e backlogEntry) error {
 		if err := rc.transport.Send(e.payload); err != nil {
-			s.log().Error("replica write failed", "replica", rc.transport.RemoteAddr(), "error", err)
+			s.log().Error("replica write failed", "replica", rc.listenAddr, "error", err)
 			return err
 		}
 		return nil
 	})
 
 	if err == nil {
-		s.log().Info("partial sync completed", "replica", rc.transport.RemoteAddr())
+		s.log().Info("partial sync completed", "replica", rc.listenAddr)
 	} else {
-		s.log().Error("partial sync failed", "replica", rc.transport.RemoteAddr())
+		s.log().Error("partial sync failed", "replica", rc.listenAddr)
 	}
 }
 
