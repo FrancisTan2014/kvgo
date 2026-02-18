@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"kvgo/protocol"
 	"kvgo/transport"
 	"net"
@@ -114,9 +113,7 @@ func TestProcessPongResponse(t *testing.T) {
 	s.roleChanged = make(chan struct{})
 
 	// Encode a PONG Response with term 0 (lower than server's term 5 → no step-down)
-	termBuf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(termBuf, 0)
-	resp := protocol.Response{Status: protocol.StatusPong, Value: termBuf}
+	resp := protocol.NewPongResponse(0)
 	payload, _ := protocol.EncodeResponse(resp)
 
 	rc := &replicaConn{listenAddr: "127.0.0.1:9999"}

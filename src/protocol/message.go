@@ -58,7 +58,6 @@ const (
 	CmdCleanup       Cmd = 7  // Trigger value file compaction
 	CmdAck           Cmd = 8  // Replica ACKs
 	CmdNack          Cmd = 9  // Replica negative ACK (write failed)
-	CmdPong          Cmd = 10 // Response to PING
 	CmdTopology      Cmd = 11 // Topology broadcast
 	CmdPeerHandshake Cmd = 12 // Peer handshake
 	CmdVoteRequest   Cmd = 13 // Election request
@@ -83,21 +82,20 @@ const (
 
 type Request struct {
 	Cmd Cmd
-	// Key contains the request identifier/parameter.
-	//
-	// - CmdGet: the key to retrieve from the database
-	// - CmdPut: the key to store in the database
-	// - CmdReplicaOf: unused (must be empty)
-	// - CmdReplicate: unused (must be empty)
-	// - CmdPing, CmdPromote, CmdCleanup: unused (must be empty)
+	// Key is the lookup key for KV commands.
+	//   CmdGet, CmdPut: the database key
+	//   All others: unused (empty)
 	Key []byte
-	// Value contains the payload data.
-	//
-	// - CmdPut: the value to store in the database
-	// - CmdReplicaOf: the target primary address (host:port format)
-	// - CmdReplicate: optionally contains replid for replica identification
-	// - CmdTopology: newline-delimited list of replica addresses for cluster membership
-	// - Others: unused (must be empty)
+	// Value carries command-specific payload.
+	// Use the typed constructors/parsers in builders.go instead of
+	// encoding/decoding this field directly.
+	//   CmdPut:          DB value
+	//   CmdReplicate:    see NewReplicateRequest / ParseReplicateValue
+	//   CmdPing:         see NewPingRequest / ParsePingTerm
+	//   CmdReplicaOf:    primary address (host:port)
+	//   CmdTopology:     see NewTopologyRequest / ParseTopologyValue
+	//   CmdVoteRequest:  see NewVoteRequest / ParseVoteRequestValue
+	//   Others: unused (empty)
 	Value         []byte
 	Seq           uint64 // Sequence number (meaningful if FlagHasSeq set: CmdPut, CmdReplicate)
 	RequireQuorum bool   // Quorum write/read (meaningful if FlagRequireQuorum set: CmdPut/CmdGet with quorum)
@@ -106,12 +104,16 @@ type Request struct {
 
 type Response struct {
 	Status Status
-	// Value contains the response payload.
-	//
-	// - StatusOK (for CmdGet): the retrieved value
-	// - StatusReadOnly: the primary server address (host:port) for client redirect
-	// - StatusFullResync: the full database snapshot for replica resync
-	// - Others: unused (must be empty)
+	// Value carries status-specific payload.
+	// Use the typed constructors/parsers in builders.go instead of
+	// encoding/decoding this field directly.
+	//   StatusOK (GET):         retrieved DB value
+	//   StatusReadOnly:         primary address for redirect
+	//   StatusReplicaTooStale:  primary address for redirect
+	//   StatusFullResync:       replid for timeline identification
+	//   StatusPong:             see NewPongResponse / ParsePongTerm
+	//   StatusVoteResponse:     see NewVoteResponse / ParseVoteResponseValue
+	//   Others: unused (empty)
 	Value []byte
 	Seq   uint64 // Sequence number at time of response (for tracking replication lag)
 }

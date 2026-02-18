@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/binary"
 	"kvgo/protocol"
 	"time"
 )
@@ -23,11 +22,8 @@ func (s *Server) handlePing(ctx *RequestContext) error {
 		return nil
 	}
 
-	// Extract sender's term from Value (8 bytes LE).
-	var senderTerm uint64
-	if len(req.Value) >= 8 {
-		senderTerm = binary.LittleEndian.Uint64(req.Value[:8])
-	}
+	// Extract sender's term from Value.
+	senderTerm := protocol.ParsePingTerm(req.Value)
 
 	myTerm := s.term.Load()
 
@@ -60,12 +56,7 @@ func (s *Server) handlePing(ctx *RequestContext) error {
 // Using writeResponse (not a CmdPong request) lets the primary use
 // Request() on the multiplexed transport and receive the PONG synchronously.
 func (s *Server) respondPong(ctx *RequestContext, term uint64) error {
-	termBuf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(termBuf, term)
-	return s.writeResponse(ctx.StreamTransport, protocol.Response{
-		Status: protocol.StatusPong,
-		Value:  termBuf,
-	})
+	return s.writeResponse(ctx.StreamTransport, protocol.NewPongResponse(term))
 }
 
 // processPongResponse extracts the replica's term from a PONG Response
@@ -77,10 +68,7 @@ func (s *Server) processPongResponse(respPayload []byte, rc *replicaConn) {
 		return
 	}
 
-	var respTerm uint64
-	if len(resp.Value) >= 8 {
-		respTerm = binary.LittleEndian.Uint64(resp.Value[:8])
-	}
+	respTerm := protocol.ParsePongTerm(resp.Value)
 
 	myTerm := s.term.Load()
 	if respTerm > myTerm {

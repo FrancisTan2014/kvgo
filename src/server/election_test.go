@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/binary"
 	"fmt"
 	"kvgo/protocol"
 	"testing"
@@ -110,18 +109,18 @@ func TestParseVoteRequest(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   string
-		want    voteRequest
+		want    protocol.VoteRequestValue
 		wantErr bool
 	}{
 		{
 			name:  "valid request",
 			input: "5\nnode-abc\n100",
-			want:  voteRequest{term: 5, nodeID: "node-abc", lastSeq: 100},
+			want:  protocol.VoteRequestValue{Term: 5, NodeID: "node-abc", LastSeq: 100},
 		},
 		{
 			name:  "term zero",
 			input: "0\nnode-1\n0",
-			want:  voteRequest{term: 0, nodeID: "node-1", lastSeq: 0},
+			want:  protocol.VoteRequestValue{Term: 0, NodeID: "node-1", LastSeq: 0},
 		},
 		{
 			name:    "too few fields",
@@ -152,13 +151,13 @@ func TestParseVoteRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseVoteRequest([]byte(tt.input))
+			got, err := protocol.ParseVoteRequestValue([]byte(tt.input))
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("parseVoteRequest() error = %v, wantErr %v", err, tt.wantErr)
+				t.Fatalf("ParseVoteRequestValue() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			if !tt.wantErr {
-				if got.term != tt.want.term || got.nodeID != tt.want.nodeID || got.lastSeq != tt.want.lastSeq {
-					t.Errorf("parseVoteRequest() = %+v, want %+v", got, tt.want)
+				if got.Term != tt.want.Term || got.NodeID != tt.want.NodeID || got.LastSeq != tt.want.LastSeq {
+					t.Errorf("ParseVoteRequestValue() = %+v, want %+v", got, tt.want)
 				}
 			}
 		})
@@ -176,18 +175,18 @@ func TestBuildAndParseVoteRequest_RoundTrip(t *testing.T) {
 		t.Fatalf("cmd = %d, want CmdVoteRequest(%d)", req.Cmd, protocol.CmdVoteRequest)
 	}
 
-	vr, err := parseVoteRequest(req.Value)
+	vr, err := protocol.ParseVoteRequestValue(req.Value)
 	if err != nil {
-		t.Fatalf("parseVoteRequest() error: %v", err)
+		t.Fatalf("ParseVoteRequestValue() error: %v", err)
 	}
-	if vr.term != 7 {
-		t.Errorf("term = %d, want 7", vr.term)
+	if vr.Term != 7 {
+		t.Errorf("term = %d, want 7", vr.Term)
 	}
-	if vr.nodeID != "node-42" {
-		t.Errorf("nodeID = %q, want %q", vr.nodeID, "node-42")
+	if vr.NodeID != "node-42" {
+		t.Errorf("nodeID = %q, want %q", vr.NodeID, "node-42")
 	}
-	if vr.lastSeq != 999 {
-		t.Errorf("lastSeq = %d, want 999", vr.lastSeq)
+	if vr.LastSeq != 999 {
+		t.Errorf("lastSeq = %d, want 999", vr.LastSeq)
 	}
 }
 
@@ -214,14 +213,17 @@ func TestBuildVoteResponse_Encoding(t *testing.T) {
 				t.Fatalf("value len = %d, want 9", len(resp.Value))
 			}
 
-			gotTerm := binary.LittleEndian.Uint64(resp.Value[0:8])
-			if gotTerm != tt.term {
-				t.Errorf("term = %d, want %d", gotTerm, tt.term)
+			vr, err := protocol.ParseVoteResponseValue(resp.Value)
+			if err != nil {
+				t.Fatalf("ParseVoteResponseValue() error: %v", err)
 			}
 
-			gotGranted := resp.Value[8] == 1
-			if gotGranted != tt.granted {
-				t.Errorf("granted = %v, want %v", gotGranted, tt.granted)
+			if vr.Term != tt.term {
+				t.Errorf("term = %d, want %d", vr.Term, tt.term)
+			}
+
+			if vr.Granted != tt.granted {
+				t.Errorf("granted = %v, want %v", vr.Granted, tt.granted)
 			}
 		})
 	}
@@ -246,16 +248,16 @@ func TestVoteResponse_RoundTrip(t *testing.T) {
 	if decoded.Status != protocol.StatusVoteResponse {
 		t.Fatalf("status = %d, want StatusVoteResponse", decoded.Status)
 	}
-	if len(decoded.Value) != 9 {
-		t.Fatalf("value len = %d, want 9", len(decoded.Value))
-	}
 
-	gotTerm := binary.LittleEndian.Uint64(decoded.Value[0:8])
-	if gotTerm != 42 {
-		t.Errorf("round-trip term = %d, want 42", gotTerm)
+	vr, vrErr := protocol.ParseVoteResponseValue(decoded.Value)
+	if vrErr != nil {
+		t.Fatalf("ParseVoteResponseValue() error: %v", vrErr)
 	}
-	if decoded.Value[8] != 1 {
-		t.Errorf("round-trip granted = %d, want 1", decoded.Value[8])
+	if vr.Term != 42 {
+		t.Errorf("round-trip term = %d, want 42", vr.Term)
+	}
+	if !vr.Granted {
+		t.Errorf("round-trip granted = false, want true")
 	}
 }
 
@@ -403,9 +405,9 @@ func TestHandleVoteRequest(t *testing.T) {
 
 			// Build request value
 			reqValue := fmt.Sprintf("%d\n%s\n%d", tt.reqTerm, tt.reqNodeID, tt.reqLastSeq)
-			vr, err := parseVoteRequest([]byte(reqValue))
+			vr, err := protocol.ParseVoteRequestValue([]byte(reqValue))
 			if err != nil {
-				t.Fatalf("parseVoteRequest: %v", err)
+				t.Fatalf("ParseVoteRequestValue: %v", err)
 			}
 
 			// Call the actual production logic under the same lock contract.
@@ -414,13 +416,13 @@ func TestHandleVoteRequest(t *testing.T) {
 			s.roleMu.Unlock()
 
 			// Decode the response to check granted/term.
-			if len(resp.Value) != 9 {
-				t.Fatalf("response value len = %d, want 9", len(resp.Value))
+			vresp, vrErr := protocol.ParseVoteResponseValue(resp.Value)
+			if vrErr != nil {
+				t.Fatalf("ParseVoteResponseValue: %v", vrErr)
 			}
-			granted := resp.Value[8] == 1
 
-			if granted != tt.wantGranted {
-				t.Errorf("granted = %v, want %v", granted, tt.wantGranted)
+			if vresp.Granted != tt.wantGranted {
+				t.Errorf("granted = %v, want %v", vresp.Granted, tt.wantGranted)
 			}
 			if s.term.Load() != tt.wantTerm {
 				t.Errorf("term after = %d, want %d", s.term.Load(), tt.wantTerm)

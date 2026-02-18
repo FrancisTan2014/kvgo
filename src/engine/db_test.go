@@ -67,7 +67,9 @@ func TestPut_EdgeCases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create DB: %v", err)
 	}
-	defer db.Close()
+	// Use Cleanup instead of defer so db.Close() runs AFTER parallel subtests finish.
+	// defer would close (and cancel ctx) when the parent returns, while subtests are still running.
+	t.Cleanup(func() { db.Close() })
 
 	tests := []struct {
 		name    string

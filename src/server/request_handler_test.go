@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"kvgo/engine"
 	"kvgo/protocol"
@@ -244,12 +243,6 @@ func TestHandlePut_ReplicaRejection(t *testing.T) {
 
 // TestHandlePing_HeartbeatUpdate tests PING updates heartbeat and primarySeq
 func TestHandlePing_HeartbeatUpdate(t *testing.T) {
-	termBytes := func(term uint64) []byte {
-		b := make([]byte, 8)
-		binary.LittleEndian.PutUint64(b, term)
-		return b
-	}
-
 	tests := []struct {
 		name           string
 		role           Role
@@ -289,7 +282,7 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 			s.role.Store(uint32(tt.role))
 			s.term.Store(tt.myTerm)
 
-			req := protocol.Request{Cmd: protocol.CmdPing, Seq: tt.pingSeq, Value: termBytes(tt.pingTerm)}
+			req := protocol.NewPingRequest(tt.pingSeq, tt.pingTerm)
 
 			mockTransport := &mockStreamTransport{}
 
@@ -345,12 +338,6 @@ func TestHandlePing_HeartbeatUpdate(t *testing.T) {
 
 // TestHandlePing_TermFencing tests stale primary fencing via PING term check
 func TestHandlePing_TermFencing(t *testing.T) {
-	termBytes := func(term uint64) []byte {
-		b := make([]byte, 8)
-		binary.LittleEndian.PutUint64(b, term)
-		return b
-	}
-
 	tests := []struct {
 		name          string
 		myTerm        uint64
@@ -409,7 +396,7 @@ func TestHandlePing_TermFencing(t *testing.T) {
 
 			var value []byte
 			if tt.pingTerm > 0 {
-				value = termBytes(tt.pingTerm)
+				value = protocol.NewPingRequest(0, tt.pingTerm).Value
 			}
 
 			req := protocol.Request{Cmd: protocol.CmdPing, Seq: 100, Value: value}
@@ -444,7 +431,7 @@ func TestHandlePing_TermFencing(t *testing.T) {
 				}
 				// PONG carries our term
 				if len(pong.Value) >= 8 {
-					pongTerm := binary.LittleEndian.Uint64(pong.Value[:8])
+					pongTerm := protocol.ParsePongTerm(pong.Value)
 					if pongTerm != tt.wantTerm {
 						t.Errorf("pong term = %d, want %d", pongTerm, tt.wantTerm)
 					}
@@ -456,12 +443,6 @@ func TestHandlePing_TermFencing(t *testing.T) {
 
 // TestProcessPongResponse_TermFencing tests stale primary steps down on higher-term PONG
 func TestProcessPongResponse_TermFencing(t *testing.T) {
-	termBytes := func(term uint64) []byte {
-		b := make([]byte, 8)
-		binary.LittleEndian.PutUint64(b, term)
-		return b
-	}
-
 	tests := []struct {
 		name     string
 		myTerm   uint64
@@ -514,7 +495,7 @@ func TestProcessPongResponse_TermFencing(t *testing.T) {
 			s.term.Store(tt.myTerm)
 			s.roleChanged = make(chan struct{})
 
-			resp := protocol.Response{Status: protocol.StatusPong, Value: termBytes(tt.pongTerm)}
+			resp := protocol.NewPongResponse(tt.pongTerm)
 			payload, _ := protocol.EncodeResponse(resp)
 
 			rc := &replicaConn{listenAddr: "127.0.0.1:9999"}

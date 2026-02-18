@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"kvgo/protocol"
@@ -309,9 +308,7 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 			// Uses Request() so the PONG comes back as a Response on the
 			// same multiplexed stream — no reader goroutine needed.
 			if time.Since(rc.lastWrite) > heartbeatInterval {
-				termBuf := make([]byte, 8)
-				binary.LittleEndian.PutUint64(termBuf, s.term.Load())
-				ping, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdPing, Seq: s.seq.Load(), Value: termBuf})
+				ping, _ := protocol.EncodeRequest(protocol.NewPingRequest(s.seq.Load(), s.term.Load()))
 
 				// Type-assert to RequestTransport (MultiplexedTransport implements both).
 				rt, ok := rc.transport.(transport.RequestTransport)

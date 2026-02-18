@@ -5,13 +5,10 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"kvgo/protocol"
 	"kvgo/utils"
 	"math/rand/v2"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -251,62 +248,22 @@ func (s *Server) requestVote(peerID string, payload []byte, timeout time.Duratio
 		return 0, false, fmt.Errorf("decode response from %s: %w", peerID, err)
 	}
 
-	if resp.Status != protocol.StatusVoteResponse || len(resp.Value) != 9 {
-		return 0, false, fmt.Errorf("unexpected response from %s: status=%d len=%d", peerID, resp.Status, len(resp.Value))
+	if resp.Status != protocol.StatusVoteResponse {
+		return 0, false, fmt.Errorf("unexpected response from %s: status=%d", peerID, resp.Status)
 	}
 
-	respTerm := binary.LittleEndian.Uint64(resp.Value[0:8])
-	granted := resp.Value[8] == 1
-	return respTerm, granted, nil
+	vr, err := protocol.ParseVoteResponseValue(resp.Value)
+	if err != nil {
+		return 0, false, fmt.Errorf("parse vote response from %s: %w", peerID, err)
+	}
+
+	return vr.Term, vr.Granted, nil
 }
 
 func (s *Server) buildVoteRequest() protocol.Request {
-	payload := fmt.Sprintf("%d%s%s%s%d",
-		s.term.Load(),
-		protocol.Delimiter,
-		s.nodeID,
-		protocol.Delimiter,
-		s.lastSeq.Load())
-	return protocol.Request{
-		Cmd:   protocol.CmdVoteRequest,
-		Value: []byte(payload),
-	}
-}
-
-type voteRequest struct {
-	term    uint64
-	nodeID  string
-	lastSeq uint64
-}
-
-func parseVoteRequest(value []byte) (voteRequest, error) {
-	parts := strings.Split(string(value), protocol.Delimiter)
-	if len(parts) != 3 {
-		return voteRequest{}, fmt.Errorf("expected 3 fields, got %d", len(parts))
-	}
-
-	term, err := strconv.ParseUint(parts[0], 10, 64)
-	if err != nil {
-		return voteRequest{}, fmt.Errorf("invalid term: %w", err)
-	}
-
-	lastSeq, err := strconv.ParseUint(parts[2], 10, 64)
-	if err != nil {
-		return voteRequest{}, fmt.Errorf("invalid lastSeq: %w", err)
-	}
-
-	return voteRequest{term: term, nodeID: parts[1], lastSeq: lastSeq}, nil
+	return protocol.NewVoteRequest(s.term.Load(), s.nodeID, s.lastSeq.Load())
 }
 
 func (s *Server) buildVoteResponse(granted bool) protocol.Response {
-	// [term u64 LE][granted u8]
-	buf := make([]byte, 9)
-	binary.LittleEndian.PutUint64(buf, s.term.Load())
-	if granted {
-		buf[8] = 1
-	}
-	return protocol.Response{
-		Status: protocol.StatusVoteResponse,
-		Value:  buf,
-	}
+	return protocol.NewVoteResponse(s.term.Load(), granted)
 }

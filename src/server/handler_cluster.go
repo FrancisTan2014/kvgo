@@ -6,7 +6,6 @@ import (
 	"kvgo/protocol"
 	"kvgo/transport"
 	"kvgo/utils"
-	"strings"
 	"time"
 )
 
@@ -24,17 +23,13 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 
 	req := &ctx.Request
 
-	strs := strings.Split(string(req.Value), protocol.Delimiter)
-	if len(strs) != 3 || strs[0] == "" || strs[1] == "" || strs[2] == "" {
-		s.log().Warn("REPLICATE rejected: invalid value format, expected replid, listenAddr, and nodeID")
+	rv, err := protocol.ParseReplicateValue(req.Value)
+	if err != nil {
+		s.log().Warn("REPLICATE rejected: invalid value format", "error", err)
 		return s.responseStatusError(ctx)
 	}
 
-	replid := strs[0]
-	listenAddr := strs[1]
-	nodeID := strs[2]
-
-	rc := newReplicaConn(ctx.StreamTransport, req.Seq, replid, nodeID, listenAddr)
+	rc := newReplicaConn(ctx.StreamTransport, req.Seq, rv.Replid, rv.NodeID, rv.ListenAddr)
 
 	// Perform initial sync (blocks), then spawn writer goroutine.
 	// Connection ownership transfers to serveReplica — caller must not close it.
@@ -44,12 +39,7 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 }
 
 func (s *Server) buildReplicateRequest() protocol.Request {
-	val := s.replid + protocol.Delimiter + s.listenAddr() + protocol.Delimiter + s.nodeID
-	return protocol.Request{
-		Cmd:   protocol.CmdReplicate,
-		Seq:   s.lastSeq.Load(),
-		Value: []byte(val),
-	}
+	return protocol.NewReplicateRequest(s.replid, s.listenAddr(), s.nodeID, s.lastSeq.Load())
 }
 
 // ---------------------------------------------------------------------------
@@ -179,21 +169,13 @@ func (s *Server) broadcastPromotion() {
 
 func (s *Server) handleTopology(ctx *RequestContext) error {
 	var peers []PeerInfo
-	if len(ctx.Request.Value) > 0 {
-		selfID := s.nodeID
-		replicaOf := s.opts.ReplicaOf
-		for _, entry := range strings.Split(string(ctx.Request.Value), protocol.Delimiter) {
-			nodeID, addr, ok := strings.Cut(entry, "@")
-			if !ok || nodeID == "" || addr == "" {
-				continue
-			}
-			// Identify the primary by matching the listen address we replicate from.
-			if addr == replicaOf {
-				s.primaryNodeID = nodeID
-			}
-			if nodeID != selfID {
-				peers = append(peers, PeerInfo{NodeID: nodeID, Addr: addr})
-			}
+	for _, entry := range protocol.ParseTopologyValue(ctx.Request.Value) {
+		// Identify the primary by matching the listen address we replicate from.
+		if entry.Addr == s.opts.ReplicaOf {
+			s.primaryNodeID = entry.NodeID
+		}
+		if entry.NodeID != s.nodeID {
+			peers = append(peers, PeerInfo{NodeID: entry.NodeID, Addr: entry.Addr})
 		}
 	}
 
@@ -202,26 +184,13 @@ func (s *Server) handleTopology(ctx *RequestContext) error {
 }
 
 func (s *Server) buildTopologyRequest(replicas map[transport.StreamTransport]*replicaConn) protocol.Request {
-	var sb strings.Builder
-
 	// Include the primary itself so replicas can reach it (e.g. for elections)
-	sb.WriteString(s.nodeID)
-	sb.WriteString("@")
-	sb.WriteString(s.listenAddr())
-	sb.WriteString(protocol.Delimiter)
-
+	entries := make([]protocol.TopologyEntry, 0, 1+len(replicas))
+	entries = append(entries, protocol.TopologyEntry{NodeID: s.nodeID, Addr: s.listenAddr()})
 	for _, rc := range replicas {
-		sb.WriteString(rc.nodeID)
-		sb.WriteString("@")
-		sb.WriteString(rc.listenAddr)
-		sb.WriteString(protocol.Delimiter)
+		entries = append(entries, protocol.TopologyEntry{NodeID: rc.nodeID, Addr: rc.listenAddr})
 	}
-
-	topology := strings.TrimRight(sb.String(), protocol.Delimiter)
-	return protocol.Request{
-		Cmd:   protocol.CmdTopology,
-		Value: []byte(topology),
-	}
+	return protocol.NewTopologyRequest(entries)
 }
 
 func (s *Server) broadcastTopology() {
@@ -309,7 +278,7 @@ func DialPeer(proto, network string, timeout time.Duration) DialFunc {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleVoteRequest(ctx *RequestContext) error {
-	vr, err := parseVoteRequest(ctx.Request.Value)
+	vr, err := protocol.ParseVoteRequestValue(ctx.Request.Value)
 	if err != nil {
 		s.log().Warn("VOTE rejected: malformed request", "error", err)
 		return s.writeResponse(ctx.StreamTransport, s.buildVoteResponse(false))
@@ -327,7 +296,7 @@ func (s *Server) handleVoteRequest(ctx *RequestContext) error {
 		// After stepping down from leader, reconnect to the cluster
 		// via the candidate (or any known peer).
 		if wasLeader {
-			if addr, ok := s.peerManager.Addr(vr.nodeID); ok {
+			if addr, ok := s.peerManager.Addr(vr.NodeID); ok {
 				go func() {
 					if err := s.relocate(addr); err != nil {
 						s.log().Warn("post-stepdown relocate failed", "addr", addr, "error", err)
@@ -343,19 +312,19 @@ func (s *Server) handleVoteRequest(ctx *RequestContext) error {
 // evaluateVoteLocked decides whether to grant a vote.
 // Caller must hold s.roleMu.
 // Returns the response and whether a step-down occurred (caller must notify).
-func (s *Server) evaluateVoteLocked(vr voteRequest) (protocol.Response, bool) {
+func (s *Server) evaluateVoteLocked(vr protocol.VoteRequestValue) (protocol.Response, bool) {
 	myTerm := s.term.Load()
 	stepped := false
 
 	// Stale term — reject without updating anything.
-	if vr.term < myTerm {
-		s.log().Debug("VOTE rejected: stale term", "candidate", vr.nodeID, "candidateTerm", vr.term, "myTerm", myTerm)
+	if vr.Term < myTerm {
+		s.log().Debug("VOTE rejected: stale term", "candidate", vr.NodeID, "candidateTerm", vr.Term, "myTerm", myTerm)
 		return s.buildVoteResponse(false), false
 	}
 
 	// Higher term — step down and update our term before evaluating the vote.
-	if vr.term > myTerm {
-		s.term.Store(vr.term)
+	if vr.Term > myTerm {
+		s.term.Store(vr.Term)
 		s.votedFor = ""
 		cur := s.currentRole()
 		if cur != RoleFollower {
@@ -369,24 +338,24 @@ func (s *Server) evaluateVoteLocked(vr voteRequest) (protocol.Response, bool) {
 	}
 
 	// Already voted for someone else this term.
-	if s.votedFor != "" && s.votedFor != vr.nodeID {
-		s.log().Debug("VOTE rejected: already voted", "candidate", vr.nodeID, "votedFor", s.votedFor)
+	if s.votedFor != "" && s.votedFor != vr.NodeID {
+		s.log().Debug("VOTE rejected: already voted", "candidate", vr.NodeID, "votedFor", s.votedFor)
 		return s.buildVoteResponse(false), stepped
 	}
 
 	// Log completeness check — candidate must be at least as up-to-date.
-	if vr.lastSeq < s.lastSeq.Load() {
-		s.log().Debug("VOTE rejected: candidate log behind", "candidate", vr.nodeID, "candidateLastSeq", vr.lastSeq, "myLastSeq", s.lastSeq.Load())
+	if vr.LastSeq < s.lastSeq.Load() {
+		s.log().Debug("VOTE rejected: candidate log behind", "candidate", vr.NodeID, "candidateLastSeq", vr.LastSeq, "myLastSeq", s.lastSeq.Load())
 		return s.buildVoteResponse(false), stepped
 	}
 
 	// Grant the vote.
-	s.votedFor = vr.nodeID
+	s.votedFor = vr.NodeID
 	s.lastHeartbeat = time.Now() // reset election timer so we don't immediately campaign
 	if err := s.storeState(); err != nil {
 		s.log().Error("failed to persist votedFor", "error", err)
 	}
 
-	s.log().Info("VOTE granted", "candidate", vr.nodeID, "term", vr.term)
+	s.log().Info("VOTE granted", "candidate", vr.NodeID, "term", vr.Term)
 	return s.buildVoteResponse(true), stepped
 }
