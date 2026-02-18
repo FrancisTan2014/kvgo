@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -47,12 +48,12 @@ func TestTcpStreamTransport_BasicSendReceive(t *testing.T) {
 
 	// Send from client to server
 	msg := []byte("hello from client")
-	if err := clientTransport.Send(msg); err != nil {
+	if err := clientTransport.Send(context.Background(), msg); err != nil {
 		t.Fatalf("Send failed: %v", err)
 	}
 
 	// Receive on server
-	received, err := serverTransport.Receive()
+	received, err := serverTransport.Receive(context.Background())
 	if err != nil {
 		t.Fatalf("Receive failed: %v", err)
 	}
@@ -68,11 +69,11 @@ func TestTcpStreamTransport_Bidirectional(t *testing.T) {
 
 	// Client → Server
 	msg1 := []byte("ping")
-	if err := clientTransport.Send(msg1); err != nil {
+	if err := clientTransport.Send(context.Background(), msg1); err != nil {
 		t.Fatalf("Client send failed: %v", err)
 	}
 
-	received1, err := serverTransport.Receive()
+	received1, err := serverTransport.Receive(context.Background())
 	if err != nil {
 		t.Fatalf("Server receive failed: %v", err)
 	}
@@ -82,11 +83,11 @@ func TestTcpStreamTransport_Bidirectional(t *testing.T) {
 
 	// Server → Client
 	msg2 := []byte("pong")
-	if err := serverTransport.Send(msg2); err != nil {
+	if err := serverTransport.Send(context.Background(), msg2); err != nil {
 		t.Fatalf("Server send failed: %v", err)
 	}
 
-	received2, err := clientTransport.Receive()
+	received2, err := clientTransport.Receive(context.Background())
 	if err != nil {
 		t.Fatalf("Client receive failed: %v", err)
 	}
@@ -105,11 +106,11 @@ func TestTcpStreamTransport_Close(t *testing.T) {
 	}
 
 	// Operations after close should fail
-	if err := clientTransport.Send([]byte("test")); err == nil {
+	if err := clientTransport.Send(context.Background(), []byte("test")); err == nil {
 		t.Error("Send after close should fail")
 	}
 
-	if _, err := clientTransport.Receive(); err == nil {
+	if _, err := clientTransport.Receive(context.Background()); err == nil {
 		t.Error("Receive after close should fail")
 	}
 
@@ -137,8 +138,8 @@ func TestTcpRequestTransport_BasicRequest(t *testing.T) {
 		}
 		defer conn.Close()
 		transport := NewTcpStream(conn)
-		msg, _ := transport.Receive()
-		_ = transport.Send(msg)
+		msg, _ := transport.Receive(context.Background())
+		_ = transport.Send(context.Background(), msg)
 	}()
 
 	// Client request
@@ -149,7 +150,9 @@ func TestTcpRequestTransport_BasicRequest(t *testing.T) {
 	defer clientTransport.Close()
 
 	req := []byte("echo test")
-	resp, err := clientTransport.Request(req, 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	resp, err := clientTransport.Request(ctx, req)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -174,8 +177,8 @@ func TestDialTcpStream(t *testing.T) {
 		}
 		defer conn.Close()
 		transport := NewTcpStream(conn)
-		msg, _ := transport.Receive()
-		_ = transport.Send(msg)
+		msg, _ := transport.Receive(context.Background())
+		_ = transport.Send(context.Background(), msg)
 	}()
 
 	// Dial and test
@@ -187,11 +190,11 @@ func TestDialTcpStream(t *testing.T) {
 	defer transport.Close()
 
 	msg := []byte("dial test")
-	if err := transport.Send(msg); err != nil {
+	if err := transport.Send(context.Background(), msg); err != nil {
 		t.Fatalf("Send failed: %v", err)
 	}
 
-	resp, err := transport.Receive()
+	resp, err := transport.Receive(context.Background())
 	if err != nil {
 		t.Fatalf("Receive failed: %v", err)
 	}

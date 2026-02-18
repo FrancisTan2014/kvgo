@@ -124,13 +124,13 @@ func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 		panic("encode error")
 	}
 
-	if err := st.Send(payload); err != nil {
+	if err := st.Send(context.Background(), payload); err != nil {
 		_ = st.Close()
 		return nil, fmt.Errorf("send replicate request: %w", err)
 	}
 
 	// Wait for ack from primary.
-	respPayload, err := st.Receive()
+	respPayload, err := st.Receive(context.Background())
 	if err != nil {
 		_ = st.Close()
 		return nil, fmt.Errorf("read replicate response: %w", err)
@@ -270,7 +270,7 @@ func (s *Server) respondSyncMode(rc *replicaConn) (bool, error) {
 		panic("encode error")
 	}
 
-	return fullSyncMode, rc.transport.Send(resp)
+	return fullSyncMode, rc.transport.Send(context.Background(), resp)
 }
 
 // serveReplicaWriter handles async write forwarding and heartbeats for a replica.
@@ -295,7 +295,10 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 				// Channel closed - replica removed
 				return
 			}
-			if err := rc.transport.SendWithTimeout(payload, 5*time.Second); err != nil {
+			sendCtx, sendCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := rc.transport.Send(sendCtx, payload)
+			sendCancel()
+			if err != nil {
 				s.log().Error("replica write failed", "replica", rc.listenAddr, "error", err)
 				return
 			}
@@ -317,7 +320,9 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 					return
 				}
 
-				resp, err := rt.Request(ping, 5*time.Second)
+				pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				resp, err := rt.Request(pingCtx, ping)
+				pingCancel()
 				if err != nil {
 					s.log().Error("replica ping failed", "replica", rc.listenAddr, "error", err)
 					return
@@ -347,7 +352,7 @@ func (s *Server) fullResync(rc *replicaConn) {
 			return false
 		}
 
-		if err := rc.transport.Send(payload); err != nil {
+		if err := rc.transport.Send(context.Background(), payload); err != nil {
 			s.log().Error("replica write failed", "replica", rc.listenAddr, "error", err)
 			return false
 		}
@@ -362,7 +367,7 @@ func (s *Server) partialSync(rc *replicaConn) {
 	s.log().Info("partial sync started", "replica", rc.listenAddr)
 
 	err := s.forwardBacklog(rc.lastSeq, func(e backlogEntry) error {
-		if err := rc.transport.Send(e.payload); err != nil {
+		if err := rc.transport.Send(context.Background(), e.payload); err != nil {
 			s.log().Error("replica write failed", "replica", rc.listenAddr, "error", err)
 			return err
 		}

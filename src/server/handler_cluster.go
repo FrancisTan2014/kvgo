@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"kvgo/protocol"
 	"kvgo/transport"
@@ -163,7 +164,9 @@ func (s *Server) broadcastPromotion() {
 				s.log().Debug("broadcastPromotion: peer unreachable", "peer", pid, "error", err)
 				return
 			}
-			if _, err := t.Request(payload, 2*time.Second); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if _, err := t.Request(ctx, payload); err != nil {
 				s.log().Debug("broadcastPromotion: request failed", "peer", pid, "error", err)
 			}
 		}()
@@ -277,7 +280,13 @@ func DialPeer(proto, network string, timeout time.Duration) DialFunc {
 		req := protocol.Request{Cmd: protocol.CmdPeerHandshake}
 		payload, _ := protocol.EncodeRequest(req)
 
-		pr, err := t.Request(payload, timeout)
+		ctx := context.Background()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		pr, err := t.Request(ctx, payload)
 		if err != nil {
 			return nil, err
 		}

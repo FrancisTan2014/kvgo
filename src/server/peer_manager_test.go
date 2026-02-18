@@ -1,13 +1,13 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"kvgo/transport"
 	"sort"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestPeerManager_SavePeers(t *testing.T) {
@@ -336,7 +336,7 @@ type closeTrackingTransport struct {
 	mu         *sync.Mutex
 }
 
-func (c *closeTrackingTransport) Request(payload []byte, timeout time.Duration) ([]byte, error) {
+func (c *closeTrackingTransport) Request(ctx context.Context, payload []byte) ([]byte, error) {
 	return nil, nil
 }
 

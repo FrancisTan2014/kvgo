@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"kvgo/protocol"
 	"time"
 )
@@ -141,7 +142,9 @@ func (s *Server) sendAckViaPeer(cmd protocol.Cmd, requestId string) {
 	req := protocol.Request{Cmd: cmd, RequestId: requestId}
 	payload, _ := protocol.EncodeRequest(req)
 
-	if _, err := t.Request(payload, 2*time.Second); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := t.Request(ctx, payload); err != nil {
 		s.log().Warn("ACK/NACK send failed",
 			"cmd", cmd, "request_id", requestId, "error", err)
 	}

@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -29,7 +30,7 @@ func NewTcpStream(conn net.Conn) *TcpStreamTransport {
 }
 
 // Send transmits a message. Thread-safe for concurrent goroutines.
-func (t *TcpStreamTransport) Send(payload []byte) error {
+func (t *TcpStreamTransport) Send(ctx context.Context, payload []byte) error {
 	t.closeMu.Lock()
 	if t.closed {
 		t.closeMu.Unlock()
@@ -39,25 +40,14 @@ func (t *TcpStreamTransport) Send(payload []byte) error {
 
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
+	if deadline, ok := ctx.Deadline(); ok {
+		return t.framer.WriteWithDeadline(payload, deadline)
+	}
 	return t.framer.Write(payload)
 }
 
-// SendWithTimeout transmits a message with a timeout.
-func (t *TcpStreamTransport) SendWithTimeout(payload []byte, timeout time.Duration) error {
-	t.closeMu.Lock()
-	if t.closed {
-		t.closeMu.Unlock()
-		return fmt.Errorf("transport closed")
-	}
-	t.closeMu.Unlock()
-
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	return t.framer.WriteWithTimeout(payload, timeout)
-}
-
 // Receive reads the next message. Thread-safe for concurrent goroutines.
-func (t *TcpStreamTransport) Receive() ([]byte, error) {
+func (t *TcpStreamTransport) Receive(ctx context.Context) ([]byte, error) {
 	t.closeMu.Lock()
 	if t.closed {
 		t.closeMu.Unlock()
@@ -67,21 +57,10 @@ func (t *TcpStreamTransport) Receive() ([]byte, error) {
 
 	t.readMu.Lock()
 	defer t.readMu.Unlock()
+	if deadline, ok := ctx.Deadline(); ok {
+		return t.framer.ReadWithDeadline(deadline)
+	}
 	return t.framer.Read()
-}
-
-// ReceiveWithTimeout reads the next message with a timeout.
-func (t *TcpStreamTransport) ReceiveWithTimeout(timeout time.Duration) ([]byte, error) {
-	t.closeMu.Lock()
-	if t.closed {
-		t.closeMu.Unlock()
-		return nil, fmt.Errorf("transport closed")
-	}
-	t.closeMu.Unlock()
-
-	t.readMu.Lock()
-	defer t.readMu.Unlock()
-	return t.framer.ReadWithTimeout(timeout)
 }
 
 // Close terminates the transport.
@@ -124,9 +103,9 @@ func NewTcpRequest(conn net.Conn) *TcpRequestTransport {
 	}
 }
 
-// Request sends a message and waits for response with timeout.
+// Request sends a message and waits for response.
 // Thread-safe but serializes requests (no concurrent requests).
-func (t *TcpRequestTransport) Request(payload []byte, timeout time.Duration) ([]byte, error) {
+func (t *TcpRequestTransport) Request(ctx context.Context, payload []byte) ([]byte, error) {
 	t.closeMu.Lock()
 	if t.closed {
 		t.closeMu.Unlock()
@@ -137,8 +116,8 @@ func (t *TcpRequestTransport) Request(payload []byte, timeout time.Duration) ([]
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Shared deadline for both write and read (not 2x timeout)
-	deadline := time.Now().Add(timeout)
+	// Extract deadline from context; if none, use zero (no deadline)
+	deadline, _ := ctx.Deadline()
 
 	// Send request
 	if err := t.framer.WriteWithDeadline(payload, deadline); err != nil {

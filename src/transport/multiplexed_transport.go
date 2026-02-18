@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -74,11 +75,7 @@ func (t *MultiplexedTransport) allocateID() uint32 {
 	}
 }
 
-func (t *MultiplexedTransport) Send(payload []byte) error {
-	return t.SendWithTimeout(payload, 0)
-}
-
-func (t *MultiplexedTransport) SendWithTimeout(payload []byte, timeout time.Duration) error {
+func (t *MultiplexedTransport) Send(ctx context.Context, payload []byte) error {
 	if len(payload) == 0 {
 		return fmt.Errorf("invalid payload")
 	}
@@ -95,31 +92,26 @@ func (t *MultiplexedTransport) SendWithTimeout(payload []byte, timeout time.Dura
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 
-	if timeout > 0 {
-		return t.framer.WriteWithTimeout(buf, timeout)
-	} else {
-		return t.framer.Write(buf)
+	if deadline, ok := ctx.Deadline(); ok {
+		return t.framer.WriteWithDeadline(buf, deadline)
 	}
+	return t.framer.Write(buf)
 }
 
-func (t *MultiplexedTransport) Receive() ([]byte, error) {
-	return t.ReceiveWithTimeout(0)
-}
-
-func (t *MultiplexedTransport) ReceiveWithTimeout(timeout time.Duration) ([]byte, error) {
-	id, payload, err := t.receiveInternal(timeout)
+func (t *MultiplexedTransport) Receive(ctx context.Context) ([]byte, error) {
+	id, payload, err := t.receiveInternal(ctx)
 	if err == nil {
 		t.lastRecvId.Store(id)
 	}
 	return payload, err
 }
 
-func (t *MultiplexedTransport) receiveInternal(timeout time.Duration) (uint32, []byte, error) {
+func (t *MultiplexedTransport) receiveInternal(ctx context.Context) (uint32, []byte, error) {
 	var payload []byte
 	var err error
 
-	if timeout > 0 {
-		payload, err = t.framer.ReadWithTimeout(timeout)
+	if deadline, ok := ctx.Deadline(); ok {
+		payload, err = t.framer.ReadWithDeadline(deadline)
 	} else {
 		payload, err = t.framer.Read()
 	}
@@ -140,7 +132,7 @@ func (t *MultiplexedTransport) RemoteAddr() string {
 	return t.conn.RemoteAddr().String()
 }
 
-func (t *MultiplexedTransport) Request(payload []byte, timeout time.Duration) ([]byte, error) {
+func (t *MultiplexedTransport) Request(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) == 0 {
 		return nil, fmt.Errorf("invalid payload")
 	}
@@ -155,6 +147,8 @@ func (t *MultiplexedTransport) Request(payload []byte, timeout time.Duration) ([
 		defer func() { <-t.inflightSem }()
 	case <-t.closeCh:
 		return nil, ErrTransportClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
 	requestId := t.allocateID()
@@ -168,10 +162,8 @@ func (t *MultiplexedTransport) Request(payload []byte, timeout time.Duration) ([
 	t.pendingRequests[requestId] = respCh
 	t.mu.Unlock()
 
-	// Calculate shared deadline
-	var timer *time.Timer
-	if timeout > 0 {
-		deadline := time.Now().Add(timeout)
+	// Write with deadline if context has one
+	if deadline, ok := ctx.Deadline(); ok {
 		t.writeMu.Lock()
 		err := t.framer.WriteWithDeadline(buf, deadline)
 		t.writeMu.Unlock()
@@ -181,9 +173,6 @@ func (t *MultiplexedTransport) Request(payload []byte, timeout time.Duration) ([
 			t.mu.Unlock()
 			return nil, err
 		}
-		// Remaining time until deadline
-		timer = time.NewTimer(time.Until(deadline))
-		defer timer.Stop()
 	} else {
 		t.writeMu.Lock()
 		err := t.framer.Write(buf)
@@ -197,25 +186,16 @@ func (t *MultiplexedTransport) Request(payload []byte, timeout time.Duration) ([
 	}
 
 	// Wait for response
-	if timer != nil {
-		select {
-		case resp := <-respCh:
-			return resp.payload, resp.err
-		case <-timer.C:
-			t.mu.Lock()
-			delete(t.pendingRequests, requestId)
-			t.mu.Unlock()
-			return nil, fmt.Errorf("request timeout")
-		case <-t.closeCh:
-			return nil, ErrTransportClosed
-		}
-	} else {
-		select {
-		case resp := <-respCh:
-			return resp.payload, resp.err
-		case <-t.closeCh:
-			return nil, ErrTransportClosed
-		}
+	select {
+	case resp := <-respCh:
+		return resp.payload, resp.err
+	case <-ctx.Done():
+		t.mu.Lock()
+		delete(t.pendingRequests, requestId)
+		t.mu.Unlock()
+		return nil, ctx.Err()
+	case <-t.closeCh:
+		return nil, ErrTransportClosed
 	}
 }
 

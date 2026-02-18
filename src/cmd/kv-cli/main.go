@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -176,11 +177,14 @@ func doPromote(t transport.StreamTransport, timeout time.Duration) error {
 		return fmt.Errorf("encode: %w", err)
 	}
 
-	if err := t.SendWithTimeout(payload, timeout); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := t.Send(ctx, payload); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 
-	respPayload, err := t.ReceiveWithTimeout(timeout)
+	respPayload, err := t.Receive(ctx)
 	if err != nil {
 		return fmt.Errorf("read: %w", err)
 	}
@@ -208,11 +212,14 @@ func doGet(t transport.StreamTransport, key string, quorum bool, timeout time.Du
 		return fmt.Errorf("encode: %w", err)
 	}
 
-	if err := t.SendWithTimeout(payload, timeout); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := t.Send(ctx, payload); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 
-	respPayload, err := t.ReceiveWithTimeout(timeout)
+	respPayload, err := t.Receive(ctx)
 	if err != nil {
 		return fmt.Errorf("read: %w", err)
 	}
@@ -258,11 +265,14 @@ func doPut(t transport.StreamTransport, key, value string, quorum bool, timeout 
 		return 0, fmt.Errorf("encode: %w", err)
 	}
 
-	if err := t.SendWithTimeout(payload, timeout); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := t.Send(ctx, payload); err != nil {
 		return 0, fmt.Errorf("write: %w", err)
 	}
 
-	respPayload, err := t.ReceiveWithTimeout(timeout)
+	respPayload, err := t.Receive(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("read: %w", err)
 	}
@@ -309,11 +319,14 @@ func doPutToPrimary(key, value string, quorum bool, primaryAddr string, timeout 
 		return 0, fmt.Errorf("encode: %w", err)
 	}
 
-	if err := t.SendWithTimeout(payload, timeout); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := t.Send(ctx, payload); err != nil {
 		return 0, fmt.Errorf("write to primary: %w", err)
 	}
 
-	respPayload, err := t.ReceiveWithTimeout(timeout)
+	respPayload, err := t.Receive(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("read from primary: %w", err)
 	}
@@ -346,11 +359,14 @@ func doReplicaOf(t transport.StreamTransport, primaryAddr string, timeout time.D
 		return fmt.Errorf("encode: %w", err)
 	}
 
-	if err := t.SendWithTimeout(payload, timeout); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := t.Send(ctx, payload); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 
-	respPayload, err := t.ReceiveWithTimeout(timeout)
+	respPayload, err := t.Receive(ctx)
 	if err != nil {
 		return fmt.Errorf("read: %w", err)
 	}
@@ -378,11 +394,14 @@ func doCleanup(t transport.StreamTransport, timeout time.Duration) error {
 		return fmt.Errorf("encode: %w", err)
 	}
 
-	if err := t.SendWithTimeout(payload, timeout); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := t.Send(ctx, payload); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 
-	respPayload, err := t.ReceiveWithTimeout(timeout)
+	respPayload, err := t.Receive(ctx)
 	if err != nil {
 		return fmt.Errorf("read: %w", err)
 	}

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"kvgo/protocol"
 	"kvgo/transport"
 	"kvgo/utils"
@@ -271,7 +272,9 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 }
 
 func (s *Server) quorumReadFromReplica(t transport.RequestTransport, payload []byte, nodeID string) (value []byte, seq uint64, ok bool) {
-	resp, err := t.Request(payload, s.opts.QuorumReadTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.QuorumReadTimeout)
+	defer cancel()
+	resp, err := t.Request(ctx, payload)
 	if err != nil {
 		s.log().Warn("quorum read: failed to get response", "node_id", nodeID, "error", err)
 		return nil, 0, false

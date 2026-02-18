@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -47,7 +48,9 @@ func TestMultiplexedTransport_ConcurrentRequests(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			msg := []byte(fmt.Sprintf("request-%d", idx))
-			resp, err := clientTransport.Request(msg, 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			resp, err := clientTransport.Request(ctx, msg)
 			if err != nil {
 				results[idx] = err
 				return
@@ -97,14 +100,16 @@ func TestMultiplexedTransport_RequestTimeout(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, err := clientTransport.Request([]byte("test"), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := clientTransport.Request(ctx, []byte("test"))
 	elapsed := time.Since(start)
 
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}
-	if !errors.Is(err, errors.New("request timeout")) && err.Error() != "request timeout" {
-		t.Errorf("expected timeout error, got: %v", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded, got: %v", err)
 	}
 
 	// Should timeout around 100ms
@@ -150,7 +155,9 @@ func TestMultiplexedTransport_CloseWithPendingRequests(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			_, err := clientTransport.Request([]byte(fmt.Sprintf("req-%d", idx)), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, err := clientTransport.Request(ctx, []byte(fmt.Sprintf("req-%d", idx)))
 			results[idx] = err
 		}(i)
 	}
@@ -208,7 +215,9 @@ func TestMultiplexedTransport_FlowControl(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			_, err := clientTransport.Request([]byte(fmt.Sprintf("req-%d", idx)), 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, err := clientTransport.Request(ctx, []byte(fmt.Sprintf("req-%d", idx)))
 			if err != nil {
 				t.Errorf("request %d failed: %v", idx, err)
 			}
@@ -282,7 +291,9 @@ func TestMultiplexedTransport_RequestIDAllocation(t *testing.T) {
 			mu.Unlock()
 
 			// Also verify Request works
-			_, err := clientTransport.Request([]byte(fmt.Sprintf("msg-%d", idx)), 1*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+			_, err := clientTransport.Request(ctx, []byte(fmt.Sprintf("msg-%d", idx)))
 			if err != nil {
 				t.Errorf("request failed: %v", err)
 			}
@@ -341,7 +352,7 @@ func TestMultiplexedTransport_StreamingSend(t *testing.T) {
 	}()
 
 	// Send streaming message
-	err := clientTransport.Send([]byte("streaming message"))
+	err := clientTransport.Send(context.Background(), []byte("streaming message"))
 	if err != nil {
 		t.Fatalf("Send failed: %v", err)
 	}
@@ -367,13 +378,13 @@ func TestMultiplexedTransport_InvalidPayload(t *testing.T) {
 	defer clientTransport.Close()
 
 	// Request with empty payload
-	_, err := clientTransport.Request([]byte{}, 1*time.Second)
+	_, err := clientTransport.Request(context.Background(), []byte{})
 	if err == nil {
 		t.Error("expected error for empty payload, got nil")
 	}
 
 	// Send with empty payload
-	err = clientTransport.Send([]byte{})
+	err = clientTransport.Send(context.Background(), []byte{})
 	if err == nil {
 		t.Error("expected error for empty payload, got nil")
 	}
@@ -392,13 +403,15 @@ func TestMultiplexedTransport_ConnectionError(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Request should fail with ErrTransportClosed
-	_, err := clientTransport.Request([]byte("test"), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	_, err := clientTransport.Request(ctx, []byte("test"))
 	if err == nil {
 		t.Fatal("expected error after connection closed, got nil")
 	}
 
 	// Should be ErrTransportClosed or write error
-	if !errors.Is(err, ErrTransportClosed) && !errors.Is(err, io.ErrClosedPipe) {
+	if !errors.Is(err, ErrTransportClosed) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, context.DeadlineExceeded) {
 		t.Logf("got error: %v (acceptable if write failed before close detected)", err)
 	}
 
@@ -414,7 +427,9 @@ func TestMultiplexedTransport_GracefulShutdown(t *testing.T) {
 
 	// Start a request that will timeout
 	go func() {
-		clientTransport.Request([]byte("test"), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		clientTransport.Request(ctx, []byte("test"))
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -483,7 +498,9 @@ func TestMultiplexedTransport_ResponseOrdering(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			msg := fmt.Sprintf("request-%d", idx)
-			resp, err := clientTransport.Request([]byte(msg), 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			resp, err := clientTransport.Request(ctx, []byte(msg))
 			if err != nil {
 				t.Errorf("request %d failed: %v", idx, err)
 				return
@@ -535,7 +552,9 @@ func TestMultiplexedTransport_UnknownRequestID(t *testing.T) {
 
 	// Should still work despite bogus response
 	msg := []byte("test")
-	resp, err := clientTransport.Request(msg, 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := clientTransport.Request(ctx, msg)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}

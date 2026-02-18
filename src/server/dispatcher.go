@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"kvgo/protocol"
 	"kvgo/transport"
 	"time"
@@ -32,13 +33,13 @@ func (s *Server) registerRequestHandlers() {
 
 func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duration) (takenOver bool) {
 	for {
-		var payload []byte
-		var err error
+		readCtx := context.Background()
 		if timeout > 0 {
-			payload, err = t.ReceiveWithTimeout(timeout)
-		} else {
-			payload, err = t.Receive()
+			var cancel context.CancelFunc
+			readCtx, cancel = context.WithTimeout(readCtx, timeout)
+			defer cancel() // OK: each cancel is idempotent; all run on function exit
 		}
+		payload, err := t.Receive(readCtx)
 		if err != nil {
 			return false
 		}
@@ -57,7 +58,7 @@ func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duratio
 
 		ctx := &RequestContext{
 			StreamTransport:  t,
-			RequestTransport: transport.AsRequestTransport(t, s.opts.ReadTimeout),
+			RequestTransport: transport.AsRequestTransport(t),
 			Request:          req,
 		}
 
@@ -77,8 +78,11 @@ func (s *Server) writeResponse(t transport.StreamTransport, resp protocol.Respon
 	if err != nil {
 		return err
 	}
+	ctx := context.Background()
 	if s.opts.WriteTimeout > 0 {
-		return t.SendWithTimeout(payload, s.opts.WriteTimeout)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.opts.WriteTimeout)
+		defer cancel()
 	}
-	return t.Send(payload)
+	return t.Send(ctx, payload)
 }

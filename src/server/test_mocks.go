@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -22,14 +23,7 @@ type mockStreamTransport struct {
 	address       string
 }
 
-func (m *mockStreamTransport) Send(payload []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.written = payload
-	return nil
-}
-
-func (m *mockStreamTransport) SendWithTimeout(payload []byte, timeout time.Duration) error {
+func (m *mockStreamTransport) Send(ctx context.Context, payload []byte) error {
 	if m.delay > 0 {
 		time.Sleep(m.delay)
 	}
@@ -46,7 +40,7 @@ func (m *mockStreamTransport) SendWithTimeout(payload []byte, timeout time.Durat
 	return nil
 }
 
-func (m *mockStreamTransport) Receive() ([]byte, error) {
+func (m *mockStreamTransport) Receive(ctx context.Context) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.receiveErr != nil {
@@ -56,10 +50,6 @@ func (m *mockStreamTransport) Receive() ([]byte, error) {
 		return m.receiveData, nil
 	}
 	return nil, io.EOF
-}
-
-func (m *mockStreamTransport) ReceiveWithTimeout(timeout time.Duration) ([]byte, error) {
-	return m.Receive()
 }
 
 func (m *mockStreamTransport) Close() error {
@@ -82,13 +72,14 @@ type mockRequestTransport struct {
 	address  string
 }
 
-func (m *mockRequestTransport) Request(payload []byte, timeout time.Duration) ([]byte, error) {
+func (m *mockRequestTransport) Request(ctx context.Context, payload []byte) ([]byte, error) {
 	m.mu.Lock()
 	delay := m.delay
 	m.mu.Unlock()
 
 	if delay > 0 {
-		if delay > timeout {
+		deadline, hasDeadline := ctx.Deadline()
+		if hasDeadline && time.Until(deadline) < delay {
 			return nil, errors.New("timeout")
 		}
 		time.Sleep(delay)
@@ -121,13 +112,7 @@ type fakeStreamTransport struct {
 	id int // Make non-zero-sized so each instance gets unique address
 }
 
-func (f *fakeStreamTransport) Send(payload []byte) error { return nil }
-func (f *fakeStreamTransport) SendWithTimeout(payload []byte, timeout time.Duration) error {
-	return nil
-}
-func (f *fakeStreamTransport) Receive() ([]byte, error) { return nil, nil }
-func (f *fakeStreamTransport) ReceiveWithTimeout(timeout time.Duration) ([]byte, error) {
-	return nil, nil
-}
-func (f *fakeStreamTransport) Close() error       { return nil }
-func (f *fakeStreamTransport) RemoteAddr() string { return "fake:1234" }
+func (f *fakeStreamTransport) Send(ctx context.Context, payload []byte) error { return nil }
+func (f *fakeStreamTransport) Receive(ctx context.Context) ([]byte, error)    { return nil, nil }
+func (f *fakeStreamTransport) Close() error                                   { return nil }
+func (f *fakeStreamTransport) RemoteAddr() string                             { return "fake:1234" }

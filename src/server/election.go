@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"kvgo/protocol"
@@ -238,7 +239,9 @@ func (s *Server) requestVote(peerID string, payload []byte, timeout time.Duratio
 		return 0, false, fmt.Errorf("get peer %s: %w", peerID, err)
 	}
 
-	respPayload, err := t.Request(payload, timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	respPayload, err := t.Request(ctx, payload)
 	if err != nil {
 		return 0, false, fmt.Errorf("request to %s: %w", peerID, err)
 	}

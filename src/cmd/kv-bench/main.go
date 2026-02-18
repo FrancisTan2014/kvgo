@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"kvgo/protocol"
@@ -107,12 +108,16 @@ func runWorker(id int, keys []string, values [][]byte, st *stats) {
 			continue
 		}
 
-		if err := t.SendWithTimeout(payload, *timeout); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+
+		if err := t.Send(ctx, payload); err != nil {
+			cancel()
 			errs++
 			continue
 		}
 
-		respPayload, err := t.ReceiveWithTimeout(*timeout)
+		respPayload, err := t.Receive(ctx)
+		cancel()
 		if err != nil {
 			errs++
 			continue
