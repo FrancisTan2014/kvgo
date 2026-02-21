@@ -112,7 +112,7 @@ func (s *Server) relocate(primaryAddr string) error {
 
 // teardownReplicationState tears down all replication state: replica send channels,
 // transports, replication loop, primary transport, and backlog trimmer.
-// Used by both relocate (role change) and monitorFence (quorum loss).
+// Used by both relocate (role change) and fenceLoop (quorum loss).
 // Caller must NOT hold connMu.
 func (s *Server) teardownReplicationState() {
 	s.connMu.Lock()
@@ -400,8 +400,6 @@ func (s *Server) evaluateVoteLocked(vr protocol.VoteRequestValue) (protocol.Resp
 // ---------------------------------------------------------------------------
 // Periodic Reconciliation
 // ---------------------------------------------------------------------------
-
-const reconcileInterval = 3 * time.Second
 
 // reconcileLoop runs while the server is alive. When leader, it periodically
 // sends REPLICAOF to peers that haven't connected as replicas — ensuring

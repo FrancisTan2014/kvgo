@@ -14,8 +14,6 @@ import (
 	"time"
 )
 
-const electionTimeout = 10 * heartbeatInterval
-
 // randomElectionTimeout returns a randomized duration in [electionTimeout, 2*electionTimeout).
 // Jitter prevents multiple followers from timing out simultaneously (split vote).
 func randomElectionTimeout() time.Duration {

@@ -5,13 +5,6 @@ import (
 	"time"
 )
 
-const (
-	DefaultBacklogSizeLimit    = 16 * 1024 * 1024
-	DefaultBacklogTrimDuration = 100 * time.Millisecond
-	MinBacklogSize             = 1 * 1024 * 1024
-	TrimRatioThreshold         = 2
-)
-
 type backlogEntry struct {
 	size    int
 	seq     uint64

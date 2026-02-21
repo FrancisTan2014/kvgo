@@ -124,10 +124,10 @@ func TestRegression_RedirectCycleDetection(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Regression: post-fence election disruption (#3)
 //
-// After CheckQuorum fires, monitorHeartbeat sees stale lastHeartbeat and
+// After CheckQuorum fires, heartbeatLoop sees stale lastHeartbeat and
 // immediately triggers becomeCandidate(), which cancels the replication loop
 // before it can connect to the new leader.
-// Fix: set fenced=true on quorum-loss step-down; monitorHeartbeat skips
+// Fix: set fenced=true on quorum-loss step-down; heartbeatLoop skips
 // election while fenced; handlePing clears fenced on real leader contact.
 // ---------------------------------------------------------------------------
 
@@ -139,7 +139,7 @@ func TestRegression_FencedSupressesElection(t *testing.T) {
 	s.term.Store(5)
 	s.fenced.Store(true)
 
-	// With fenced=true, monitorHeartbeat should skip the election even though
+	// With fenced=true, heartbeatLoop should skip the election even though
 	// lastHeartbeat is ancient. We verify the flag check directly.
 	if !s.fenced.Load() {
 		t.Fatal("fenced should be true")
@@ -227,78 +227,26 @@ func TestRegression_RelocateInitsPrimarySeq(t *testing.T) {
 //
 // context.WithTimeout(ctx, 0) creates an already-expired context, breaking
 // ALL streaming writes and heartbeat PINGs. Only full sync on reconnect worked.
-// Fix: check WriteTimeout > 0 before using WithTimeout; use Background() when 0.
-// Also added pingTimeout() returning 500ms when ReadTimeout=0.
+// Original fix: guard WriteTimeout > 0. Current fix: applyDefaults guarantees
+// positive timeouts, so the guard is no longer needed.
 // ---------------------------------------------------------------------------
 
-func TestRegression_WriteTimeoutZeroValidContext(t *testing.T) {
-	tr := &errorStreamTransport{failAfter: 999}
-	rc := &replicaConn{
-		transport:  tr,
-		sendCh:     make(chan []byte, replicaSendBuffer),
-		hb:         time.NewTicker(time.Hour),
-		listenAddr: "test:1",
-		nodeID:     "n1",
+func TestRegression_ApplyDefaultsGuaranteesTimeouts(t *testing.T) {
+	opts := Options{}
+	opts.applyDefaults()
+
+	if opts.ReadTimeout <= 0 {
+		t.Errorf("applyDefaults left ReadTimeout=%v, want >0", opts.ReadTimeout)
 	}
-	rc.connected.Store(true)
-
-	s := &Server{
-		replicas:    make(map[string]*replicaConn),
-		opts:        Options{Logger: noopLogger, WriteTimeout: 0}, // zero!
-		peerManager: NewPeerManager(nil, noopLogger),
-	}
-	s.role.Store(uint32(RoleLeader))
-	s.replicas["n1"] = rc
-
-	done := make(chan struct{})
-	go func() {
-		s.serveReplicaWriter(rc)
-		close(done)
-	}()
-
-	// Send a payload — with the bug, context.WithTimeout(ctx, 0) would expire
-	// immediately and Send would fail. With the fix, it uses Background().
-	payload := []byte("test-data")
-	rc.sendCh <- payload
-
-	// Give writer time to process
-	time.Sleep(50 * time.Millisecond)
-
-	// Writer should still be running (not crashed from expired context)
-	select {
-	case <-done:
-		// Writer exited — check if transport saw any sends
-		tr.mu.Lock()
-		count := tr.sendCount
-		tr.mu.Unlock()
-		if count == 0 {
-			t.Error("writer exited without sending — WriteTimeout=0 likely created expired context")
-		}
-	default:
-		// Still running — good, close channel to clean up
-		close(rc.sendCh)
-		<-done
+	if opts.WriteTimeout <= 0 {
+		t.Errorf("applyDefaults left WriteTimeout=%v, want >0", opts.WriteTimeout)
 	}
 }
 
-func TestRegression_PingTimeoutFallback(t *testing.T) {
-	tests := []struct {
-		name        string
-		readTimeout time.Duration
-		want        time.Duration
-	}{
-		{"zero returns 500ms", 0, 500 * time.Millisecond},
-		{"non-zero returns ReadTimeout", 2 * time.Second, 2 * time.Second},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := &Server{opts: Options{ReadTimeout: tt.readTimeout}}
-			got := s.pingTimeout()
-			if got != tt.want {
-				t.Errorf("pingTimeout() = %v, want %v", got, tt.want)
-			}
-		})
+func TestRegression_PingTimeoutReturnsReadTimeout(t *testing.T) {
+	s := &Server{opts: Options{ReadTimeout: 2 * time.Second}}
+	if got := s.pingTimeout(); got != 2*time.Second {
+		t.Errorf("pingTimeout() = %v, want 2s", got)
 	}
 }
 

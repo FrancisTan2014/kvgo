@@ -14,10 +14,6 @@ import (
 	"time"
 )
 
-const replicaSendBuffer = 1024 // max queued writes per replica
-const heartbeatInterval = 200 * time.Millisecond
-const retryInterval = 100 * time.Millisecond
-
 // errRedirect is returned by connectToPrimary when the contacted node
 // is a follower and redirects us to the actual leader.
 type errRedirect struct {
@@ -334,13 +330,7 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 				// Channel closed
 				return
 			}
-			var sendCtx context.Context
-			var sendCancel context.CancelFunc
-			if s.opts.WriteTimeout > 0 {
-				sendCtx, sendCancel = context.WithTimeout(context.Background(), s.opts.WriteTimeout)
-			} else {
-				sendCtx, sendCancel = context.Background(), func() {}
-			}
+			sendCtx, sendCancel := context.WithTimeout(context.Background(), s.opts.WriteTimeout)
 			err := rc.transport.Send(sendCtx, payload)
 			sendCancel()
 			if err != nil {

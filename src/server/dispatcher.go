@@ -78,11 +78,7 @@ func (s *Server) writeResponse(t transport.StreamTransport, resp protocol.Respon
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	if s.opts.WriteTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.opts.WriteTimeout)
-		defer cancel()
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.WriteTimeout)
+	defer cancel()
 	return t.Send(ctx, payload)
 }

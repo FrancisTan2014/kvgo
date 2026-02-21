@@ -18,11 +18,6 @@ import (
 	"time"
 )
 
-const (
-	defaultHost    = "127.0.0.1" // localhost only; override with Options.Host
-	defaultNetwork = NetworkTCP
-)
-
 // Consistency Model
 //
 // Replication is async, fire-and-forget with no delivery guarantees.
@@ -33,21 +28,6 @@ const (
 // We accept this trade-off to keep the system simple and fast (following Redis).
 //
 // Sequence numbers provide visibility into replication lag but do not fix it.
-
-// Supported network types for Options.Network.
-const (
-	NetworkTCP  = "tcp"
-	NetworkTCP4 = "tcp4"
-	NetworkTCP6 = "tcp6"
-	NetworkUnix = "unix"
-)
-
-var supportedNetworks = map[string]bool{
-	NetworkTCP:  true,
-	NetworkTCP4: true,
-	NetworkTCP6: true,
-	NetworkUnix: true,
-}
 
 var (
 	ErrAlreadyStarted = errors.New("server: already started")
@@ -170,29 +150,7 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.Network == NetworkUnix && opts.Host == "" {
 		return nil, fmt.Errorf("server: Host (socket path) is required for %s network", NetworkUnix)
 	}
-	if opts.MaxFrameSize <= 0 {
-		// Default to protocol DefaultMaxFrameSize, but keep it local to avoid
-		// pulling protocol into the server config.
-		opts.MaxFrameSize = 16 << 20
-	}
-	if opts.BacklogSizeLimit <= 0 {
-		opts.BacklogSizeLimit = 16 << 20 // 16MB
-	}
-	if opts.BacklogTrimDuration <= 0 {
-		opts.BacklogTrimDuration = 100 * time.Millisecond
-	}
-	if opts.QuorumWriteTimeout <= 0 {
-		opts.QuorumWriteTimeout = 500 * time.Millisecond
-	}
-	if opts.QuorumReadTimeout <= 0 {
-		opts.QuorumReadTimeout = 500 * time.Millisecond
-	}
-	if opts.ReplicaStaleHeartbeat <= 0 {
-		opts.ReplicaStaleHeartbeat = 1 * time.Second
-	}
-	if opts.ReplicaStaleLag <= 0 {
-		opts.ReplicaStaleLag = 1000
-	}
+	opts.applyDefaults()
 
 	s := &Server{
 		opts:            opts,
@@ -304,22 +262,19 @@ func (s *Server) Start() (err error) {
 	}
 
 	s.lock, s.ln = lock, ln
+
 	go s.acceptLoop()
 	go s.monitorDBHealth()
-	go s.monitorHeartbeat()
-	go s.monitorFence()
+	go s.heartbeatLoop()
+	go s.fenceLoop()
 	go s.reconcileLoop()
+
 	return nil
 }
 
 // pingTimeout returns the timeout for heartbeat pings.
-// Falls back to 500ms when ReadTimeout is 0 (no timeout) to avoid
-// context.WithTimeout(ctx, 0) creating an already-expired context.
 func (s *Server) pingTimeout() time.Duration {
-	if s.opts.ReadTimeout > 0 {
-		return s.opts.ReadTimeout
-	}
-	return 500 * time.Millisecond
+	return s.opts.ReadTimeout
 }
 
 func (s *Server) network() string {
