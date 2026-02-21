@@ -1,7 +1,7 @@
 package server
 
 import (
-	"kvgo/transport"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -25,12 +25,12 @@ func TestComputeReplicaAcksNeeded(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				replicas: make(map[transport.StreamTransport]*replicaConn),
+				replicas: make(map[string]*replicaConn),
 			}
-			// Populate fake replicas with distinct pointers
-			fakeConns := make([]fakeStreamTransport, tt.replicas)
+			// Populate fake replicas with distinct keys
 			for i := 0; i < tt.replicas; i++ {
-				s.replicas[&fakeConns[i]] = &replicaConn{}
+				nodeID := "node" + strconv.Itoa(i)
+				s.replicas[nodeID] = &replicaConn{nodeID: nodeID}
 			}
 
 			got := s.computeReplicaAcksNeeded()

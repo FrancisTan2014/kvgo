@@ -18,6 +18,16 @@ import (
 // ACKs arrive via the peer channel (Request), so we respond with OK.
 // Uses per-request locking to avoid global serialization across concurrent writes.
 func (s *Server) handleAck(ctx *RequestContext) error {
+	senderId := string(ctx.Request.Value)
+	if ctx.Request.RequestId == "" || senderId == "" {
+		s.log().Warn("ACK missing required fields",
+			"request_id", ctx.Request.RequestId,
+			"sender_id", senderId)
+		return s.responseStatusError(ctx)
+	}
+
+	s.markReplicaActive(senderId)
+
 	// Fast path: lookup state with read lock
 	s.quorumMu.RLock()
 	state, ok := s.quorumWrites[ctx.Request.RequestId]
@@ -34,16 +44,15 @@ func (s *Server) handleAck(ctx *RequestContext) error {
 	defer state.mu.Unlock()
 
 	// Check if this specific replica already ACK'd (deduplication)
-	remoteAddr := ctx.StreamTransport.RemoteAddr()
-	if _, alreadyAcked := state.ackedReplicas[remoteAddr]; alreadyAcked {
+	if _, alreadyAcked := state.ackedReplicas[senderId]; alreadyAcked {
 		s.log().Debug("duplicate ACK from same replica ignored",
 			"request_id", ctx.Request.RequestId,
-			"replica", remoteAddr)
+			"replica", senderId)
 		return s.responseStatusOk(ctx)
 	}
 
 	// Mark this replica as having ACK'd
-	state.ackedReplicas[remoteAddr] = struct{}{}
+	state.ackedReplicas[senderId] = struct{}{}
 	state.ackCount++
 
 	if state.ackCount >= int32(state.needed) {
@@ -55,10 +64,31 @@ func (s *Server) handleAck(ctx *RequestContext) error {
 	return s.responseStatusOk(ctx)
 }
 
+// markReplicaActive marks a replica as recently active for CheckQuorum.
+func (s *Server) markReplicaActive(nodeID string) {
+	s.connMu.RLock()
+	rc, exists := s.replicas[nodeID]
+	s.connMu.RUnlock()
+
+	if exists {
+		rc.recentActive.Store(true)
+	}
+}
+
 // handleNack processes NACK messages from replicas for failed quorum writes.
 // NACKs arrive via the peer channel (Request), so we respond with OK.
 // NACK triggers immediate failure without waiting for timeout.
 func (s *Server) handleNack(ctx *RequestContext) error {
+	senderId := string(ctx.Request.Value)
+	if ctx.Request.RequestId == "" || senderId == "" {
+		s.log().Warn("NACK missing required fields",
+			"request_id", ctx.Request.RequestId,
+			"sender_id", senderId)
+		return s.responseStatusError(ctx)
+	}
+
+	s.markReplicaActive(senderId)
+
 	// Fast path: lookup state with read lock
 	s.quorumMu.RLock()
 	state, ok := s.quorumWrites[ctx.Request.RequestId]
@@ -75,20 +105,19 @@ func (s *Server) handleNack(ctx *RequestContext) error {
 	defer state.mu.Unlock()
 
 	// Check if this specific replica already responded (deduplication)
-	remoteAddr := ctx.StreamTransport.RemoteAddr()
-	if _, alreadyProcessed := state.ackedReplicas[remoteAddr]; alreadyProcessed {
+	if _, alreadyProcessed := state.ackedReplicas[senderId]; alreadyProcessed {
 		s.log().Debug("duplicate NACK from same replica ignored",
 			"request_id", ctx.Request.RequestId,
-			"replica", remoteAddr)
+			"replica", senderId)
 		return s.responseStatusOk(ctx)
 	}
 
 	// Mark this replica as having responded
-	state.ackedReplicas[remoteAddr] = struct{}{}
+	state.ackedReplicas[senderId] = struct{}{}
 
 	s.log().Warn("replica NACK'd write",
 		"request_id", ctx.Request.RequestId,
-		"replica", remoteAddr)
+		"replica", senderId)
 
 	// NACK means this replica failed - can't reach quorum
 	// Close channel to fail fast instead of waiting for timeout
@@ -178,9 +207,9 @@ func (s *Server) processPrimaryPut(ctx *RequestContext) error {
 }
 
 func (s *Server) computeReplicaAcksNeeded() int {
-	s.connectionMu.Lock()
+	s.connMu.Lock()
 	totalNodes := len(s.replicas) + 1 // +1 for primary itself
-	s.connectionMu.Unlock()
+	s.connMu.Unlock()
 	quorum := utils.ComputeQuorum(totalNodes)
 	return quorum - 1 // Primary doesn't ACK itself, only count replica ACKs
 }

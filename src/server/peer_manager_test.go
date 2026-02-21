@@ -10,10 +10,10 @@ import (
 	"testing"
 )
 
-func TestPeerManager_SavePeers(t *testing.T) {
+func TestPeerManager_MergePeers(t *testing.T) {
 	t.Run("adds new peers lazily", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "a:1"},
 			{NodeID: "n2", Addr: "b:2"},
 			{NodeID: "n3", Addr: "c:3"},
@@ -38,13 +38,13 @@ func TestPeerManager_SavePeers(t *testing.T) {
 		}
 	})
 
-	t.Run("removes absent peers and closes transport", func(t *testing.T) {
+	t.Run("retains absent peers without closing transport", func(t *testing.T) {
 		closed := false
 		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
 			return &mockRequestTransport{address: addr}, nil
 		}, noopLogger)
 
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "a:1"},
 			{NodeID: "n2", Addr: "b:2"},
 		})
@@ -56,34 +56,35 @@ func TestPeerManager_SavePeers(t *testing.T) {
 		pm.peers["n1"].transport = &closeTrackingTransport{closed: &closed}
 		pm.mu.Unlock()
 
-		// New topology drops n1
-		pm.SavePeers([]PeerInfo{{NodeID: "n2", Addr: "b:2"}})
+		// New topology drops n1 — but MergePeers retains it
+		pm.MergePeers([]PeerInfo{{NodeID: "n2", Addr: "b:2"}})
 
-		if !closed {
-			t.Error("removed peer transport not closed")
+		if closed {
+			t.Error("retained peer transport should not be closed")
 		}
 		ids := pm.NodeIDs()
-		if len(ids) != 1 || ids[0] != "n2" {
-			t.Errorf("ids = %v, want [n2]", ids)
+		sort.Strings(ids)
+		if len(ids) != 2 || ids[0] != "n1" || ids[1] != "n2" {
+			t.Errorf("ids = %v, want [n1 n2]", ids)
 		}
 	})
 
-	t.Run("nil topology clears all peers", func(t *testing.T) {
+	t.Run("nil topology is a no-op", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "a:1"},
 			{NodeID: "n2", Addr: "b:2"},
 		})
-		pm.SavePeers(nil)
+		pm.MergePeers(nil)
 
-		if len(pm.NodeIDs()) != 0 {
-			t.Errorf("len = %d, want 0 after nil topology", len(pm.NodeIDs()))
+		if len(pm.NodeIDs()) != 2 {
+			t.Errorf("len = %d, want 2 after nil topology (no-op)", len(pm.NodeIDs()))
 		}
 	})
 
 	t.Run("skips entries with empty nodeID or addr", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "a:1"},
 			{NodeID: "", Addr: "b:2"},
 			{NodeID: "n3", Addr: ""},
@@ -102,14 +103,14 @@ func TestPeerManager_SavePeers(t *testing.T) {
 			return &mockRequestTransport{address: addr}, nil
 		}, noopLogger)
 
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "a:1"},
 			{NodeID: "n2", Addr: "b:2"},
 		})
 		t1, _ := pm.Get("n1")
 
 		// Same topology again
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "a:1"},
 			{NodeID: "n2", Addr: "b:2"},
 		})
@@ -123,7 +124,7 @@ func TestPeerManager_SavePeers(t *testing.T) {
 
 func TestPeerManager_Addr(t *testing.T) {
 	pm := NewPeerManager(nil, noopLogger)
-	pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
+	pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
 
 	addr, ok := pm.Addr("n1")
 	if !ok || addr != "a:1" {
@@ -144,7 +145,7 @@ func TestPeerManager_AnyAddr(t *testing.T) {
 		t.Error("AnyAddr on empty should return false")
 	}
 
-	pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
+	pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
 	addr, ok := pm.AnyAddr()
 	if !ok || addr != "a:1" {
 		t.Errorf("AnyAddr = (%q, %v), want (a:1, true)", addr, ok)
@@ -160,7 +161,7 @@ func TestPeerManager_PeerInfos(t *testing.T) {
 		t.Errorf("PeerInfos on empty = %d, want 0", len(infos))
 	}
 
-	pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
+	pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
 	infos = pm.PeerInfos()
 	if len(infos) != 2 {
 		t.Fatalf("PeerInfos = %d, want 2", len(infos))
@@ -184,9 +185,9 @@ func TestPeerManager_Get(t *testing.T) {
 			return &mockRequestTransport{address: addr}, nil
 		}, noopLogger)
 
-		pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
+		pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
 		if dialCount != 0 {
-			t.Fatalf("dial called on SavePeers, count = %d", dialCount)
+			t.Fatalf("dial called on MergePeers, count = %d", dialCount)
 		}
 
 		t1, err := pm.Get("n1")
@@ -223,7 +224,7 @@ func TestPeerManager_Get(t *testing.T) {
 			return nil, errors.New("connection refused")
 		}, noopLogger)
 
-		pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
+		pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
 		_, err := pm.Get("n1")
 		if err == nil {
 			t.Error("expected dial error")
@@ -236,7 +237,7 @@ func TestPeerManager_Snapshot(t *testing.T) {
 		return &mockRequestTransport{address: addr}, nil
 	}, noopLogger)
 
-	pm.SavePeers([]PeerInfo{
+	pm.MergePeers([]PeerInfo{
 		{NodeID: "n1", Addr: "a:1"},
 		{NodeID: "n2", Addr: "b:2"},
 		{NodeID: "n3", Addr: "c:3"},
@@ -277,7 +278,7 @@ func TestPeerManager_Close(t *testing.T) {
 		}, nil
 	}, noopLogger)
 
-	pm.SavePeers([]PeerInfo{
+	pm.MergePeers([]PeerInfo{
 		{NodeID: "n1", Addr: "a:1"},
 		{NodeID: "n2", Addr: "b:2"},
 	})
@@ -306,14 +307,14 @@ func TestPeerManager_ConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	n := 50
 
-	// Concurrent SavePeers + Get + NodeIDs
+	// Concurrent MergePeers + Get + NodeIDs
 	wg.Add(n * 3)
 	for i := 0; i < n; i++ {
 		nodeID := fmt.Sprintf("node%d", i)
 		addr := fmt.Sprintf("peer%d:1234", i)
 		go func() {
 			defer wg.Done()
-			pm.SavePeers([]PeerInfo{{NodeID: nodeID, Addr: addr}})
+			pm.MergePeers([]PeerInfo{{NodeID: nodeID, Addr: addr}})
 		}()
 		go func() {
 			defer wg.Done()

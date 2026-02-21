@@ -2,6 +2,7 @@ package server
 
 import (
 	"kvgo/protocol"
+	"kvgo/utils"
 	"time"
 )
 
@@ -48,6 +49,7 @@ func (s *Server) handlePing(ctx *RequestContext) error {
 
 	s.lastHeartbeat = time.Now()
 	s.primarySeq = req.Seq
+	s.fenced.Store(false) // connected to a real leader, safe to participate in elections again
 
 	return s.respondPong(ctx, s.term.Load())
 }
@@ -81,9 +83,15 @@ func (s *Server) processPongResponse(respPayload []byte, rc *replicaConn) {
 			s.log().Error("failed to persist state after step-down", "error", err)
 		}
 		s.roleMu.Unlock()
-		s.becomeFollower()
 
 		// After stepping down, reconnect to the cluster via any known peer.
+		// Set lastHeartbeat first to suppress monitorHeartbeat election trigger
+		// while the replication loop connects.
+		if wasLeader {
+			s.lastHeartbeat = time.Now()
+		}
+		s.becomeFollower()
+
 		if wasLeader {
 			if addr, ok := s.peerManager.AnyAddr(); ok {
 				go func() {
@@ -123,9 +131,71 @@ func (s *Server) monitorHeartbeat() {
 		case <-s.ctx.Done():
 			return
 		case <-time.After(heartbeatInterval):
+			if s.fenced.Load() {
+				continue // fenced node must not trigger elections; wait for leader contact
+			}
 			if time.Since(s.lastHeartbeat) >= randomElectionTimeout() {
 				_ = s.becomeCandidate() // follower → candidate, or candidate retries with new term
 			}
 		}
 	}
+}
+
+func (s *Server) monitorFence() {
+	for {
+		if !s.isLeader() {
+			ch := s.getRoleChangedCh()
+			select {
+			case <-ch: // woken by role change
+				continue
+			case <-s.ctx.Done():
+				return
+			}
+		}
+
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(randomElectionTimeout()):
+			if s.fenceDetected() {
+				s.log().Warn("fence detected: lost quorum, stepping down")
+				// Suppress monitorHeartbeat election trigger while we reconnect.
+				// Without this, the stale lastHeartbeat causes an immediate election
+				// that cancels our replication loop before it can connect.
+				s.lastHeartbeat = time.Now()
+				s.fenced.Store(true)
+				if addr, ok := s.peerManager.AnyAddr(); ok {
+					if err := s.relocate(addr); err != nil {
+						s.log().Error("fence relocate failed", "addr", addr, "error", err)
+					}
+				} else {
+					s.log().Error("fence detected but no peers available")
+					s.primarySeq = s.lastSeq.Load() // prevent false staleness
+					s.becomeFollower()
+					s.teardownReplicationState()
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) fenceDetected() bool {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
+
+	if len(s.replicas) == 0 {
+		// standalone primary — quorum check not applicable
+		return false
+	}
+
+	activeReplicas := 1 // self
+	for _, rc := range s.replicas {
+		if rc.recentActive.Load() {
+			activeReplicas++
+		}
+		rc.recentActive.Store(false)
+	}
+
+	quorum := utils.ComputeQuorum(len(s.replicas) + 1)
+	return activeReplicas < quorum
 }

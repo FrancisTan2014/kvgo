@@ -398,7 +398,13 @@ func TestHandleVoteRequest(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
 				votedFor: tt.myVotedFor,
+				opts:     Options{DataDir: t.TempDir()},
 			}
+			defer func() {
+				if s.metaFile != nil {
+					s.metaFile.Close()
+				}
+			}()
 			s.term.Store(tt.myTerm)
 			s.lastSeq.Store(tt.myLastSeq)
 			s.role.Store(uint32(tt.myRole))

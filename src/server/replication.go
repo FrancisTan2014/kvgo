@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,14 +30,16 @@ func (e *errRedirect) Error() string {
 
 // replicaConn manages a single replica connection with a dedicated write goroutine.
 type replicaConn struct {
-	transport  transport.StreamTransport
-	sendCh     chan []byte  // buffered channel for outgoing writes
-	lastReplid string       // primary replid this replica last followed
-	lastSeq    uint64       // last seq reported by this replica on connect
-	hb         *time.Ticker // heartbeat ticker
-	lastWrite  time.Time
-	nodeID     string // replica's unique identity (persisted, stable across restarts)
-	listenAddr string // replica's advertised listen address (for topology broadcast)
+	transport    transport.StreamTransport
+	sendCh       chan []byte  // buffered channel for outgoing writes
+	lastReplid   string       // primary replid this replica last followed
+	lastSeq      uint64       // last seq reported by this replica on connect
+	hb           *time.Ticker // heartbeat ticker
+	lastWrite    time.Time
+	nodeID       string // replica's unique identity (persisted, stable across restarts)
+	listenAddr   string // replica's advertised listen address (for topology broadcast)
+	connected    atomic.Bool
+	recentActive atomic.Bool // marked on PONG/ACK/NACK; reset each CheckQuorum tick
 }
 
 func newReplicaConn(t transport.StreamTransport, replicaLastSeq uint64, lastReplid, nodeID, listenAddr string) *replicaConn {
@@ -61,12 +64,13 @@ func (s *Server) startReplicationLoop() {
 	s.replCtx, s.replCancel = context.WithCancel(s.ctx)
 	ctx := s.replCtx
 
-	s.wg.Go(func() {
+	s.connWg.Go(func() {
 		s.replicationLoop(ctx)
 	})
 }
 
 func (s *Server) replicationLoop(ctx context.Context) {
+	var lastRedirFrom string // detect redirect cycles (A→B→A→B)
 	for {
 		select {
 		case <-ctx.Done():
@@ -83,11 +87,32 @@ func (s *Server) replicationLoop(ctx context.Context) {
 		if err != nil {
 			var redir *errRedirect
 			if errors.As(err, &redir) {
+				if redir.addr == s.listenAddr() {
+					s.log().Warn("redirect points to self, backing off")
+					lastRedirFrom = ""
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(retryInterval):
+					}
+					continue
+				}
+				// Detect redirect cycle: A redirects to B, B redirects to A.
+				// Back off to avoid tight loop while peers resolve elections.
+				cycle := lastRedirFrom == redir.addr
+				lastRedirFrom = s.opts.ReplicaOf
 				s.log().Info("redirected to new primary", "address", redir.addr)
-				s.connectionMu.Lock()
+				s.connMu.Lock()
 				s.opts.ReplicaOf = redir.addr
-				s.connectionMu.Unlock()
-				continue // retry immediately, no backoff
+				s.connMu.Unlock()
+				if cycle {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(retryInterval):
+					}
+				}
+				continue
 			}
 
 			s.log().Warn("connect failed", "error", err)
@@ -101,6 +126,7 @@ func (s *Server) replicationLoop(ctx context.Context) {
 			continue
 		}
 
+		lastRedirFrom = ""
 		s.receiveFromPrimary(f) // blocks until disconnect or cancel
 	}
 }
@@ -164,10 +190,10 @@ func (s *Server) connectToPrimary() (transport.StreamTransport, error) {
 
 	s.log().Info("replication handshake complete")
 
-	s.connectionMu.Lock()
+	s.connMu.Lock()
 	s.primary = st
 	s.lastHeartbeat = time.Now() // Initialize heartbeat timer on successful connection
-	s.connectionMu.Unlock()
+	s.connMu.Unlock()
 
 	return st, nil
 }
@@ -191,10 +217,14 @@ func (s *Server) receiveFromPrimary(t transport.StreamTransport) {
 
 // forwardToReplicas sends a write to all connected replicas (non-blocking).
 func (s *Server) forwardToReplicas(payload []byte, seq uint64) {
-	s.connectionMu.Lock()
-	defer s.connectionMu.Unlock()
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
 
 	for _, rc := range s.replicas {
+		if !rc.connected.Load() {
+			continue
+		}
+
 		select {
 		case rc.sendCh <- payload:
 			// queued
@@ -233,21 +263,23 @@ func (s *Server) serveReplica(rc *replicaConn) bool {
 		s.partialSync(rc)
 	}
 
+	// Mark connected only after sync completes — writes forwarded before this point go direct
+	rc.connected.Store(true)
+
 	// Spawn writer goroutine to handle async write forwarding + heartbeats
-	s.wg.Go(func() {
+	s.connWg.Go(func() {
 		s.serveReplicaWriter(rc)
 	})
 
-	// Broadcast updated topology so all replicas (including new one) learn peers.
 	s.broadcastTopology()
 
 	return true
 }
 
 func (s *Server) addNewReplica(rc *replicaConn) {
-	s.connectionMu.Lock()
-	s.replicas[rc.transport] = rc
-	s.connectionMu.Unlock()
+	s.connMu.Lock()
+	s.replicas[rc.nodeID] = rc
+	s.connMu.Unlock()
 }
 
 func (s *Server) respondSyncMode(rc *replicaConn) (bool, error) {
@@ -276,13 +308,20 @@ func (s *Server) respondSyncMode(rc *replicaConn) (bool, error) {
 // Runs in a dedicated goroutine until connection closes or channel is closed.
 func (s *Server) serveReplicaWriter(rc *replicaConn) {
 	s.log().Info("serveReplicaWriter started", "replica", rc.listenAddr)
+
+	// snapshot for `defer`, in-case we close the reconnected replica connection
+	t := rc.transport
+	reconnecting := false
+
 	defer rc.hb.Stop()
 	defer func() {
+		if reconnecting {
+			// Channel closed by updateReplicaConn — it owns cleanup
+			return
+		}
 		// Clean up: remove from replicas map and close connection.
-		s.connectionMu.Lock()
-		delete(s.replicas, rc.transport)
-		s.connectionMu.Unlock()
-		_ = rc.transport.Close()
+		rc.connected.Store(false)
+		_ = t.Close()
 		s.broadcastTopology()
 		s.log().Info("replica disconnected", "replica", rc.listenAddr)
 	}()
@@ -291,10 +330,17 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 		select {
 		case payload, ok := <-rc.sendCh:
 			if !ok {
-				// Channel closed - replica removed
+				reconnecting = true
+				// Channel closed
 				return
 			}
-			sendCtx, sendCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			var sendCtx context.Context
+			var sendCancel context.CancelFunc
+			if s.opts.WriteTimeout > 0 {
+				sendCtx, sendCancel = context.WithTimeout(context.Background(), s.opts.WriteTimeout)
+			} else {
+				sendCtx, sendCancel = context.Background(), func() {}
+			}
 			err := rc.transport.Send(sendCtx, payload)
 			sendCancel()
 			if err != nil {
@@ -317,7 +363,7 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 					return
 				}
 
-				pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				pingCtx, pingCancel := context.WithTimeout(context.Background(), s.pingTimeout())
 				resp, err := rt.Request(pingCtx, ping)
 				pingCancel()
 				if err != nil {
@@ -325,6 +371,7 @@ func (s *Server) serveReplicaWriter(rc *replicaConn) {
 					return
 				}
 				rc.lastWrite = time.Now()
+				rc.recentActive.Store(true)
 
 				// Process PONG (encoded as Response with term in Value).
 				s.processPongResponse(resp, rc)
@@ -421,7 +468,7 @@ func (s *Server) restoreState() error {
 					}
 				}
 				if s.peerManager != nil {
-					s.peerManager.SavePeers(peers)
+					s.peerManager.MergePeers(peers)
 				}
 			}
 		}

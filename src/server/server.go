@@ -108,16 +108,16 @@ type Server struct {
 	lock *dataDirLock
 
 	// Connection management
-	connectionMu sync.RWMutex
-	wg           sync.WaitGroup
-	conns        map[transport.StreamTransport]struct{}
+	connMu sync.RWMutex
+	connWg sync.WaitGroup
+	conns  map[transport.StreamTransport]struct{}
 
 	// Request dispatch
 	requestHandlers map[protocol.Cmd]HandlerFunc
 
 	// Replication state (primary role)
 	seq      atomic.Uint64 // monotonic sequence number for writes
-	replicas map[transport.StreamTransport]*replicaConn
+	replicas map[string]*replicaConn
 	replid   string
 
 	// Replication state (replica role)
@@ -144,6 +144,7 @@ type Server struct {
 	role        atomic.Uint32
 	roleChanged chan struct{}
 	roleMu      sync.Mutex
+	fenced      atomic.Bool // set on quorum-loss step-down; cleared when connected to a real leader
 
 	// Partial resync backlog
 	backlog       list.List
@@ -197,7 +198,7 @@ func NewServer(opts Options) (*Server, error) {
 		opts:            opts,
 		conns:           make(map[transport.StreamTransport]struct{}),
 		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
-		replicas:        make(map[transport.StreamTransport]*replicaConn),
+		replicas:        make(map[string]*replicaConn),
 		lastHeartbeat:   time.Now(), // Initialize heartbeat timer (updated by PING messages)
 		quorumAckCh:     make(chan string),
 		quorumWrites:    make(map[string]*quorumWriteState),
@@ -306,7 +307,19 @@ func (s *Server) Start() (err error) {
 	go s.acceptLoop()
 	go s.monitorDBHealth()
 	go s.monitorHeartbeat()
+	go s.monitorFence()
+	go s.reconcileLoop()
 	return nil
+}
+
+// pingTimeout returns the timeout for heartbeat pings.
+// Falls back to 500ms when ReadTimeout is 0 (no timeout) to avoid
+// context.WithTimeout(ctx, 0) creating an already-expired context.
+func (s *Server) pingTimeout() time.Duration {
+	if s.opts.ReadTimeout > 0 {
+		return s.opts.ReadTimeout
+	}
+	return 500 * time.Millisecond
 }
 
 func (s *Server) network() string {
@@ -378,7 +391,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Wait for in-flight requests to finish, or context to cancel.
 	done := make(chan struct{})
 	go func() {
-		s.wg.Wait()
+		s.connWg.Wait()
 		close(done)
 	}()
 
@@ -419,17 +432,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) closeConnections() {
 	// Force close active connections to unblock handlers.
-	s.connectionMu.Lock()
+	s.connMu.Lock()
 	for c := range s.conns {
 		_ = c.Close()
 	}
-	if s.isLeader() {
-		for _, rc := range s.replicas {
-			close(rc.sendCh) // signal writer goroutine to exit
-			_ = rc.transport.Close()
-		}
+	for _, rc := range s.replicas {
+		rc.connected.Store(false) // gate off senders before closing channel
+		close(rc.sendCh)          // signal writer goroutine to exit
+		_ = rc.transport.Close()
 	}
-	s.connectionMu.Unlock()
+	s.connMu.Unlock()
 }
 
 func (s *Server) acceptLoop() {
@@ -442,15 +454,15 @@ func (s *Server) acceptLoop() {
 		// Wrap immediately in transport
 		t := transport.NewStreamTransport(s.opts.Protocol, conn)
 
-		s.connectionMu.Lock()
+		s.connMu.Lock()
 		s.conns[t] = struct{}{}
-		s.connectionMu.Unlock()
+		s.connMu.Unlock()
 
-		s.wg.Go(func() {
+		s.connWg.Go(func() {
 			takenOver := s.handleRequest(t, s.opts.ReadTimeout)
-			s.connectionMu.Lock()
+			s.connMu.Lock()
 			delete(s.conns, t)
-			s.connectionMu.Unlock()
+			s.connMu.Unlock()
 			if !takenOver {
 				_ = t.Close()
 			}
@@ -459,13 +471,13 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-func (s *Server) getReplicaSnapshot() map[transport.StreamTransport]*replicaConn {
-	s.connectionMu.RLock()
-	defer s.connectionMu.RUnlock()
+func (s *Server) getReplicaSnapshot() map[string]*replicaConn {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
 
-	snapshot := make(map[transport.StreamTransport]*replicaConn, len(s.replicas))
-	for st, rc := range s.replicas {
-		snapshot[st] = rc
+	snapshot := make(map[string]*replicaConn, len(s.replicas))
+	for id, rc := range s.replicas {
+		snapshot[id] = rc
 	}
 	return snapshot
 }

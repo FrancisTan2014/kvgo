@@ -38,50 +38,37 @@ func NewPeerManager(dial DialFunc, logger *slog.Logger) *PeerManager {
 	}
 }
 
-// SavePeers replaces the known topology. New peers are added lazily
-// (no dial until Get). Peers absent from topology are removed and
-// their transports closed. A nil or empty topology clears all peers.
-func (p *PeerManager) SavePeers(topology []PeerInfo) {
+// MergePeers upserts peers into the known topology. New peers are added lazily
+// (no dial until Get). Existing peers with changed addresses are re-dialed.
+// Peers absent from the incoming list are retained — historical nodes are never
+// removed by a topology update. A nil or empty topology is a no-op.
+func (p *PeerManager) MergePeers(topology []PeerInfo) {
+	if len(topology) == 0 {
+		return
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	incoming := make(map[string]string, len(topology)) // nodeID → addr
 	for _, pi := range topology {
 		if pi.NodeID == "" || pi.Addr == "" {
 			p.logger.Warn("peer manager: skipping peer with empty nodeID or addr")
 			continue
 		}
-		incoming[pi.NodeID] = pi.Addr
-	}
-
-	// Remove peers no longer in topology
-	for nodeID, entry := range p.peers {
-		if _, keep := incoming[nodeID]; keep {
-			continue
-		}
-		if entry.transport != nil {
-			_ = entry.transport.Close()
-		}
-		p.logger.Info("peer manager: removed peer", "node_id", nodeID, "addr", entry.addr)
-		delete(p.peers, nodeID)
-	}
-
-	// Add new peers (lazy — no transport yet); update addr if changed
-	for nodeID, addr := range incoming {
-		if existing, exists := p.peers[nodeID]; exists {
-			if existing.addr != addr {
+		if existing, exists := p.peers[pi.NodeID]; exists {
+			if existing.addr != pi.Addr {
 				// Address changed — close old transport so next Get re-dials
 				if existing.transport != nil {
 					_ = existing.transport.Close()
 				}
-				existing.addr = addr
+				existing.addr = pi.Addr
 				existing.transport = nil
-				p.logger.Info("peer manager: peer address updated", "node_id", nodeID, "addr", addr)
+				p.logger.Info("peer manager: peer address updated", "node_id", pi.NodeID, "addr", pi.Addr)
 			}
 			continue
 		}
-		p.logger.Info("peer manager: discovered peer", "node_id", nodeID, "addr", addr)
-		p.peers[nodeID] = &peerEntry{addr: addr}
+		p.logger.Info("peer manager: discovered peer", "node_id", pi.NodeID, "addr", pi.Addr)
+		p.peers[pi.NodeID] = &peerEntry{addr: pi.Addr}
 	}
 }
 

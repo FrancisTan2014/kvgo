@@ -2,7 +2,6 @@ package server
 
 import (
 	"kvgo/protocol"
-	"kvgo/transport"
 	"testing"
 )
 
@@ -176,7 +175,7 @@ func TestHandlerTakeoverFlag(t *testing.T) {
 func TestComputeReplicaAcksNeeded_EdgeCases(t *testing.T) {
 	// Create server with known replica count
 	s := &Server{
-		replicas: make(map[transport.StreamTransport]*replicaConn),
+		replicas: make(map[string]*replicaConn),
 	}
 
 	// Test with zero replicas

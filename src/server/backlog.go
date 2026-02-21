@@ -114,7 +114,7 @@ func (s *Server) startBacklogTrimmer() {
 
 	trimmerTicker := time.NewTicker(trimDuration)
 
-	s.wg.Go(func() {
+	s.connWg.Go(func() {
 		// Goroutine owns backlog lifecycle; clear on exit regardless of reason
 		defer trimmerTicker.Stop()
 		defer func() {

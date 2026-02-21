@@ -189,3 +189,24 @@ func ParseTopologyValue(value []byte) []TopologyEntry {
 	}
 	return entries
 }
+
+// ---------------------------------------------------------------------------
+// Ack/Nack (CmdAck, CmdNack)
+// Value = sender's nodeID
+// RequestId = quorum write request ID
+// ---------------------------------------------------------------------------
+
+// AckRequest holds the parsed fields from a CmdAck or CmdNack request.
+type AckRequest struct {
+	NodeID    string
+	RequestId string
+}
+
+// NewAckRequest builds a CmdAck or CmdNack request.
+func NewAckRequest(c Cmd, requestId string, nodeId string) Request {
+	return Request{
+		Cmd:       c,
+		Value:     []byte(nodeId),
+		RequestId: requestId,
+	}
+}

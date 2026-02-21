@@ -89,6 +89,10 @@ func (s *Server) isCandidate() bool {
 	return s.currentRole() == RoleCandidate
 }
 
+func (s *Server) isFollower() bool {
+	return s.currentRole() == RoleFollower
+}
+
 func (s *Server) becomeCandidate() bool {
 	cur := s.currentRole()
 	to := RoleCandidate

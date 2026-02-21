@@ -93,6 +93,7 @@ type Request struct {
 	//   CmdReplicate:    see NewReplicateRequest / ParseReplicateValue
 	//   CmdPing:         see NewPingRequest / ParsePingTerm
 	//   CmdReplicaOf:    primary address (host:port)
+	//   CmdAck, CmdNack: sender's nodeID (for recentActive tracking)
 	//   CmdTopology:     see NewTopologyRequest / ParseTopologyValue
 	//   CmdVoteRequest:  see NewVoteRequest / ParseVoteRequestValue
 	//   Others: unused (empty)

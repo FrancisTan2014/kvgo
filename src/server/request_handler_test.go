@@ -389,8 +389,13 @@ func TestHandlePing_TermFencing(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
 				lastHeartbeat: time.Now().Add(-1 * time.Hour),
-				opts:          Options{Logger: nil},
+				opts:          Options{Logger: nil, DataDir: t.TempDir()},
 			}
+			defer func() {
+				if s.metaFile != nil {
+					s.metaFile.Close()
+				}
+			}()
 			s.role.Store(uint32(tt.myRole))
 			s.term.Store(tt.myTerm)
 
@@ -488,9 +493,14 @@ func TestProcessPongResponse_TermFencing(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{
-				opts:        Options{Logger: nil},
+				opts:        Options{Logger: nil, DataDir: t.TempDir()},
 				peerManager: NewPeerManager(nil, noopLogger),
 			}
+			defer func() {
+				if s.metaFile != nil {
+					s.metaFile.Close()
+				}
+			}()
 			s.role.Store(uint32(tt.myRole))
 			s.term.Store(tt.myTerm)
 			s.roleChanged = make(chan struct{})
@@ -554,7 +564,7 @@ func TestRequestDispatch(t *testing.T) {
 func TestStoreRestoreState_Peers(t *testing.T) {
 	dir := t.TempDir()
 	pm := NewPeerManager(nil, noopLogger)
-	pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "10.0.0.1:4000"}, {NodeID: "n2", Addr: "10.0.0.2:4001"}})
+	pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "10.0.0.1:4000"}, {NodeID: "n2", Addr: "10.0.0.2:4001"}})
 
 	s := &Server{
 		opts:        Options{DataDir: dir},

@@ -2,7 +2,6 @@ package server
 
 import (
 	"kvgo/protocol"
-	"kvgo/transport"
 	"sort"
 	"testing"
 )
@@ -72,9 +71,9 @@ func TestHandleTopology(t *testing.T) {
 		}
 	})
 
-	t.Run("empty topology clears peers", func(t *testing.T) {
+	t.Run("empty topology retains existing peers", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		pm.SavePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
+		pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}, {NodeID: "n2", Addr: "b:2"}})
 
 		s := &Server{peerManager: pm, nodeID: "self"}
 
@@ -88,8 +87,8 @@ func TestHandleTopology(t *testing.T) {
 			t.Fatalf("handleTopology: %v", err)
 		}
 
-		if len(pm.NodeIDs()) != 0 {
-			t.Errorf("peers not cleared, got %v", pm.NodeIDs())
+		if len(pm.NodeIDs()) != 2 {
+			t.Errorf("peers should be retained, got %v", pm.NodeIDs())
 		}
 	})
 }
@@ -103,9 +102,9 @@ func TestBuildTopologyRequest(t *testing.T) {
 	t1 := &fakeStreamTransport{id: 1}
 	t2 := &fakeStreamTransport{id: 2}
 
-	replicas := map[transport.StreamTransport]*replicaConn{
-		t1: {transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001"},
-		t2: {transport: t2, nodeID: "n2", listenAddr: "10.0.0.2:5002"},
+	replicas := map[string]*replicaConn{
+		"n1": {transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001"},
+		"n2": {transport: t2, nodeID: "n2", listenAddr: "10.0.0.2:5002"},
 	}
 
 	req := s.buildTopologyRequest(replicas)
@@ -134,7 +133,7 @@ func TestBroadcastTopology(t *testing.T) {
 	t.Run("saves peers to primary peerManager", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
 		s := &Server{
-			replicas:    make(map[transport.StreamTransport]*replicaConn),
+			replicas:    make(map[string]*replicaConn),
 			nodeID:      "primary",
 			opts:        Options{Host: "10.0.0.100", Port: 4000},
 			peerManager: pm,
@@ -143,7 +142,7 @@ func TestBroadcastTopology(t *testing.T) {
 
 		ch1 := make(chan []byte, 1)
 		t1 := &fakeStreamTransport{id: 1}
-		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
+		s.replicas["n1"] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
 
 		s.broadcastTopology()
 
@@ -160,7 +159,7 @@ func TestBroadcastTopology(t *testing.T) {
 	t.Run("filters replicas with empty nodeID or listenAddr", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
 		s := &Server{
-			replicas:    make(map[transport.StreamTransport]*replicaConn),
+			replicas:    make(map[string]*replicaConn),
 			nodeID:      "primary",
 			opts:        Options{Host: "10.0.0.100", Port: 4000},
 			peerManager: pm,
@@ -174,9 +173,9 @@ func TestBroadcastTopology(t *testing.T) {
 		t2 := &fakeStreamTransport{id: 2}
 		t3 := &fakeStreamTransport{id: 3}
 
-		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
-		s.replicas[t2] = &replicaConn{transport: t2, nodeID: "", listenAddr: "10.0.0.2:5002", sendCh: ch2} // empty nodeID
-		s.replicas[t3] = &replicaConn{transport: t3, nodeID: "n3", listenAddr: "", sendCh: ch3}            // empty addr
+		s.replicas["n1"] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
+		s.replicas["no-id"] = &replicaConn{transport: t2, nodeID: "", listenAddr: "10.0.0.2:5002", sendCh: ch2} // empty nodeID
+		s.replicas["n3"] = &replicaConn{transport: t3, nodeID: "n3", listenAddr: "", sendCh: ch3}               // empty addr
 
 		s.broadcastTopology()
 
@@ -191,7 +190,7 @@ func TestBroadcastTopology(t *testing.T) {
 
 	t.Run("sends to all replicas", func(t *testing.T) {
 		s := &Server{
-			replicas:    make(map[transport.StreamTransport]*replicaConn),
+			replicas:    make(map[string]*replicaConn),
 			nodeID:      "primary",
 			opts:        Options{Host: "10.0.0.100", Port: 4000},
 			peerManager: NewPeerManager(nil, noopLogger),
@@ -203,8 +202,12 @@ func TestBroadcastTopology(t *testing.T) {
 		t1 := &fakeStreamTransport{id: 1}
 		t2 := &fakeStreamTransport{id: 2}
 
-		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "r1:5001", sendCh: ch1}
-		s.replicas[t2] = &replicaConn{transport: t2, nodeID: "n2", listenAddr: "r2:5002", sendCh: ch2}
+		rc1 := &replicaConn{transport: t1, nodeID: "n1", listenAddr: "r1:5001", sendCh: ch1}
+		rc1.connected.Store(true)
+		rc2 := &replicaConn{transport: t2, nodeID: "n2", listenAddr: "r2:5002", sendCh: ch2}
+		rc2.connected.Store(true)
+		s.replicas["n1"] = rc1
+		s.replicas["n2"] = rc2
 
 		s.broadcastTopology()
 
@@ -232,12 +235,12 @@ func TestBroadcastTopology(t *testing.T) {
 
 	t.Run("skipped on replica", func(t *testing.T) {
 		s := &Server{
-			replicas: make(map[transport.StreamTransport]*replicaConn),
+			replicas: make(map[string]*replicaConn),
 		}
 
 		ch := make(chan []byte, 1)
 		t1 := &fakeStreamTransport{id: 1}
-		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "r:1", sendCh: ch}
+		s.replicas["n1"] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "r:1", sendCh: ch}
 
 		s.broadcastTopology()
 
@@ -251,7 +254,7 @@ func TestBroadcastTopology(t *testing.T) {
 
 	t.Run("topology contains primary and all replica entries", func(t *testing.T) {
 		s := &Server{
-			replicas:    make(map[transport.StreamTransport]*replicaConn),
+			replicas:    make(map[string]*replicaConn),
 			nodeID:      "primary",
 			opts:        Options{Host: "10.0.0.100", Port: 4000},
 			peerManager: NewPeerManager(nil, noopLogger),
@@ -265,9 +268,15 @@ func TestBroadcastTopology(t *testing.T) {
 		t2 := &fakeStreamTransport{id: 2}
 		t3 := &fakeStreamTransport{id: 3}
 
-		s.replicas[t1] = &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
-		s.replicas[t2] = &replicaConn{transport: t2, nodeID: "n2", listenAddr: "10.0.0.2:5002", sendCh: ch2}
-		s.replicas[t3] = &replicaConn{transport: t3, nodeID: "n3", listenAddr: "10.0.0.3:5003", sendCh: ch3}
+		rc1 := &replicaConn{transport: t1, nodeID: "n1", listenAddr: "10.0.0.1:5001", sendCh: ch1}
+		rc1.connected.Store(true)
+		rc2 := &replicaConn{transport: t2, nodeID: "n2", listenAddr: "10.0.0.2:5002", sendCh: ch2}
+		rc2.connected.Store(true)
+		rc3 := &replicaConn{transport: t3, nodeID: "n3", listenAddr: "10.0.0.3:5003", sendCh: ch3}
+		rc3.connected.Store(true)
+		s.replicas["n1"] = rc1
+		s.replicas["n2"] = rc2
+		s.replicas["n3"] = rc3
 
 		s.broadcastTopology()
 

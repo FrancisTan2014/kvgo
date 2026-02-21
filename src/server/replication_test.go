@@ -177,9 +177,9 @@ func TestReplicaConnectionIdentity(t *testing.T) {
 	}
 
 	// Test 1: Connection identity check for primary connection
-	s.connectionMu.Lock()
+	s.connMu.Lock()
 	isPrimaryConn := (s.primary != nil && serverPrimaryTransport == s.primary)
-	s.connectionMu.Unlock()
+	s.connMu.Unlock()
 
 	if !isPrimaryConn {
 		t.Error("failed to identify primary connection")
@@ -187,9 +187,9 @@ func TestReplicaConnectionIdentity(t *testing.T) {
 
 	// Test 2: Connection identity check for client connection (won't match)
 	serverClientTransport := transport.NewStreamTransport(transport.ProtocolTCP, serverClientConn)
-	s.connectionMu.Lock()
+	s.connMu.Lock()
 	isClientPrimaryConn := (s.primary != nil && serverClientTransport == s.primary)
-	s.connectionMu.Unlock()
+	s.connMu.Unlock()
 
 	if isClientPrimaryConn {
 		t.Error("incorrectly identified client connection as primary")
@@ -221,21 +221,21 @@ func TestReplicationStateCleanup(t *testing.T) {
 	serverTransport := transport.NewStreamTransport(transport.ProtocolTCP, serverConn)
 
 	s := &Server{
-		replicas: make(map[transport.StreamTransport]*replicaConn),
+		replicas: make(map[string]*replicaConn),
 	}
 
 	// Add replica connection
 	rc := newReplicaConn(serverTransport, 0, "test-replid", "test-node-id", s.listenAddr())
-	s.replicas[serverTransport] = rc
+	s.replicas[rc.nodeID] = rc
 
 	if len(s.replicas) != 1 {
 		t.Fatalf("expected 1 replica, got %d", len(s.replicas))
 	}
 
 	// Simulate cleanup (what serveReplicaWriter does in defer)
-	s.connectionMu.Lock()
-	delete(s.replicas, serverTransport)
-	s.connectionMu.Unlock()
+	s.connMu.Lock()
+	delete(s.replicas, rc.nodeID)
+	s.connMu.Unlock()
 	serverTransport.Close()
 	conn.Close()
 
@@ -259,9 +259,9 @@ func TestReplicaReconnectionFlow(t *testing.T) {
 	}
 
 	// Verify server state remains stable after failed connection
-	s.connectionMu.Lock()
+	s.connMu.Lock()
 	primaryIsNil := s.primary == nil
-	s.connectionMu.Unlock()
+	s.connMu.Unlock()
 
 	if !primaryIsNil {
 		t.Error("primary connection should be nil after failed connection")

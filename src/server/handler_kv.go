@@ -69,9 +69,9 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 
 	if !s.isLeader() {
 		// Check if this PUT is from our primary (replication stream)
-		s.connectionMu.Lock()
+		s.connMu.Lock()
 		isPrimaryConn := (s.primary != nil && ctx.StreamTransport == s.primary)
-		s.connectionMu.Unlock()
+		s.connMu.Unlock()
 
 		if isPrimaryConn {
 			// Replicated write from primary - apply locally
@@ -139,7 +139,7 @@ func (s *Server) sendAckViaPeer(cmd protocol.Cmd, requestId string) {
 		return
 	}
 
-	req := protocol.Request{Cmd: cmd, RequestId: requestId}
+	req := protocol.NewAckRequest(cmd, requestId, s.nodeID)
 	payload, _ := protocol.EncodeRequest(req)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

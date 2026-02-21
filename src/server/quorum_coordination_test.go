@@ -6,6 +6,7 @@ import (
 	"kvgo/engine"
 	"kvgo/protocol"
 	"kvgo/transport"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -33,7 +34,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		s := &Server{
 			db:           db,
-			replicas:     make(map[transport.StreamTransport]*replicaConn),
+			replicas:     make(map[string]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
 				QuorumWriteTimeout: 500 * time.Millisecond,
@@ -47,9 +48,10 @@ func TestQuorumWriteCoordination(t *testing.T) {
 		replica2 := &mockStreamTransport{address: "r2:6379"}
 		replica3 := &mockStreamTransport{address: "r3:6379"}
 
-		s.replicas[replica1] = &replicaConn{transport: replica1}
-		s.replicas[replica2] = &replicaConn{transport: replica2}
-		s.replicas[replica3] = &replicaConn{transport: replica3}
+		for i, tr := range []transport.StreamTransport{replica1, replica2, replica3} {
+			nodeID := "node" + strconv.Itoa(i+1)
+			s.replicas[nodeID] = &replicaConn{nodeID: nodeID, transport: tr}
+		}
 
 		// Send 2 ACKs once quorum write state is registered
 		go func() {
@@ -57,9 +59,10 @@ func TestQuorumWriteCoordination(t *testing.T) {
 			if requestId == "" {
 				return
 			}
-			ackReq := protocol.Request{Cmd: protocol.CmdAck, RequestId: requestId}
-			s.handleAck(&RequestContext{StreamTransport: replica1, Request: ackReq})
-			s.handleAck(&RequestContext{StreamTransport: replica2, Request: ackReq})
+			ack1 := protocol.Request{Cmd: protocol.CmdAck, RequestId: requestId, Value: []byte("node1")}
+			ack2 := protocol.Request{Cmd: protocol.CmdAck, RequestId: requestId, Value: []byte("node2")}
+			s.handleAck(&RequestContext{StreamTransport: replica1, Request: ack1})
+			s.handleAck(&RequestContext{StreamTransport: replica2, Request: ack2})
 		}()
 
 		req := protocol.Request{
@@ -101,7 +104,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		s := &Server{
 			db:           db,
-			replicas:     make(map[transport.StreamTransport]*replicaConn),
+			replicas:     make(map[string]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
 				QuorumWriteTimeout: 500 * time.Millisecond,
@@ -113,8 +116,8 @@ func TestQuorumWriteCoordination(t *testing.T) {
 		replica1 := &mockStreamTransport{address: "r1:6379"}
 		replica2 := &mockStreamTransport{address: "r2:6379"}
 
-		s.replicas[replica1] = &replicaConn{transport: replica1}
-		s.replicas[replica2] = &replicaConn{transport: replica2}
+		s.replicas["node1"] = &replicaConn{nodeID: "node1", transport: replica1}
+		s.replicas["node2"] = &replicaConn{nodeID: "node2", transport: replica2}
 
 		// Send NACK once quorum write state is registered
 		go func() {
@@ -122,7 +125,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 			if requestId == "" {
 				return
 			}
-			nackReq := protocol.Request{Cmd: protocol.CmdNack, RequestId: requestId}
+			nackReq := protocol.Request{Cmd: protocol.CmdNack, RequestId: requestId, Value: []byte("node1")}
 			s.handleNack(&RequestContext{StreamTransport: replica1, Request: nackReq})
 		}()
 
@@ -157,7 +160,7 @@ func TestQuorumWriteCoordination(t *testing.T) {
 
 		s := &Server{
 			db:           db,
-			replicas:     make(map[transport.StreamTransport]*replicaConn),
+			replicas:     make(map[string]*replicaConn),
 			quorumWrites: make(map[string]*quorumWriteState),
 			opts: Options{
 				QuorumWriteTimeout: 50 * time.Millisecond,
@@ -170,8 +173,8 @@ func TestQuorumWriteCoordination(t *testing.T) {
 		replica1 := &mockStreamTransport{address: "r1:6379"}
 		replica2 := &mockStreamTransport{address: "r2:6379"}
 
-		s.replicas[replica1] = &replicaConn{transport: replica1}
-		s.replicas[replica2] = &replicaConn{transport: replica2}
+		s.replicas["node1"] = &replicaConn{nodeID: "node1", transport: replica1}
+		s.replicas["node2"] = &replicaConn{nodeID: "node2", transport: replica2}
 
 		req := protocol.Request{
 			Cmd:           protocol.CmdPut,
@@ -225,7 +228,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
 			return mocks[addr], nil
 		}, noopLogger)
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "r1"},
 			{NodeID: "n2", Addr: "r2"},
 		})
@@ -304,7 +307,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 			}
 			return m, nil
 		}, noopLogger)
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "r1"},
 			{NodeID: "n2", Addr: "r2"},
 			{NodeID: "n3", Addr: "r3"},
@@ -358,7 +361,7 @@ func TestQuorumReadCoordination(t *testing.T) {
 		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
 			return mocks[addr], nil
 		}, noopLogger)
-		pm.SavePeers([]PeerInfo{
+		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "r1"},
 			{NodeID: "n2", Addr: "r2"},
 		})

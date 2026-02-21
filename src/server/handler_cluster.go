@@ -29,13 +29,36 @@ func (s *Server) handleReplicate(ctx *RequestContext) error {
 		return s.responseStatusError(ctx)
 	}
 
-	rc := newReplicaConn(ctx.StreamTransport, req.Seq, rv.Replid, rv.NodeID, rv.ListenAddr)
+	s.connMu.RLock()
+	existing, exists := s.replicas[rv.NodeID]
+	s.connMu.RUnlock()
+
+	var rc *replicaConn
+	if exists {
+		rc = existing
+		s.updateReplicaConn(rc, ctx, &rv)
+	} else {
+		rc = newReplicaConn(ctx.StreamTransport, req.Seq, rv.Replid, rv.NodeID, rv.ListenAddr)
+	}
 
 	// Perform initial sync (blocks), then spawn writer goroutine.
 	// Connection ownership transfers to serveReplica — caller must not close it.
 	ctx.takenOver = s.serveReplica(rc)
 
 	return nil
+}
+
+func (s *Server) updateReplicaConn(rc *replicaConn, ctx *RequestContext, rv *protocol.ReplicateValue) {
+	rc.connected.Store(false) // gate off senders before closing old channel
+	close(rc.sendCh)
+	s.connMu.Lock()
+	// Drain stale writes — fresh SYNC/PSYNC establishes the new baseline
+	rc.sendCh = make(chan []byte, replicaSendBuffer)
+	rc.transport = ctx.StreamTransport
+	rc.listenAddr = rv.ListenAddr
+	rc.lastSeq = ctx.Request.Seq
+	rc.lastReplid = rv.Replid
+	s.connMu.Unlock()
 }
 
 func (s *Server) buildReplicateRequest() protocol.Request {
@@ -58,50 +81,62 @@ func (s *Server) handleReplicaOf(ctx *RequestContext) error {
 }
 
 func (s *Server) relocate(primaryAddr string) error {
+	if primaryAddr == s.listenAddr() {
+		return fmt.Errorf("relocate: refusing to replicate from self (%s)", primaryAddr)
+	}
 	s.log().Info("switching primary", "address", primaryAddr)
 
-	if s.currentRole() != RoleFollower {
+	if !s.isFollower() {
 		if !s.becomeFollower() {
 			return fmt.Errorf("relocate: invalid transition from %s to follower", s.currentRole())
 		}
+		// Initialize primarySeq to avoid false staleness after leader→follower transition.
+		// Without this, primarySeq=0 minus lastSeq=N wraps to a huge uint64 and
+		// isStaleness() rejects all reads until the first heartbeat arrives.
+		s.primarySeq = s.lastSeq.Load()
 	}
 
 	// Update config immediately
-	s.connectionMu.Lock()
+	s.connMu.Lock()
 	s.opts.ReplicaOf = primaryAddr
-	s.connectionMu.Unlock()
+	s.connMu.Unlock()
 
 	// Do cleanup async to avoid blocking client response
 	go func() {
-		s.connectionMu.Lock()
-		// Cancel old replication loop
-		if s.replCancel != nil {
-			s.replCancel()
-		}
-
-		for c, r := range s.replicas {
-			close(r.sendCh)
-			_ = r.transport.Close()
-			delete(s.replicas, c)
-		}
-
-		// Clear peers when switching primary (topology will be re-sent by new primary)
-		s.peerManager.SavePeers(nil)
-
-		if s.primary != nil {
-			_ = s.primary.Close()
-			s.primary = nil
-		}
-
-		if s.backlogCancel != nil {
-			s.backlogCancel()
-		}
-		s.connectionMu.Unlock()
-
+		s.teardownReplicationState()
 		s.startReplicationLoop()
 	}()
 
 	return nil
+}
+
+// teardownReplicationState tears down all replication state: replica send channels,
+// transports, replication loop, primary transport, and backlog trimmer.
+// Used by both relocate (role change) and monitorFence (quorum loss).
+// Caller must NOT hold connMu.
+func (s *Server) teardownReplicationState() {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
+	if s.replCancel != nil {
+		s.replCancel()
+	}
+
+	for id, rc := range s.replicas {
+		rc.connected.Store(false) // gate off senders before closing channel
+		close(rc.sendCh)
+		_ = rc.transport.Close()
+		delete(s.replicas, id)
+	}
+
+	if s.primary != nil {
+		_ = s.primary.Close()
+		s.primary = nil
+	}
+
+	if s.backlogCancel != nil {
+		s.backlogCancel()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -179,11 +214,11 @@ func (s *Server) handleTopology(ctx *RequestContext) error {
 		}
 	}
 
-	s.peerManager.SavePeers(peers)
+	s.peerManager.MergePeers(peers)
 	return nil // TOPOLOGY is a one-way notification; no response expected by primary's reader.
 }
 
-func (s *Server) buildTopologyRequest(replicas map[transport.StreamTransport]*replicaConn) protocol.Request {
+func (s *Server) buildTopologyRequest(replicas map[string]*replicaConn) protocol.Request {
 	// Include the primary itself so replicas can reach it (e.g. for elections)
 	entries := make([]protocol.TopologyEntry, 0, 1+len(replicas))
 	entries = append(entries, protocol.TopologyEntry{NodeID: s.nodeID, Addr: s.listenAddr()})
@@ -210,10 +245,12 @@ func (s *Server) broadcastTopology() {
 			peers = append(peers, PeerInfo{NodeID: rc.nodeID, Addr: rc.listenAddr})
 		}
 	}
-	s.peerManager.SavePeers(peers)
+	s.peerManager.MergePeers(peers)
 
 	for _, rc := range snapshot {
-		rc.sendCh <- payload
+		if rc.connected.Load() {
+			rc.sendCh <- payload
+		}
 	}
 }
 
@@ -358,4 +395,84 @@ func (s *Server) evaluateVoteLocked(vr protocol.VoteRequestValue) (protocol.Resp
 
 	s.log().Info("VOTE granted", "candidate", vr.NodeID, "term", vr.Term)
 	return s.buildVoteResponse(true), stepped
+}
+
+// ---------------------------------------------------------------------------
+// Periodic Reconciliation
+// ---------------------------------------------------------------------------
+
+const reconcileInterval = 3 * time.Second
+
+// reconcileLoop runs while the server is alive. When leader, it periodically
+// sends REPLICAOF to peers that haven't connected as replicas — ensuring
+// orphaned nodes (e.g. a stale old primary) eventually rejoin the cluster.
+func (s *Server) reconcileLoop() {
+	for {
+		if !s.isLeader() {
+			ch := s.getRoleChangedCh()
+			select {
+			case <-ch:
+				continue
+			case <-s.ctx.Done():
+				return
+			}
+		}
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(reconcileInterval):
+			s.reconcilePeers()
+		}
+	}
+}
+
+func (s *Server) reconcilePeers() {
+	if !s.isLeader() {
+		return
+	}
+
+	snapshot := s.getReplicaSnapshot()
+	connected := make(map[string]bool, len(snapshot))
+	connectedCount := 0
+	for nodeID, rc := range snapshot {
+		if rc.connected.Load() {
+			connected[nodeID] = true
+			connectedCount++
+		}
+	}
+
+	// A leader that had replicas but lost them all is likely stale (fence pending).
+	// Don't reconcile — we'd recruit peers back and prevent fence from triggering.
+	if len(snapshot) > 0 && connectedCount == 0 {
+		return
+	}
+
+	peerIDs := s.peerManager.NodeIDs()
+	for _, pid := range peerIDs {
+		if pid == s.nodeID {
+			continue
+		}
+		if connected[pid] {
+			continue
+		}
+		go func() {
+			t, err := s.peerManager.Get(pid)
+			if err != nil {
+				s.log().Debug("reconcile: peer unreachable", "peer", pid, "error", err)
+				return
+			}
+			req := protocol.Request{
+				Cmd:   protocol.CmdReplicaOf,
+				Value: []byte(s.listenAddr()),
+			}
+			payload, _ := protocol.EncodeRequest(req)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if _, err := t.Request(ctx, payload); err != nil {
+				s.log().Debug("reconcile: REPLICAOF failed", "peer", pid, "error", err)
+			} else {
+				s.log().Info("reconcile: sent REPLICAOF", "peer", pid)
+			}
+		}()
+	}
 }
