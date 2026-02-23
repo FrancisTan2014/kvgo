@@ -72,9 +72,20 @@ func (p *PeerManager) MergePeers(topology []PeerInfo) {
 	}
 }
 
-// Get returns a RequestTransport for the given nodeID, dialing lazily on first use.
+// Get returns the PeerInfo for the given nodeID, or false if unknown.
+func (p *PeerManager) Get(nodeID string) (PeerInfo, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	entry, exists := p.peers[nodeID]
+	if !exists {
+		return PeerInfo{}, false
+	}
+	return PeerInfo{NodeID: nodeID, Addr: entry.addr}, true
+}
+
+// GetTransport returns a RequestTransport for the given nodeID, dialing lazily on first use.
 // Returns an error if nodeID is unknown or dial fails.
-func (p *PeerManager) Get(nodeID string) (transport.RequestTransport, error) {
+func (p *PeerManager) GetTransport(nodeID string) (transport.RequestTransport, error) {
 	p.mu.RLock()
 	entry, exists := p.peers[nodeID]
 	if !exists {
@@ -166,6 +177,12 @@ func (p *PeerManager) AnyAddr() (string, bool) {
 		return entry.addr, true
 	}
 	return "", false
+}
+
+func (p *PeerManager) Any() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.peers) > 0
 }
 
 // Close closes all peer transports and clears the peer map.

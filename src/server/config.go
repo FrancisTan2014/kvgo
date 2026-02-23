@@ -73,6 +73,7 @@ const (
 	defaultQuorumReadTimeout   = 500 * time.Millisecond
 	defaultStaleHeartbeat      = 1 * time.Second
 	defaultStaleLag            = 1000
+	defaultDiscoveryTimeout    = 1 * time.Second
 )
 
 // applyDefaults fills zero-valued fields with sensible defaults.
@@ -103,5 +104,8 @@ func (o *Options) applyDefaults() {
 	}
 	if o.ReplicaStaleLag <= 0 {
 		o.ReplicaStaleLag = defaultStaleLag
+	}
+	if o.DiscoveryTimeout <= 0 {
+		o.DiscoveryTimeout = defaultDiscoveryTimeout
 	}
 }

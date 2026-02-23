@@ -76,14 +76,22 @@ function Start-Node {
     param(
         [string]$Port,
         [string]$DataDir,
-        [string]$ReplicaOf = $null
+        [string]$ReplicaOf = $null,
+        [string]$LogFile = $null
     )
     $serverExe = Get-BinaryPath "kv-server"
     $nodeArgs = @("--port", $Port, "--data-dir", $DataDir)
+    if ($LogFile) {
+        $nodeArgs += "--debug"
+    }
     if ($ReplicaOf) {
         $nodeArgs += @("--replica-of", $ReplicaOf)
     }
-    return Start-Process -FilePath $serverExe -ArgumentList $nodeArgs -PassThru -NoNewWindow
+    $extraArgs = @{}
+    if ($LogFile) {
+        $extraArgs["RedirectStandardError"] = $LogFile
+    }
+    return Start-Process -FilePath $serverExe -ArgumentList $nodeArgs -PassThru -NoNewWindow @extraArgs
 }
 
 function Print-Results {

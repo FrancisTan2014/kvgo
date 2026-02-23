@@ -233,7 +233,7 @@ func (s *Server) tickElection() {
 // requestVote sends a VoteRequest to a single peer and parses the response.
 // Returns the responder's term, whether the vote was granted, and any error.
 func (s *Server) requestVote(peerID string, payload []byte, timeout time.Duration) (uint64, bool, error) {
-	t, err := s.peerManager.Get(peerID)
+	t, err := s.peerManager.GetTransport(peerID)
 	if err != nil {
 		return 0, false, fmt.Errorf("get peer %s: %w", peerID, err)
 	}

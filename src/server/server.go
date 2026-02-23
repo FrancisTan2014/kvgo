@@ -63,6 +63,8 @@ type Options struct {
 	ReplicaStaleHeartbeat time.Duration // time-based: reject if no heartbeat for this duration (partition detection), default 1s
 	ReplicaStaleLag       int           // sequence-based: reject if > N operations behind (backlog limit), default 1000
 
+	DiscoveryTimeout time.Duration // default 1s
+
 	Logger *slog.Logger // optional debug logger; nil disables logging
 }
 
@@ -163,10 +165,6 @@ func NewServer(opts Options) (*Server, error) {
 		roleChanged:     make(chan struct{}),
 	}
 
-	if opts.ReplicaOf == "" {
-		s.role.Store(uint32(RoleLeader))
-	}
-
 	s.peerManager = NewPeerManager(
 		DialPeer(opts.Protocol, s.network(), opts.ReadTimeout),
 		s.log(),
@@ -221,7 +219,26 @@ func (s *Server) Start() (err error) {
 		s.nodeID = utils.GenerateUniqueID()
 	}
 
-	if s.replid == "" {
+	// Role determination
+	if s.opts.ReplicaOf == "" {
+		if s.peerManager.Any() {
+			s.role.Store(uint32(RoleFollower))
+			leader, term, found := s.discoverCluster()
+			if found {
+				s.term.Store(term)
+				s.primaryNodeID = leader.NodeID
+				s.opts.ReplicaOf = leader.Addr
+				s.peerManager.MergePeers([]PeerInfo{leader})
+			}
+			s.lastHeartbeat = time.Now() // reset election timer after discovery
+		} else {
+			s.role.Store(uint32(RoleLeader))
+		}
+	} else {
+		s.role.Store(uint32(RoleFollower))
+	}
+
+	if s.replid == "" && s.isLeader() {
 		// First boot as primary — reuse nodeID as the initial replication lineage ID.
 		// A separate replid is only needed after failover (new primary, new lineage).
 		s.replid = s.nodeID

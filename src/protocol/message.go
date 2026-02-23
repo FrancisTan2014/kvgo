@@ -61,21 +61,23 @@ const (
 	CmdTopology      Cmd = 11 // Topology broadcast
 	CmdPeerHandshake Cmd = 12 // Peer handshake
 	CmdVoteRequest   Cmd = 13 // Election request
+	CmdDiscovery     Cmd = 14 // Discovery request
 )
 
 type Status uint8
 
 const (
-	StatusOK              Status = iota // Success
-	StatusNotFound                      // Key not found (GET)
-	StatusError                         // Generic server error
-	StatusReadOnly                      // Replica cannot accept writes; Value contains primary address
-	StatusPong                          // Response to PING
-	StatusFullResync                    // Primary requires full resync; Value contains snapshot
-	StatusCleaning                      // Cleanup in progress, writes temporarily rejected
-	StatusReplicaTooStale               // Replica exceeds staleness bounds; client should retry another replica or primary
-	StatusQuorumFailed                  // Quorum read failed; insufficient replica responses
-	StatusVoteResponse                  // Vote response; Value contains vote granted/denied
+	StatusOK                Status = iota // Success
+	StatusNotFound                        // Key not found (GET)
+	StatusError                           // Generic server error
+	StatusReadOnly                        // Replica cannot accept writes; Value contains primary address
+	StatusPong                            // Response to PING
+	StatusFullResync                      // Primary requires full resync; Value contains snapshot
+	StatusCleaning                        // Cleanup in progress, writes temporarily rejected
+	StatusReplicaTooStale                 // Replica exceeds staleness bounds; client should retry another replica or primary
+	StatusQuorumFailed                    // Quorum read failed; insufficient replica responses
+	StatusVoteResponse                    // Vote response; Value contains vote granted/denied
+	StatusDiscoveryResponse               // Discovery response; Value contains current term and leader address
 
 	statusMaxKnown // Sentinel: update when adding new status codes
 )
@@ -96,6 +98,7 @@ type Request struct {
 	//   CmdAck, CmdNack: sender's nodeID (for recentActive tracking)
 	//   CmdTopology:     see NewTopologyRequest / ParseTopologyValue
 	//   CmdVoteRequest:  see NewVoteRequest / ParseVoteRequestValue
+	//   CmdDiscovery:    see NewDiscoveryRequest / ParseDiscoveryRequestValue
 	//   Others: unused (empty)
 	Value         []byte
 	Seq           uint64 // Sequence number (meaningful if FlagHasSeq set: CmdPut, CmdReplicate)
@@ -108,12 +111,13 @@ type Response struct {
 	// Value carries status-specific payload.
 	// Use the typed constructors/parsers in builders.go instead of
 	// encoding/decoding this field directly.
-	//   StatusOK (GET):         retrieved DB value
-	//   StatusReadOnly:         primary address for redirect
-	//   StatusReplicaTooStale:  primary address for redirect
-	//   StatusFullResync:       replid for timeline identification
-	//   StatusPong:             see NewPongResponse / ParsePongTerm
-	//   StatusVoteResponse:     see NewVoteResponse / ParseVoteResponseValue
+	//   StatusOK (GET):          retrieved DB value
+	//   StatusReadOnly:          primary address for redirect
+	//   StatusReplicaTooStale:   primary address for redirect
+	//   StatusFullResync:        replid for timeline identification
+	//   StatusPong:              see NewPongResponse / ParsePongTerm
+	//   StatusVoteResponse:      see NewVoteResponse / ParseVoteResponseValue
+	//   StatusDiscoveryResponse: see NewDiscoveryResponse / ParseDiscoveryResponseValue
 	//   Others: unused (empty)
 	Value []byte
 	Seq   uint64 // Sequence number at time of response (for tracking replication lag)
@@ -145,7 +149,13 @@ func putU64LE(buf []byte, off int, v uint64) {
 
 // statusCanCarryValue returns true if the status code is allowed to have a non-empty value field.
 func statusCanCarryValue(st Status) bool {
-	return st == StatusOK || st == StatusFullResync || st == StatusReadOnly || st == StatusReplicaTooStale || st == StatusVoteResponse || st == StatusPong
+	return st == StatusOK ||
+		st == StatusFullResync ||
+		st == StatusReadOnly ||
+		st == StatusReplicaTooStale ||
+		st == StatusVoteResponse ||
+		st == StatusPong ||
+		st == StatusDiscoveryResponse
 }
 
 // EncodeRequest encodes a Request into a payload (without the outer frameLen).

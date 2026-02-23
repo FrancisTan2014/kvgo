@@ -250,7 +250,7 @@ func (s *Server) doQuorumGet(ctx *RequestContext) error {
 
 	for _, nodeID := range nodes {
 		wg.Go(func() {
-			t, err := s.peerManager.Get(nodeID)
+			t, err := s.peerManager.GetTransport(nodeID)
 			if err != nil {
 				s.log().Warn("quorum read: peer unavailable", "node_id", nodeID, "error", err)
 				return

@@ -49,7 +49,7 @@ func TestPeerManager_MergePeers(t *testing.T) {
 			{NodeID: "n2", Addr: "b:2"},
 		})
 		// Dial n1 to cache transport
-		pm.Get("n1")
+		pm.GetTransport("n1")
 
 		// Override close to track it
 		pm.mu.Lock()
@@ -107,14 +107,14 @@ func TestPeerManager_MergePeers(t *testing.T) {
 			{NodeID: "n1", Addr: "a:1"},
 			{NodeID: "n2", Addr: "b:2"},
 		})
-		t1, _ := pm.Get("n1")
+		t1, _ := pm.GetTransport("n1")
 
 		// Same topology again
 		pm.MergePeers([]PeerInfo{
 			{NodeID: "n1", Addr: "a:1"},
 			{NodeID: "n2", Addr: "b:2"},
 		})
-		t2, _ := pm.Get("n1")
+		t2, _ := pm.GetTransport("n1")
 
 		if t1 != t2 {
 			t.Error("transport replaced on unchanged topology")
@@ -177,8 +177,8 @@ func TestPeerManager_PeerInfos(t *testing.T) {
 	}
 }
 
-func TestPeerManager_Get(t *testing.T) {
-	t.Run("lazy dial on first Get", func(t *testing.T) {
+func TestPeerManager_GetTransport(t *testing.T) {
+	t.Run("lazy dial on first GetTransport", func(t *testing.T) {
 		dialCount := 0
 		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
 			dialCount++
@@ -190,18 +190,18 @@ func TestPeerManager_Get(t *testing.T) {
 			t.Fatalf("dial called on MergePeers, count = %d", dialCount)
 		}
 
-		t1, err := pm.Get("n1")
+		t1, err := pm.GetTransport("n1")
 		if err != nil {
-			t.Fatalf("Get: %v", err)
+			t.Fatalf("GetTransport: %v", err)
 		}
 		if dialCount != 1 {
 			t.Errorf("dial count = %d, want 1", dialCount)
 		}
 
-		// Second Get reuses cached transport
-		t2, err := pm.Get("n1")
+		// Second GetTransport reuses cached transport
+		t2, err := pm.GetTransport("n1")
 		if err != nil {
-			t.Fatalf("Get: %v", err)
+			t.Fatalf("GetTransport: %v", err)
 		}
 		if t1 != t2 {
 			t.Error("second Get returned different transport")
@@ -213,7 +213,7 @@ func TestPeerManager_Get(t *testing.T) {
 
 	t.Run("unknown peer returns error", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		_, err := pm.Get("unknown")
+		_, err := pm.GetTransport("unknown")
 		if err == nil {
 			t.Error("expected error for unknown peer")
 		}
@@ -225,7 +225,7 @@ func TestPeerManager_Get(t *testing.T) {
 		}, noopLogger)
 
 		pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
-		_, err := pm.Get("n1")
+		_, err := pm.GetTransport("n1")
 		if err == nil {
 			t.Error("expected dial error")
 		}
@@ -244,8 +244,8 @@ func TestPeerManager_Snapshot(t *testing.T) {
 	})
 
 	// Only dial two
-	pm.Get("n1")
-	pm.Get("n3")
+	pm.GetTransport("n1")
+	pm.GetTransport("n3")
 
 	snap := pm.Snapshot()
 	if len(snap) != 2 {
@@ -282,8 +282,8 @@ func TestPeerManager_Close(t *testing.T) {
 		{NodeID: "n1", Addr: "a:1"},
 		{NodeID: "n2", Addr: "b:2"},
 	})
-	pm.Get("n1")
-	pm.Get("n2")
+	pm.GetTransport("n1")
+	pm.GetTransport("n2")
 
 	pm.Close()
 
@@ -318,7 +318,7 @@ func TestPeerManager_ConcurrentAccess(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			pm.Get(nodeID) // may fail — that's fine
+			pm.GetTransport(nodeID) // may fail — that's fine
 		}()
 		go func() {
 			defer wg.Done()
@@ -327,6 +327,31 @@ func TestPeerManager_ConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 	// No panic = pass
+}
+
+func TestPeerManager_Get(t *testing.T) {
+	pm := NewPeerManager(nil, noopLogger)
+	pm.MergePeers([]PeerInfo{
+		{NodeID: "n1", Addr: "a:1"},
+		{NodeID: "n2", Addr: "b:2"},
+	})
+
+	t.Run("returns known peer", func(t *testing.T) {
+		pi, ok := pm.Get("n1")
+		if !ok {
+			t.Fatal("expected ok")
+		}
+		if pi.NodeID != "n1" || pi.Addr != "a:1" {
+			t.Errorf("Get(n1) = %+v, want {n1 a:1}", pi)
+		}
+	})
+
+	t.Run("returns false for unknown peer", func(t *testing.T) {
+		_, ok := pm.Get("unknown")
+		if ok {
+			t.Error("expected not ok for unknown peer")
+		}
+	})
 }
 
 // closeTrackingTransport tracks Close() calls for test assertions

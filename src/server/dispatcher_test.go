@@ -29,6 +29,7 @@ func TestCommandRegistration(t *testing.T) {
 		{protocol.CmdTopology, "TOPOLOGY"},
 		{protocol.CmdPeerHandshake, "PEER"},
 		{protocol.CmdVoteRequest, "VOTE"},
+		{protocol.CmdDiscovery, "DISCOVERY"},
 	}
 
 	for _, tc := range expectedCommands {

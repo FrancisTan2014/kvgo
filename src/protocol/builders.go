@@ -32,7 +32,7 @@ func NewReplicateRequest(replid, listenAddr, nodeID string, lastSeq uint64) Requ
 // ParseReplicateValue parses the Value field of a CmdReplicate request.
 func ParseReplicateValue(value []byte) (ReplicateValue, error) {
 	parts := strings.Split(string(value), Delimiter)
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+	if len(parts) != 3 || parts[1] == "" || parts[2] == "" {
 		return ReplicateValue{}, fmt.Errorf("expected replid, listenAddr, nodeID separated by delimiter")
 	}
 	return ReplicateValue{
@@ -209,4 +209,68 @@ func NewAckRequest(c Cmd, requestId string, nodeId string) Request {
 		Value:     []byte(nodeId),
 		RequestId: requestId,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Discovery (CmdDiscovery, StatusDiscoveryResponse)
+// Request Value = "term\nnodeID"
+// Response Value = term\nleaderID\nleaderAddr
+// ---------------------------------------------------------------------------
+
+// DiscoveryRequestValue holds the parsed fields from a CmdDiscovery.
+type DiscoveryRequestValue struct {
+	Term   uint64
+	NodeID string
+}
+
+// NewDiscoveryRequest builds a CmdDiscovery.
+func NewDiscoveryRequest(term uint64, nodeID string) Request {
+	payload := fmt.Sprintf("%d%s%s", term, Delimiter, nodeID)
+	return Request{
+		Cmd:   CmdDiscovery,
+		Value: []byte(payload),
+	}
+}
+
+// ParseDiscoveryRequestValue parses the Value field of a CmdDiscovery.
+func ParseDiscoveryRequestValue(value []byte) (DiscoveryRequestValue, error) {
+	parts := strings.Split(string(value), Delimiter)
+	if len(parts) != 2 {
+		return DiscoveryRequestValue{}, fmt.Errorf("expected 2 fields, got %d", len(parts))
+	}
+
+	term, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return DiscoveryRequestValue{}, fmt.Errorf("invalid term: %w", err)
+	}
+
+	return DiscoveryRequestValue{Term: term, NodeID: parts[1]}, nil
+}
+
+// DiscoveryResponseValue holds the parsed fields from a StatusDiscoveryResponse.
+type DiscoveryResponseValue struct {
+	Term       uint64
+	LeaderId   string
+	LeaderAddr string
+}
+
+// NewDiscoveryResponse builds a StatusDiscoveryResponse.
+func NewDiscoveryResponse(term uint64, leaderId string, leaderAddr string) Response {
+	payload := fmt.Sprintf("%d%s%s%s%s", term, Delimiter, leaderId, Delimiter, leaderAddr)
+	return Response{Status: StatusDiscoveryResponse, Value: []byte(payload)}
+}
+
+// ParseDiscoveryResponseValue parses the Value field of a StatusDiscoveryResponse.
+func ParseDiscoveryResponseValue(value []byte) (DiscoveryResponseValue, error) {
+	parts := strings.Split(string(value), Delimiter)
+	if len(parts) != 3 {
+		return DiscoveryResponseValue{}, fmt.Errorf("expected 3 fields, got %d", len(parts))
+	}
+
+	term, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return DiscoveryResponseValue{}, fmt.Errorf("invalid term: %w", err)
+	}
+
+	return DiscoveryResponseValue{Term: term, LeaderId: parts[1], LeaderAddr: parts[2]}, nil
 }

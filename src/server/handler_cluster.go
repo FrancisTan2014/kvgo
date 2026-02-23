@@ -6,6 +6,7 @@ import (
 	"kvgo/protocol"
 	"kvgo/transport"
 	"kvgo/utils"
+	"sync"
 	"time"
 )
 
@@ -58,6 +59,7 @@ func (s *Server) updateReplicaConn(rc *replicaConn, ctx *RequestContext, rv *pro
 	rc.listenAddr = rv.ListenAddr
 	rc.lastSeq = ctx.Request.Seq
 	rc.lastReplid = rv.Replid
+	rc.hb = time.NewTicker(heartbeatInterval) // old ticker stopped by exiting writer's defer
 	s.connMu.Unlock()
 }
 
@@ -184,7 +186,7 @@ func (s *Server) broadcastPromotion() {
 	peerIds := s.peerManager.NodeIDs()
 	for _, pid := range peerIds {
 		go func() {
-			t, err := s.peerManager.Get(pid)
+			t, err := s.peerManager.GetTransport(pid)
 			if err != nil {
 				s.log().Debug("broadcastPromotion: peer unreachable", "peer", pid, "error", err)
 				return
@@ -454,7 +456,7 @@ func (s *Server) reconcilePeers() {
 			continue
 		}
 		go func() {
-			t, err := s.peerManager.Get(pid)
+			t, err := s.peerManager.GetTransport(pid)
 			if err != nil {
 				s.log().Debug("reconcile: peer unreachable", "peer", pid, "error", err)
 				return
@@ -473,4 +475,112 @@ func (s *Server) reconcilePeers() {
 			}
 		}()
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Auto Discovery On Restart
+// ---------------------------------------------------------------------------
+
+// discoverCluster probes all known peers for the current leader on restart.
+func (s *Server) discoverCluster() (PeerInfo, uint64, bool) {
+	peerIDs := s.peerManager.NodeIDs()
+	myTerm := s.term.Load()
+	s.log().Info("discovering cluster", "peers", len(peerIDs), "term", myTerm)
+
+	req := protocol.NewDiscoveryRequest(myTerm, s.nodeID)
+	payload, _ := protocol.EncodeRequest(req)
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.DiscoveryTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var leaderId, leaderAddr string
+	highestTerm := myTerm
+
+	for _, pid := range peerIDs {
+		wg.Go(func() {
+			rv, ok := s.probePeer(ctx, pid, payload)
+			if !ok {
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if rv.Term >= highestTerm && rv.LeaderId != "" && rv.LeaderAddr != "" {
+				highestTerm = rv.Term
+				leaderId = rv.LeaderId
+				leaderAddr = rv.LeaderAddr
+			}
+		})
+	}
+
+	wg.Wait()
+
+	if leaderId != "" {
+		s.log().Info("discovered leader", "leader", leaderId, "addr", leaderAddr, "term", highestTerm)
+		return PeerInfo{NodeID: leaderId, Addr: leaderAddr}, highestTerm, true
+	} else {
+		s.log().Info("no leader discovered, waiting for election")
+		return PeerInfo{}, highestTerm, false
+	}
+}
+
+// probePeer sends a discovery request to a single peer and returns the parsed response.
+func (s *Server) probePeer(ctx context.Context, peerID string, payload []byte) (protocol.DiscoveryResponseValue, bool) {
+	p, err := s.peerManager.GetTransport(peerID)
+	if err != nil {
+		s.log().Debug("discovery: peer unreachable", "peer", peerID, "error", err)
+		return protocol.DiscoveryResponseValue{}, false
+	}
+
+	respPayload, err := p.Request(ctx, payload)
+	if err != nil {
+		s.log().Debug("discovery: request failed", "peer", peerID, "error", err)
+		return protocol.DiscoveryResponseValue{}, false
+	}
+
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		s.log().Debug("discovery: invalid response", "peer", peerID, "error", err)
+		return protocol.DiscoveryResponseValue{}, false
+	}
+
+	if resp.Status != protocol.StatusDiscoveryResponse {
+		s.log().Debug("discovery: unexpected status", "peer", peerID, "status", resp.Status)
+		return protocol.DiscoveryResponseValue{}, false
+	}
+
+	rv, err := protocol.ParseDiscoveryResponseValue(resp.Value)
+	if err != nil {
+		s.log().Debug("discovery: invalid response value", "peer", peerID, "error", err)
+		return protocol.DiscoveryResponseValue{}, false
+	}
+
+	return rv, true
+}
+
+// handleDiscovery replies with the current leader's identity and address.
+func (s *Server) handleDiscovery(ctx *RequestContext) error {
+	rv, err := protocol.ParseDiscoveryRequestValue(ctx.Request.Value)
+	if err != nil {
+		s.log().Debug("discovery: invalid request", "error", err)
+		return err
+	}
+
+	s.log().Info("discovery: request received", "nodeId", rv.NodeID, "term", rv.Term)
+
+	var resp protocol.Response
+	if s.isLeader() {
+		resp = protocol.NewDiscoveryResponse(s.term.Load(), s.nodeID, s.listenAddr())
+	} else if s.primaryNodeID != "" {
+		if pi, ok := s.peerManager.Get(s.primaryNodeID); ok {
+			resp = protocol.NewDiscoveryResponse(s.term.Load(), pi.NodeID, pi.Addr)
+		} else {
+			s.log().Debug("discovery: leader known but address missing", "leader", s.primaryNodeID)
+		}
+	}
+
+	return s.writeResponse(ctx.StreamTransport, resp)
 }
