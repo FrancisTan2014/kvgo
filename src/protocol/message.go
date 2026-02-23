@@ -49,19 +49,20 @@ const (
 type Cmd uint8
 
 const (
-	CmdGet           Cmd = 1  // Retrieve value by key
-	CmdPut           Cmd = 2  // Store key-value pair
-	CmdReplicate     Cmd = 3  // Establish replication connection
-	CmdPing          Cmd = 4  // Health check
-	CmdPromote       Cmd = 5  // Promote replica to primary
-	CmdReplicaOf     Cmd = 6  // Configure as replica of primary
-	CmdCleanup       Cmd = 7  // Trigger value file compaction
-	CmdAck           Cmd = 8  // Replica ACKs
-	CmdNack          Cmd = 9  // Replica negative ACK (write failed)
-	CmdTopology      Cmd = 11 // Topology broadcast
-	CmdPeerHandshake Cmd = 12 // Peer handshake
-	CmdVoteRequest   Cmd = 13 // Election request
-	CmdDiscovery     Cmd = 14 // Discovery request
+	CmdGet            Cmd = 1  // Retrieve value by key
+	CmdPut            Cmd = 2  // Store key-value pair
+	CmdReplicate      Cmd = 3  // Establish replication connection
+	CmdPing           Cmd = 4  // Health check
+	CmdPromote        Cmd = 5  // Promote replica to primary
+	CmdReplicaOf      Cmd = 6  // Configure as replica of primary
+	CmdCleanup        Cmd = 7  // Trigger value file compaction
+	CmdAck            Cmd = 8  // Replica ACKs
+	CmdNack           Cmd = 9  // Replica negative ACK (write failed)
+	CmdTopology       Cmd = 11 // Topology broadcast
+	CmdPeerHandshake  Cmd = 12 // Peer handshake
+	CmdPreVoteRequest Cmd = 13 // PreVote probe (no term increment)
+	CmdVoteRequest    Cmd = 14 // Election request
+	CmdDiscovery      Cmd = 15 // Discovery request
 )
 
 type Status uint8
@@ -76,6 +77,7 @@ const (
 	StatusCleaning                        // Cleanup in progress, writes temporarily rejected
 	StatusReplicaTooStale                 // Replica exceeds staleness bounds; client should retry another replica or primary
 	StatusQuorumFailed                    // Quorum read failed; insufficient replica responses
+	StatusPreVoteResponse                 // PreVote response; Value contains term and granted (same format as VoteResponse)
 	StatusVoteResponse                    // Vote response; Value contains vote granted/denied
 	StatusDiscoveryResponse               // Discovery response; Value contains current term and leader address
 
@@ -153,6 +155,7 @@ func statusCanCarryValue(st Status) bool {
 		st == StatusFullResync ||
 		st == StatusReadOnly ||
 		st == StatusReplicaTooStale ||
+		st == StatusPreVoteResponse ||
 		st == StatusVoteResponse ||
 		st == StatusPong ||
 		st == StatusDiscoveryResponse

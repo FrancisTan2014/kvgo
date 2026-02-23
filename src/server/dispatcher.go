@@ -29,6 +29,7 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdTopology] = (*Server).handleTopology
 	s.requestHandlers[protocol.CmdPeerHandshake] = (*Server).handlePeerHandshake
 	s.requestHandlers[protocol.CmdVoteRequest] = (*Server).handleVoteRequest
+	s.requestHandlers[protocol.CmdPreVoteRequest] = (*Server).handlePreVoteRequest
 	s.requestHandlers[protocol.CmdDiscovery] = (*Server).handleDiscovery
 }
 

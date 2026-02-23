@@ -147,6 +147,32 @@ func ParseVoteResponseValue(value []byte) (VoteResponseValue, error) {
 }
 
 // ---------------------------------------------------------------------------
+// PreVote (CmdPreVoteRequest, StatusPreVoteResponse)
+// Reuses VoteRequestValue / VoteResponseValue format.
+// ---------------------------------------------------------------------------
+
+// NewPreVoteRequest builds a CmdPreVoteRequest.
+// The term should be the candidate's current term + 1 (the term it *would*
+// campaign for), but the caller does NOT actually increment its own term.
+func NewPreVoteRequest(term uint64, nodeID string, lastSeq uint64) Request {
+	payload := fmt.Sprintf("%d%s%s%s%d", term, Delimiter, nodeID, Delimiter, lastSeq)
+	return Request{
+		Cmd:   CmdPreVoteRequest,
+		Value: []byte(payload),
+	}
+}
+
+// NewPreVoteResponse builds a StatusPreVoteResponse.
+func NewPreVoteResponse(term uint64, granted bool) Response {
+	buf := make([]byte, 9)
+	binary.LittleEndian.PutUint64(buf, term)
+	if granted {
+		buf[8] = 1
+	}
+	return Response{Status: StatusPreVoteResponse, Value: buf}
+}
+
+// ---------------------------------------------------------------------------
 // Topology (CmdTopology)
 // Value = "nodeID@addr\nnodeID@addr\n..."
 // ---------------------------------------------------------------------------

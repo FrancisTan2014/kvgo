@@ -316,6 +316,20 @@ func DialPeer(proto, network string, timeout time.Duration) DialFunc {
 // VOTE Command Handler (Candidate requests votes during leader election)
 // ---------------------------------------------------------------------------
 
+func (s *Server) handlePreVoteRequest(ctx *RequestContext) error {
+	vr, err := protocol.ParseVoteRequestValue(ctx.Request.Value)
+	if err != nil {
+		s.log().Warn("PREVOTE rejected: malformed request", "error", err)
+		return s.writeResponse(ctx.StreamTransport, s.buildPreVoteResponse(false))
+	}
+
+	s.roleMu.Lock()
+	resp := s.evaluatePreVoteLocked(vr)
+	s.roleMu.Unlock()
+
+	return s.writeResponse(ctx.StreamTransport, resp)
+}
+
 func (s *Server) handleVoteRequest(ctx *RequestContext) error {
 	vr, err := protocol.ParseVoteRequestValue(ctx.Request.Value)
 	if err != nil {
@@ -365,12 +379,7 @@ func (s *Server) evaluateVoteLocked(vr protocol.VoteRequestValue) (protocol.Resp
 	if vr.Term > myTerm {
 		s.term.Store(vr.Term)
 		s.votedFor = ""
-		cur := s.currentRole()
-		if cur != RoleFollower {
-			s.role.Store(uint32(RoleFollower))
-			s.log().Info("became follower", "term", s.term.Load())
-			stepped = true
-		}
+		stepped = s.setRoleFollower()
 		if err := s.storeState(); err != nil {
 			s.log().Error("failed to persist state on term bump", "error", err)
 		}
@@ -397,6 +406,37 @@ func (s *Server) evaluateVoteLocked(vr protocol.VoteRequestValue) (protocol.Resp
 
 	s.log().Info("VOTE granted", "candidate", vr.NodeID, "term", vr.Term)
 	return s.buildVoteResponse(true), stepped
+}
+
+// evaluatePreVoteLocked decides whether to grant a pre-vote.
+// PreVote is side-effect-free: no term bump, no votedFor, no persistence.
+// Adds a lease check: reject if we've heard from a leader recently
+// (prevents a partitioned node from disrupting a healthy cluster).
+// Caller must hold s.roleMu.
+func (s *Server) evaluatePreVoteLocked(vr protocol.VoteRequestValue) protocol.Response {
+	myTerm := s.term.Load()
+
+	// Stale term — reject.
+	if vr.Term < myTerm {
+		s.log().Debug("PREVOTE rejected: stale term", "candidate", vr.NodeID, "candidateTerm", vr.Term, "myTerm", myTerm)
+		return s.buildPreVoteResponse(false)
+	}
+
+	// Log completeness check — candidate must be at least as up-to-date.
+	if vr.LastSeq < s.lastSeq.Load() {
+		s.log().Debug("PREVOTE rejected: candidate log behind", "candidate", vr.NodeID, "candidateLastSeq", vr.LastSeq, "myLastSeq", s.lastSeq.Load())
+		return s.buildPreVoteResponse(false)
+	}
+
+	// Lease check: if we've heard from the leader within the election timeout,
+	// the cluster is healthy — reject to prevent disruption.
+	if time.Since(s.lastHeartbeat) < electionTimeout {
+		s.log().Debug("PREVOTE rejected: leader lease active", "candidate", vr.NodeID, "lastHeartbeat", time.Since(s.lastHeartbeat))
+		return s.buildPreVoteResponse(false)
+	}
+
+	s.log().Info("PREVOTE granted", "candidate", vr.NodeID, "term", vr.Term)
+	return s.buildPreVoteResponse(true)
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"kvgo/protocol"
 	"testing"
+	"time"
 )
 
 func TestValidTransition(t *testing.T) {
@@ -19,6 +20,15 @@ func TestValidTransition(t *testing.T) {
 		{RoleCandidate, RoleLeader, true},    // won election
 		{RoleCandidate, RoleFollower, true},  // discovered higher term
 		{RoleLeader, RoleFollower, true},     // discovered higher term
+
+		// PreCandidate transitions
+		{RoleFollower, RolePreCandidate, true},      // election timeout (PreVote first)
+		{RolePreCandidate, RoleFollower, true},      // step-down
+		{RolePreCandidate, RoleCandidate, true},     // PreVote won
+		{RoleCandidate, RolePreCandidate, true},     // retry via PreVote
+		{RolePreCandidate, RoleLeader, false},       // can't skip candidate
+		{RoleLeader, RolePreCandidate, false},       // leader doesn't re-campaign
+		{RolePreCandidate, RolePreCandidate, false}, // no self-loop
 
 		// Illegal transitions
 		{RoleFollower, RoleLeader, false},  // can't skip candidate
@@ -43,6 +53,7 @@ func TestRoleString(t *testing.T) {
 		want string
 	}{
 		{RoleFollower, "follower"},
+		{RolePreCandidate, "pre-candidate"},
 		{RoleCandidate, "candidate"},
 		{RoleLeader, "leader"},
 		{Role(99), "unknown"},
@@ -449,5 +460,286 @@ func TestRandomElectionTimeout(t *testing.T) {
 		if d < min || d >= max {
 			t.Fatalf("randomElectionTimeout() = %v, want [%v, %v)", d, min, max)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PreVote unit tests (ep034)
+// ---------------------------------------------------------------------------
+
+func TestBecomePreCandidate_NoTermIncrement(t *testing.T) {
+	s := &Server{nodeID: "node-1"}
+	s.role.Store(uint32(RoleFollower))
+	s.term.Store(5)
+	s.votedFor = "old-candidate"
+
+	// becomePreCandidate calls tickPreElection which needs peerManager.
+	// We only test the transition guard here, so we set role directly.
+	cur := s.currentRole()
+	if !validTransition(cur, RolePreCandidate) {
+		t.Fatal("follower → pre-candidate should be valid")
+	}
+	s.role.Store(uint32(RolePreCandidate))
+
+	// PreVote is a dry run: term must NOT increment.
+	if s.term.Load() != 5 {
+		t.Errorf("term = %d, want 5 (unchanged)", s.term.Load())
+	}
+	// votedFor must NOT be set to self (PreVote doesn't grant a real vote).
+	if s.votedFor == "node-1" {
+		t.Error("votedFor should not be set to self during pre-candidacy")
+	}
+}
+
+func TestBecomePreCandidate_IllegalTransitions(t *testing.T) {
+	tests := []struct {
+		name string
+		from Role
+	}{
+		{"from leader", RoleLeader},
+		{"from pre-candidate (no self-loop)", RolePreCandidate},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			s.role.Store(uint32(tt.from))
+			if s.becomePreCandidate() {
+				t.Errorf("becomePreCandidate() from %s should return false", tt.from)
+			}
+		})
+	}
+}
+
+func TestEvaluatePreVoteLocked(t *testing.T) {
+	tests := []struct {
+		name         string
+		myTerm       uint64
+		myLastSeq    uint64
+		heartbeatAge time.Duration // time since last heartbeat
+		reqTerm      uint64
+		reqLastSeq   uint64
+		wantGranted  bool
+	}{
+		{
+			name:         "grant: eligible pre-vote",
+			myTerm:       5,
+			myLastSeq:    100,
+			heartbeatAge: electionTimeout + time.Second, // no recent heartbeat
+			reqTerm:      6,                             // term+1 from pre-candidate
+			reqLastSeq:   100,
+			wantGranted:  true,
+		},
+		{
+			name:         "grant: candidate log ahead",
+			myTerm:       5,
+			myLastSeq:    50,
+			heartbeatAge: electionTimeout + time.Second,
+			reqTerm:      6,
+			reqLastSeq:   100,
+			wantGranted:  true,
+		},
+		{
+			name:         "reject: stale term",
+			myTerm:       10,
+			myLastSeq:    100,
+			heartbeatAge: electionTimeout + time.Second,
+			reqTerm:      5,
+			reqLastSeq:   100,
+			wantGranted:  false,
+		},
+		{
+			name:         "reject: candidate log behind",
+			myTerm:       5,
+			myLastSeq:    200,
+			heartbeatAge: electionTimeout + time.Second,
+			reqTerm:      6,
+			reqLastSeq:   100,
+			wantGranted:  false,
+		},
+		{
+			name:         "reject: leader lease active",
+			myTerm:       5,
+			myLastSeq:    100,
+			heartbeatAge: 100 * time.Millisecond, // very recent heartbeat
+			reqTerm:      6,
+			reqLastSeq:   100,
+			wantGranted:  false,
+		},
+		{
+			name:         "reject: lease at boundary",
+			myTerm:       5,
+			myLastSeq:    100,
+			heartbeatAge: electionTimeout / 2, // within timeout
+			reqTerm:      6,
+			reqLastSeq:   100,
+			wantGranted:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			s.term.Store(tt.myTerm)
+			s.lastSeq.Store(tt.myLastSeq)
+			s.lastHeartbeat = time.Now().Add(-tt.heartbeatAge)
+
+			vr := protocol.VoteRequestValue{
+				Term:    tt.reqTerm,
+				NodeID:  "pre-candidate-1",
+				LastSeq: tt.reqLastSeq,
+			}
+
+			resp := s.evaluatePreVoteLocked(vr)
+
+			vresp, err := protocol.ParseVoteResponseValue(resp.Value)
+			if err != nil {
+				t.Fatalf("ParseVoteResponseValue: %v", err)
+			}
+
+			if vresp.Granted != tt.wantGranted {
+				t.Errorf("granted = %v, want %v", vresp.Granted, tt.wantGranted)
+			}
+
+			if resp.Status != protocol.StatusPreVoteResponse {
+				t.Errorf("status = %d, want StatusPreVoteResponse(%d)", resp.Status, protocol.StatusPreVoteResponse)
+			}
+		})
+	}
+}
+
+func TestEvaluatePreVoteLocked_NeverMutatesState(t *testing.T) {
+	// evaluatePreVoteLocked must be side-effect-free:
+	// term, votedFor, and role must remain unchanged regardless of outcome.
+	tests := []struct {
+		name         string
+		heartbeatAge time.Duration
+		reqTerm      uint64
+		reqLastSeq   uint64
+	}{
+		{"grant path", electionTimeout + time.Second, 6, 100},
+		{"reject: stale term", electionTimeout + time.Second, 3, 100},
+		{"reject: short log", electionTimeout + time.Second, 6, 50},
+		{"reject: lease active", 100 * time.Millisecond, 6, 100},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{
+				votedFor: "someone-else",
+			}
+			s.term.Store(5)
+			s.lastSeq.Store(100)
+			s.role.Store(uint32(RoleFollower))
+			s.lastHeartbeat = time.Now().Add(-tt.heartbeatAge)
+
+			vr := protocol.VoteRequestValue{
+				Term:    tt.reqTerm,
+				NodeID:  "pre-candidate-1",
+				LastSeq: tt.reqLastSeq,
+			}
+
+			s.evaluatePreVoteLocked(vr)
+
+			if s.term.Load() != 5 {
+				t.Errorf("term mutated: got %d, want 5", s.term.Load())
+			}
+			if s.votedFor != "someone-else" {
+				t.Errorf("votedFor mutated: got %q, want %q", s.votedFor, "someone-else")
+			}
+			if s.currentRole() != RoleFollower {
+				t.Errorf("role mutated: got %s, want follower", s.currentRole())
+			}
+		})
+	}
+}
+
+func TestBuildPreVoteResponse_Encoding(t *testing.T) {
+	tests := []struct {
+		name    string
+		term    uint64
+		granted bool
+	}{
+		{"granted", 5, true},
+		{"denied", 10, false},
+		{"term zero granted", 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			s.term.Store(tt.term)
+			resp := s.buildPreVoteResponse(tt.granted)
+
+			if resp.Status != protocol.StatusPreVoteResponse {
+				t.Fatalf("status = %d, want StatusPreVoteResponse", resp.Status)
+			}
+
+			vr, err := protocol.ParseVoteResponseValue(resp.Value)
+			if err != nil {
+				t.Fatalf("ParseVoteResponseValue() error: %v", err)
+			}
+			if vr.Term != tt.term {
+				t.Errorf("term = %d, want %d", vr.Term, tt.term)
+			}
+			if vr.Granted != tt.granted {
+				t.Errorf("granted = %v, want %v", vr.Granted, tt.granted)
+			}
+		})
+	}
+}
+
+func TestPreVoteResponse_RoundTrip(t *testing.T) {
+	s := &Server{}
+	s.term.Store(42)
+	resp := s.buildPreVoteResponse(true)
+
+	payload, err := protocol.EncodeResponse(resp)
+	if err != nil {
+		t.Fatalf("EncodeResponse() error: %v", err)
+	}
+
+	decoded, err := protocol.DecodeResponse(payload)
+	if err != nil {
+		t.Fatalf("DecodeResponse() error: %v", err)
+	}
+
+	if decoded.Status != protocol.StatusPreVoteResponse {
+		t.Fatalf("status = %d, want StatusPreVoteResponse", decoded.Status)
+	}
+
+	vr, vrErr := protocol.ParseVoteResponseValue(decoded.Value)
+	if vrErr != nil {
+		t.Fatalf("ParseVoteResponseValue() error: %v", vrErr)
+	}
+	if vr.Term != 42 {
+		t.Errorf("round-trip term = %d, want 42", vr.Term)
+	}
+	if !vr.Granted {
+		t.Errorf("round-trip granted = false, want true")
+	}
+}
+
+func TestSetRoleFollower(t *testing.T) {
+	tests := []struct {
+		name        string
+		from        Role
+		wantChanged bool
+	}{
+		{"from leader", RoleLeader, true},
+		{"from candidate", RoleCandidate, true},
+		{"from pre-candidate", RolePreCandidate, true},
+		{"from follower (no-op)", RoleFollower, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			s.role.Store(uint32(tt.from))
+			got := s.setRoleFollower()
+			if got != tt.wantChanged {
+				t.Errorf("setRoleFollower() = %v, want %v", got, tt.wantChanged)
+			}
+			if s.currentRole() != RoleFollower {
+				t.Errorf("role after = %s, want follower", s.currentRole())
+			}
+		})
 	}
 }

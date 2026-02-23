@@ -94,7 +94,7 @@ Start as follower when peers exist. Actively probe peers with `CmdDiscovery` to 
 - Option B (pure discovery) has no safe fallback — if all peers are unreachable, the node is stuck forever.
 - Option D combines the safety of C with the speed of B.
 
-**What we don't do: PreVote.** etcd's PreVote prevents a partitioned node from disrupting the cluster by probing "would I win?" before incrementing its term. We have a simpler substitute: the `fenced` flag from episode 032. A fenced node won't campaign. And the discovery phase ensures a restarting node finds the leader before it even considers an election. PreVote is the right answer for large clusters with complex partition scenarios — for a 3-5 node system, discovery + fenced flag is sufficient. PreVote remains an open thread for later.
+**What we defer: PreVote.** etcd's PreVote prevents a partitioned node from disrupting the cluster by probing "would I win?" before incrementing its term. Discovery + the `fenced` flag cover the restart case (a restarting node finds the leader before considering an election), but they don't cover a follower that is partitioned from the start — that node still inflates its term via repeated `becomeCandidate()` calls. PreVote is addressed in episode 034.
 
 ## Flow
 

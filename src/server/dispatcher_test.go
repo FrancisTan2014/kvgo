@@ -29,6 +29,7 @@ func TestCommandRegistration(t *testing.T) {
 		{protocol.CmdTopology, "TOPOLOGY"},
 		{protocol.CmdPeerHandshake, "PEER"},
 		{protocol.CmdVoteRequest, "VOTE"},
+		{protocol.CmdPreVoteRequest, "PREVOTE"},
 		{protocol.CmdDiscovery, "DISCOVERY"},
 	}
 

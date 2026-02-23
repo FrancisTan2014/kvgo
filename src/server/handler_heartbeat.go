@@ -39,11 +39,14 @@ func (s *Server) handlePing(ctx *RequestContext) error {
 		s.roleMu.Lock()
 		s.term.Store(senderTerm)
 		s.votedFor = ""
+		stepped := s.setRoleFollower()
 		if err := s.storeState(); err != nil {
 			s.log().Error("failed to persist state on term bump", "error", err)
 		}
 		s.roleMu.Unlock()
-		s.becomeFollower()
+		if stepped {
+			s.notifyRoleChanged()
+		}
 	}
 
 	s.lastHeartbeat = time.Now()
@@ -78,6 +81,7 @@ func (s *Server) processPongResponse(respPayload []byte, rc *replicaConn) {
 		s.roleMu.Lock()
 		s.term.Store(respTerm)
 		s.votedFor = ""
+		stepped := s.setRoleFollower()
 		if err := s.storeState(); err != nil {
 			s.log().Error("failed to persist state after step-down", "error", err)
 		}
@@ -89,7 +93,9 @@ func (s *Server) processPongResponse(respPayload []byte, rc *replicaConn) {
 		if wasLeader {
 			s.lastHeartbeat = time.Now()
 		}
-		s.becomeFollower()
+		if stepped {
+			s.notifyRoleChanged()
+		}
 
 		if wasLeader {
 			if addr, ok := s.peerManager.AnyAddr(); ok {
@@ -134,7 +140,7 @@ func (s *Server) heartbeatLoop() {
 				continue // fenced node must not trigger elections; wait for leader contact
 			}
 			if time.Since(s.lastHeartbeat) >= randomElectionTimeout() {
-				_ = s.becomeCandidate() // follower → candidate, or candidate retries with new term
+				_ = s.becomePreCandidate() // follower → pre-candidate, or pre-candidate retries with new term
 			}
 		}
 	}
