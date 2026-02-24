@@ -82,8 +82,10 @@ func (p *PeerManager) healthCheck(ctx context.Context, probe func(ctx context.Co
 
 // MergePeers upserts peers into the known topology. New peers are added lazily
 // (no dial until Get). Existing peers with changed addresses are re-dialed.
-// Peers absent from the incoming list are retained — historical nodes are never
-// removed by a topology update. A nil or empty topology is a no-op.
+// When a new nodeID appears at an address already claimed by a different nodeID,
+// the stale entry is evicted (two nodes can't listen on the same address).
+// Peers absent from the incoming list are retained. A nil or empty topology
+// is a no-op.
 func (p *PeerManager) MergePeers(topology []PeerInfo) {
 	if len(topology) == 0 {
 		return
@@ -110,6 +112,21 @@ func (p *PeerManager) MergePeers(topology []PeerInfo) {
 			}
 			continue
 		}
+
+		// Evict any stale entry that holds the same address under a different nodeID.
+		// A node that restarted with a fresh identity still listens on the same port,
+		// so the old nodeID is unreachable and would cause phantom reconcile traffic.
+		for oldID, oldEntry := range p.peers {
+			if oldEntry.addr == pi.Addr {
+				if oldEntry.inner != nil {
+					_ = oldEntry.inner.Close()
+				}
+				delete(p.peers, oldID)
+				p.logger.Info("peer manager: evicted stale peer", "old_id", oldID, "new_id", pi.NodeID, "addr", pi.Addr)
+				break // at most one stale entry per address
+			}
+		}
+
 		p.logger.Info("peer manager: discovered peer", "node_id", pi.NodeID, "addr", pi.Addr)
 		p.peers[pi.NodeID] = &peerEntry{addr: pi.Addr}
 	}

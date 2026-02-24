@@ -507,12 +507,17 @@ func (s *Server) reconcilePeers() {
 	}
 
 	peerIDs := s.peerManager.NodeIDs()
+	myAddr := s.listenAddr()
 	for _, pid := range peerIDs {
 		if pid == s.nodeID {
 			continue
 		}
 		if connected[pid] {
 			continue
+		}
+		pi, ok := s.peerManager.Get(pid)
+		if !ok || pi.Addr == myAddr {
+			continue // stale entry pointing at our own address
 		}
 		go func() {
 			t, err := s.peerManager.GetTransport(pid)

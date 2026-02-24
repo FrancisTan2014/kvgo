@@ -124,6 +124,46 @@ func TestPeerManager_MergePeers(t *testing.T) {
 			t.Error("transport replaced on unchanged topology")
 		}
 	})
+
+	t.Run("evicts stale nodeID when new nodeID claims same address", func(t *testing.T) {
+		closed := false
+		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
+			return &mockRequestTransport{address: addr}, nil
+		}, noopLogger)
+
+		pm.MergePeers([]PeerInfo{
+			{NodeID: "old-id", Addr: "127.0.0.1:4001"},
+			{NodeID: "n2", Addr: "127.0.0.1:4002"},
+		})
+		// Dial old-id to cache transport, then track Close
+		pm.GetTransport("old-id")
+		pm.mu.Lock()
+		pm.peers["old-id"].inner = &closeTrackingTransport{closed: &closed}
+		pm.mu.Unlock()
+
+		// A replica restarted with a new nodeID at the same address
+		pm.MergePeers([]PeerInfo{
+			{NodeID: "new-id", Addr: "127.0.0.1:4001"},
+		})
+
+		ids := pm.NodeIDs()
+		sort.Strings(ids)
+		if len(ids) != 2 {
+			t.Fatalf("len = %d, want 2", len(ids))
+		}
+		// old-id should be gone, new-id should exist
+		_, oldExists := pm.Get("old-id")
+		if oldExists {
+			t.Error("stale peer old-id should have been evicted")
+		}
+		pi, newExists := pm.Get("new-id")
+		if !newExists || pi.Addr != "127.0.0.1:4001" {
+			t.Errorf("new-id not found or wrong addr: %+v", pi)
+		}
+		if !closed {
+			t.Error("stale peer transport should have been closed")
+		}
+	})
 }
 
 func TestPeerManager_PeerInfos(t *testing.T) {

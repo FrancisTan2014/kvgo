@@ -272,4 +272,36 @@ func TestReconcilePeers(t *testing.T) {
 		// Should not panic
 		s.reconcilePeers()
 	})
+
+	t.Run("skips stale peer whose address matches leader listenAddr", func(t *testing.T) {
+		// Regression: after multiple restarts with fresh data dirs, replication.meta
+		// accumulates stale nodeIDs pointing at the leader's own address. Reconcile
+		// must not send REPLICAOF to its own address under a foreign nodeID.
+		capture := &capturingTransport{}
+		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
+			return capture, nil
+		}, noopLogger)
+		pm.MergePeers([]PeerInfo{
+			{NodeID: "stale-old-primary", Addr: "10.0.0.1:4000"}, // same addr as leader
+			{NodeID: "r1", Addr: "10.0.0.2:4000"},
+		})
+
+		rc := &replicaConn{nodeID: "r1", listenAddr: "10.0.0.2:4000"}
+		rc.connected.Store(true)
+
+		s := &Server{
+			nodeID:      "leader",
+			peerManager: pm,
+			replicas:    map[string]*replicaConn{"r1": rc},
+			opts:        Options{Host: "10.0.0.1", Port: 4000},
+		}
+		s.role.Store(uint32(RoleLeader))
+
+		s.reconcilePeers()
+		time.Sleep(50 * time.Millisecond)
+
+		if len(capture.payloads()) != 0 {
+			t.Errorf("should not reconcile stale peer at own address, got %d requests", len(capture.payloads()))
+		}
+	})
 }
