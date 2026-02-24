@@ -136,6 +136,11 @@ func (s *Server) handleNack(ctx *RequestContext) error {
 // processPrimaryPut handles a write on the primary node.
 // Applies locally, forwards to replicas, optionally waits for quorum ACKs.
 func (s *Server) processPrimaryPut(ctx *RequestContext) error {
+	// reject writes on transferring
+	if s.transferring.Load() {
+		return s.responseWithStatus(ctx, protocol.StatusNotLeader)
+	}
+
 	req := &ctx.Request
 	key := string(req.Key)
 

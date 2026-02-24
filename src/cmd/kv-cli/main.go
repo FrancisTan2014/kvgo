@@ -31,7 +31,7 @@ func main() {
 	defer conn.Close()
 
 	fmt.Printf("connected to %s\n", *addr)
-	fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
+	fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, transfer <nodeID>, cleanup, quit")
 	fmt.Println()
 
 	t := transport.NewMultiplexedTransport(conn)
@@ -159,9 +159,23 @@ func main() {
 				}
 			}
 
+		case "transfer":
+			if len(parts) < 2 {
+				fmt.Println("usage: transfer <nodeID>")
+				continue
+			}
+			target := parts[1]
+			if err := doTransfer(t, target, *timeout); err != nil {
+				fmt.Printf("error: %v\n", err)
+				if isConnectionError(err) {
+					fmt.Println("connection lost, exiting")
+					os.Exit(1)
+				}
+			}
+
 		default:
 			fmt.Printf("unknown command: %s\n", cmd)
-			fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, cleanup, quit")
+			fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, transfer <nodeID>, cleanup, quit")
 		}
 	}
 
@@ -416,6 +430,41 @@ func doCleanup(t transport.StreamTransport, timeout time.Duration) error {
 		fmt.Println("OK (cleanup started)")
 	case protocol.StatusError:
 		fmt.Println("(server error)")
+	default:
+		fmt.Printf("(unexpected status: %d)\n", resp.Status)
+	}
+	return nil
+}
+
+func doTransfer(t transport.StreamTransport, target string, timeout time.Duration) error {
+	req := protocol.NewTransferLeaderRequest(target)
+	payload, err := protocol.EncodeRequest(req)
+	if err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := t.Send(ctx, payload); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	respPayload, err := t.Receive(ctx)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	switch resp.Status {
+	case protocol.StatusOK:
+		fmt.Println("OK (transfer initiated)")
+	case protocol.StatusError:
+		fmt.Println("(server error — target may not be connected or reachable)")
 	default:
 		fmt.Printf("(unexpected status: %d)\n", resp.Status)
 	}

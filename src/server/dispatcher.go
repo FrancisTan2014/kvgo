@@ -31,6 +31,8 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdVoteRequest] = (*Server).handleVoteRequest
 	s.requestHandlers[protocol.CmdPreVoteRequest] = (*Server).handlePreVoteRequest
 	s.requestHandlers[protocol.CmdDiscovery] = (*Server).handleDiscovery
+	s.requestHandlers[protocol.CmdTransferLeader] = (*Server).handleTransferLeader
+	s.requestHandlers[protocol.CmdTimeoutNow] = (*Server).handleTimeoutNow
 }
 
 func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duration) (takenOver bool) {

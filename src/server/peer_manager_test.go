@@ -116,7 +116,7 @@ func TestPeerManager_MergePeers(t *testing.T) {
 		})
 		t2, _ := pm.GetTransport("n1")
 
-		if t1 != t2 {
+		if t1.RemoteAddr() != t2.RemoteAddr() {
 			t.Error("transport replaced on unchanged topology")
 		}
 	})
@@ -197,14 +197,12 @@ func TestPeerManager_GetTransport(t *testing.T) {
 		if dialCount != 1 {
 			t.Errorf("dial count = %d, want 1", dialCount)
 		}
+		_ = t1 // wrapper identity differs per call; dial count verifies caching
 
-		// Second GetTransport reuses cached transport
-		t2, err := pm.GetTransport("n1")
+		// Second GetTransport reuses cached inner transport (dial count stays 1)
+		_, err = pm.GetTransport("n1")
 		if err != nil {
 			t.Fatalf("GetTransport: %v", err)
-		}
-		if t1 != t2 {
-			t.Error("second Get returned different transport")
 		}
 		if dialCount != 1 {
 			t.Errorf("dial count = %d, want 1 (cached)", dialCount)
@@ -380,4 +378,69 @@ func (c *closeTrackingTransport) Close() error {
 
 func (c *closeTrackingTransport) RemoteAddr() string {
 	return c.address
+}
+
+func TestPeerManager_ReconnectOnError(t *testing.T) {
+	t.Run("redials after request error", func(t *testing.T) {
+		dialCount := 0
+		failOnce := true
+		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
+			dialCount++
+			if failOnce {
+				failOnce = false
+				return &mockRequestTransport{address: addr, err: errors.New("conn reset")}, nil
+			}
+			return &mockRequestTransport{address: addr}, nil
+		}, noopLogger)
+
+		pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
+
+		// First dial returns a transport that will fail on Request
+		t1, err := pm.GetTransport("n1")
+		if err != nil {
+			t.Fatalf("GetTransport: %v", err)
+		}
+		if dialCount != 1 {
+			t.Fatalf("dial count = %d, want 1", dialCount)
+		}
+
+		// Request fails — triggers invalidation
+		_, err = t1.Request(context.Background(), nil)
+		if err == nil {
+			t.Fatal("expected error from broken transport")
+		}
+
+		// Next GetTransport should redial (dial count goes to 2)
+		t2, err := pm.GetTransport("n1")
+		if err != nil {
+			t.Fatalf("GetTransport after error: %v", err)
+		}
+		if dialCount != 2 {
+			t.Fatalf("dial count = %d, want 2 (should have redialed)", dialCount)
+		}
+
+		// New transport works
+		_, err = t2.Request(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("Request on new transport: %v", err)
+		}
+	})
+
+	t.Run("successful request preserves cache", func(t *testing.T) {
+		dialCount := 0
+		pm := NewPeerManager(func(addr string) (transport.RequestTransport, error) {
+			dialCount++
+			return &mockRequestTransport{address: addr}, nil
+		}, noopLogger)
+
+		pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
+
+		t1, _ := pm.GetTransport("n1")
+		_, _ = t1.Request(context.Background(), nil) // success — no invalidation
+
+		_, _ = pm.GetTransport("n1")
+		if dialCount != 1 {
+			t.Errorf("dial count = %d, want 1 (cache should survive successful request)", dialCount)
+		}
+	})
 }

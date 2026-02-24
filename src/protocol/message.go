@@ -58,11 +58,13 @@ const (
 	CmdCleanup        Cmd = 7  // Trigger value file compaction
 	CmdAck            Cmd = 8  // Replica ACKs
 	CmdNack           Cmd = 9  // Replica negative ACK (write failed)
-	CmdTopology       Cmd = 11 // Topology broadcast
-	CmdPeerHandshake  Cmd = 12 // Peer handshake
-	CmdPreVoteRequest Cmd = 13 // PreVote probe (no term increment)
-	CmdVoteRequest    Cmd = 14 // Election request
-	CmdDiscovery      Cmd = 15 // Discovery request
+	CmdTopology       Cmd = 10 // Topology broadcast
+	CmdPeerHandshake  Cmd = 11 // Peer handshake
+	CmdPreVoteRequest Cmd = 12 // PreVote probe (no term increment)
+	CmdVoteRequest    Cmd = 13 // Election request
+	CmdDiscovery      Cmd = 14 // Discovery request
+	CmdTransferLeader Cmd = 15 // Leader transfer start
+	CmdTimeoutNow     Cmd = 16 // Tell the target follower to start an election right now
 )
 
 type Status uint8
@@ -80,6 +82,7 @@ const (
 	StatusPreVoteResponse                 // PreVote response; Value contains term and granted (same format as VoteResponse)
 	StatusVoteResponse                    // Vote response; Value contains vote granted/denied
 	StatusDiscoveryResponse               // Discovery response; Value contains current term and leader address
+	StatusNotLeader                       // Server cannot accept writes (leader transfer, quorum-loss step-down); describes the effect, not the mechanism
 
 	statusMaxKnown // Sentinel: update when adding new status codes
 )
@@ -196,7 +199,7 @@ func EncodeRequest(req Request) ([]byte, error) {
 		if req.RequestId != "" {
 			flags |= FlagHasRequestId
 		}
-	case CmdReplicate, CmdPing:
+	case CmdReplicate, CmdPing, CmdTimeoutNow:
 		flags |= FlagHasSeq
 	case CmdGet:
 		if req.RequireQuorum {

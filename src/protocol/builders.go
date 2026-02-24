@@ -300,3 +300,22 @@ func ParseDiscoveryResponseValue(value []byte) (DiscoveryResponseValue, error) {
 
 	return DiscoveryResponseValue{Term: term, LeaderId: parts[1], LeaderAddr: parts[2]}, nil
 }
+
+// ---------------------------------------------------------------------------
+// Transfer Leader (CmdTransferLeader)
+// Request Value = target node ID
+// ---------------------------------------------------------------------------
+
+func NewTransferLeaderRequest(target string) Request {
+	return Request{
+		Cmd:   CmdTransferLeader,
+		Value: []byte(target),
+	}
+}
+
+func NewTimeoutNowRequest(seq uint64) Request {
+	return Request{
+		Cmd: CmdTimeoutNow,
+		Seq: seq,
+	}
+}

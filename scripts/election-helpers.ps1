@@ -21,7 +21,7 @@ function Get-BinaryPath($name) {
 
 function Cleanup-All {
     Get-Process kv-server, kv-cli, kv-bench -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Seconds 2
 }
 
 function Initialize-DataDir($testName) {

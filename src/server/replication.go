@@ -56,11 +56,22 @@ func (s *Server) startReplicationLoop() {
 		s.replCancel()
 	}
 
-	// Create new context for this loop
+	// Wait for old loop goroutine to fully exit before starting a new one.
+	// Without this, the old loop can reconnect (using the updated ReplicaOf
+	// address) while the new loop is also running — two loops doing full
+	// resync concurrently causes "FATAL: WAL write failed: file already closed".
+	if s.replDone != nil {
+		<-s.replDone
+	}
+
+	// Create new context and done channel for this loop
 	s.replCtx, s.replCancel = context.WithCancel(s.ctx)
+	done := make(chan struct{})
+	s.replDone = done
 	ctx := s.replCtx
 
 	s.connWg.Go(func() {
+		defer close(done)
 		s.replicationLoop(ctx)
 	})
 }
@@ -237,7 +248,7 @@ func (s *Server) forwardToReplicas(payload []byte, seq uint64) {
 func (s *Server) serveReplica(rc *replicaConn) bool {
 	// Check timeline compatibility
 	if rc.lastReplid != "" && rc.lastReplid != s.replid {
-		s.log().Error("incompatible replid detected — replica was following different primary",
+		s.log().Warn("incompatible replid detected — replica was following different primary",
 			"replica", rc.listenAddr,
 			"replica_replid", rc.lastReplid,
 			"primary_replid", s.replid,

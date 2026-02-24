@@ -4,6 +4,7 @@ import (
 	"context"
 	"kvgo/protocol"
 	"kvgo/transport"
+	"sync"
 	"testing"
 	"time"
 )
@@ -290,5 +291,62 @@ func TestRegression_ReconcileSkipsWhenAllDisconnected(t *testing.T) {
 
 	if len(capture.payloads()) != 0 {
 		t.Errorf("stale leader with all replicas disconnected should NOT reconcile, got %d requests", len(capture.payloads()))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: concurrent relocate tears down DB mid-sync (#7)
+//
+// After leader transfer, a node receives two concurrent relocate() calls to
+// the same target (e.g. VOTE step-down + broadcastPromotion from R1).
+// Without serialization, both spawn teardownReplicationState()+
+// startReplicationLoop() goroutines. The second teardown closes the DB
+// engine while the first full-resync is writing, causing
+// "FATAL: WAL write failed: file already closed".
+//
+// Fix: relocateMu serializes all relocate() calls. startReplicationLoop
+// waits for the previous loop to exit via replDone before starting a new one.
+// ---------------------------------------------------------------------------
+
+func TestRegression_ConcurrentRelocateSameTarget(t *testing.T) {
+	s := &Server{
+		opts:        Options{Host: "10.0.0.1", Port: 4000, DataDir: t.TempDir()},
+		replicas:    make(map[string]*replicaConn),
+		peerManager: NewPeerManager(nil, noopLogger),
+	}
+	defer func() {
+		if s.metaFile != nil {
+			s.metaFile.Close()
+		}
+	}()
+	s.role.Store(uint32(RoleLeader))
+	s.term.Store(3)
+	s.lastSeq.Store(100)
+	s.roleChanged = make(chan struct{})
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	defer s.cancel()
+
+	target := "10.0.0.2:4000"
+
+	// Fire two concurrent relocate calls to the same target.
+	// relocateMu serializes them — second sees alreadyFollowing and returns.
+	var wg sync.WaitGroup
+	var err1, err2 error
+	wg.Add(2)
+	go func() { defer wg.Done(); err1 = s.relocate(target) }()
+	go func() { defer wg.Done(); err2 = s.relocate(target) }()
+	wg.Wait()
+
+	if err1 != nil {
+		t.Fatalf("relocate goroutine 1 failed: %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("relocate goroutine 2 failed: %v", err2)
+	}
+	if s.opts.ReplicaOf != target {
+		t.Fatalf("ReplicaOf = %q, want %q", s.opts.ReplicaOf, target)
+	}
+	if !s.isFollower() {
+		t.Fatal("should be follower after relocate")
 	}
 }

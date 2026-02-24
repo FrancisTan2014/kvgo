@@ -119,6 +119,17 @@ func (s *Server) applyReplicatedPut(ctx *RequestContext) error {
 		s.log().Error("failed to store replica state", "error", err)
 	}
 
+	pendingSeq := s.pendingTransferSeq.Load()
+	s.transferMu.RLock()
+	ch := s.seqReachedCh
+	s.transferMu.RUnlock()
+	if pendingSeq > 0 && int64(req.Seq) >= pendingSeq && ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+
 	return nil
 }
 
@@ -162,9 +173,13 @@ func (s *Server) responseStatusWithPrimaryAddress(ctx *RequestContext, status pr
 }
 
 func (s *Server) responseStatusError(ctx *RequestContext) error {
-	return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: protocol.StatusError})
+	return s.responseWithStatus(ctx, protocol.StatusError)
 }
 
 func (s *Server) responseStatusOk(ctx *RequestContext) error {
-	return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: protocol.StatusOK})
+	return s.responseWithStatus(ctx, protocol.StatusOK)
+}
+
+func (s *Server) responseWithStatus(ctx *RequestContext, status protocol.Status) error {
+	return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: status})
 }

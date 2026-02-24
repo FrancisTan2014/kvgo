@@ -86,6 +86,23 @@ func (s *Server) relocate(primaryAddr string) error {
 	if primaryAddr == s.listenAddr() {
 		return fmt.Errorf("relocate: refusing to replicate from self (%s)", primaryAddr)
 	}
+
+	// Serialize all relocate calls. Without this, concurrent callers
+	// (e.g. VOTE step-down + broadcastPromotion) each spawn a
+	// teardown+restart cycle, the second teardown closes the DB
+	// while the first resync is writing.
+	s.relocateMu.Lock()
+	defer s.relocateMu.Unlock()
+
+	// If we're already following this primary, skip teardown+restart.
+	s.connMu.RLock()
+	alreadyFollowing := s.isFollower() && s.opts.ReplicaOf == primaryAddr
+	s.connMu.RUnlock()
+	if alreadyFollowing {
+		s.log().Debug("relocate: already following target, skipping", "address", primaryAddr)
+		return nil
+	}
+
 	s.log().Info("switching primary", "address", primaryAddr)
 
 	if !s.isFollower() {
@@ -98,16 +115,18 @@ func (s *Server) relocate(primaryAddr string) error {
 		s.primarySeq = s.lastSeq.Load()
 	}
 
-	// Update config immediately
+	// Tear down old replication state (cancels context, closes primary
+	// transport to unblock receiveFromPrimary). Then set the new address
+	// and start a fresh loop. startReplicationLoop waits for the old
+	// loop goroutine to fully exit via replDone before launching the
+	// new one, preventing concurrent loops.
+	s.teardownReplicationState()
+
 	s.connMu.Lock()
 	s.opts.ReplicaOf = primaryAddr
 	s.connMu.Unlock()
 
-	// Do cleanup async to avoid blocking client response
-	go func() {
-		s.teardownReplicationState()
-		s.startReplicationLoop()
-	}()
+	s.startReplicationLoop()
 
 	return nil
 }
@@ -191,7 +210,7 @@ func (s *Server) broadcastPromotion() {
 				s.log().Debug("broadcastPromotion: peer unreachable", "peer", pid, "error", err)
 				return
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), promotionBroadcastTimeout)
 			defer cancel()
 			if _, err := t.Request(ctx, payload); err != nil {
 				s.log().Debug("broadcastPromotion: request failed", "peer", pid, "error", err)
@@ -623,4 +642,127 @@ func (s *Server) handleDiscovery(ctx *RequestContext) error {
 	}
 
 	return s.writeResponse(ctx.StreamTransport, resp)
+}
+
+// ---------------------------------------------------------------------------
+// Transfer Leader To A Target Follower
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleTransferLeader(ctx *RequestContext) error {
+	target := string(ctx.Request.Value)
+	if target == "" {
+		s.log().Warn("TRANSFER reject: empty target received")
+		return s.responseStatusError(ctx)
+	}
+
+	replica, exists := s.getReplicaSnapshot()[target]
+	if !exists || !replica.connected.Load() {
+		s.log().Warn("TRANSFER reject: target replica not connected", "target", target)
+		return s.responseStatusError(ctx)
+	}
+
+	pt, err := s.peerManager.GetTransport(target)
+	if err != nil {
+		s.log().Warn("TRANSFER reject: cannot reach target peer", "target", target, "error", err)
+		return s.responseStatusError(ctx)
+	}
+
+	req := protocol.NewTimeoutNowRequest(s.seq.Load())
+	reqPayload, _ := protocol.EncodeRequest(req)
+	c, cancel := context.WithTimeout(context.Background(), transferCatchUpTimeout)
+	defer cancel()
+
+	s.transferring.Store(true) // reject all writes
+	respPayload, err := pt.Request(c, reqPayload)
+	if err != nil {
+		s.transferring.Store(false)
+		s.log().Warn("TRANSFER failed: request error", "target", target, "error", err)
+		return s.responseStatusError(ctx)
+	}
+
+	resp, err := protocol.DecodeResponse(respPayload)
+	if err != nil {
+		s.transferring.Store(false)
+		s.log().Warn("TRANSFER failed: invalid response", "target", target, "error", err)
+		return s.responseStatusError(ctx)
+	}
+
+	if resp.Status != protocol.StatusOK {
+		s.transferring.Store(false)
+		s.log().Warn("TRANSFER failed: non-ok status", "status", resp.Status, "target", target)
+		return s.responseStatusError(ctx)
+	}
+
+	go func() {
+		time.Sleep(electionTimeout)
+		if s.transferring.CompareAndSwap(true, false) {
+			s.log().Warn("TRANSFER timed out, resuming writes", "target", target)
+		}
+	}()
+
+	s.log().Info("TRANSFER initiated", "target", target, "seq", s.seq.Load())
+	return s.responseStatusOk(ctx)
+}
+
+func (s *Server) handleTimeoutNow(ctx *RequestContext) error {
+	s.fenced.Store(false)
+
+	targetSeq := ctx.Request.Seq
+	s.log().Info("TIMEOUT_NOW received", "targetSeq", targetSeq, "lastSeq", s.lastSeq.Load())
+
+	// fast path: already caught up — campaign immediately
+	if s.lastSeq.Load() >= targetSeq {
+		s.log().Info("TIMEOUT_NOW: already caught up, campaigning")
+		go func() {
+			if !s.becomeCandidate() {
+				s.log().Warn("TIMEOUT_NOW: becomeCandidate failed")
+			}
+		}()
+		return s.responseStatusOk(ctx)
+	}
+
+	s.transferMu.Lock()
+	// create channel before atomic store — PUT goroutines that observe
+	// pendingTransferSeq > 0 are guaranteed to see the channel
+	// (atomic store provides happens-before)
+	s.seqReachedCh = make(chan struct{}, 1)
+	s.transferMu.Unlock()
+	defer func() {
+		s.transferMu.Lock()
+		defer s.transferMu.Unlock()
+		s.seqReachedCh = nil
+		s.pendingTransferSeq.Store(0)
+	}()
+
+	s.pendingTransferSeq.Store(int64(targetSeq))
+	c, cancel := context.WithTimeout(context.Background(), transferCatchUpTimeout)
+	defer cancel()
+
+	// set-then-check: if the last PUT landed between the first check and the Store above,
+	// lastSeq already reached the target — catch it here before blocking on the channel
+	if s.lastSeq.Load() >= targetSeq {
+		s.log().Info("TIMEOUT_NOW: caught up after store, campaigning")
+		go func() {
+			if !s.becomeCandidate() {
+				s.log().Warn("TIMEOUT_NOW: becomeCandidate failed")
+			}
+		}()
+		return s.responseStatusOk(ctx)
+	}
+
+	s.log().Info("TIMEOUT_NOW: waiting for catch-up", "lastSeq", s.lastSeq.Load(), "targetSeq", targetSeq)
+
+	select {
+	case <-s.seqReachedCh:
+		s.log().Info("TIMEOUT_NOW: caught up via replication, campaigning")
+		go func() {
+			if !s.becomeCandidate() {
+				s.log().Warn("TIMEOUT_NOW: becomeCandidate failed")
+			}
+		}()
+		return s.responseStatusOk(ctx)
+	case <-c.Done():
+		s.log().Warn("TIMEOUT_NOW: catch-up timed out", "targetSeq", targetSeq, "lastSeq", s.lastSeq.Load())
+		return s.responseStatusError(ctx)
+	}
 }

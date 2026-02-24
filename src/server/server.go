@@ -110,8 +110,10 @@ type Server struct {
 	primarySeq    uint64        // primary's position from heartbeat; compared with lastSeq for staleness detection
 
 	// Replication loop control
+	relocateMu sync.Mutex // serializes relocate() calls — prevents concurrent teardown+restart
 	replCtx    context.Context
 	replCancel context.CancelFunc
+	replDone   chan struct{} // closed when replicationLoop goroutine exits
 
 	// Quorum control
 	quorumMu     sync.RWMutex
@@ -127,6 +129,12 @@ type Server struct {
 	roleChanged chan struct{}
 	roleMu      sync.Mutex
 	fenced      atomic.Bool // set on quorum-loss step-down; cleared when connected to a real leader
+
+	// Leader transferring
+	transferMu         sync.RWMutex
+	seqReachedCh       chan struct{}
+	transferring       atomic.Bool // set on leader transfer; rejects writes until transfer completes or times out
+	pendingTransferSeq atomic.Int64
 
 	// Partial resync backlog
 	backlog       list.List

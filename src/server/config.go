@@ -31,9 +31,11 @@ var supportedNetworks = map[string]bool{
 // ---------------------------------------------------------------------------
 
 const (
-	replicaSendBuffer = 1024 // max queued writes per replica
-	heartbeatInterval = 200 * time.Millisecond
-	retryInterval     = 100 * time.Millisecond
+	replicaSendBuffer         = 1024 // max queued writes per replica
+	heartbeatInterval         = 200 * time.Millisecond
+	retryInterval             = 100 * time.Millisecond
+	transferCatchUpTimeout    = electionTimeout / 2
+	promotionBroadcastTimeout = 2 * time.Second
 )
 
 // ---------------------------------------------------------------------------

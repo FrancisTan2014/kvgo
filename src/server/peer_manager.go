@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"kvgo/transport"
 	"log/slog"
@@ -84,7 +85,8 @@ func (p *PeerManager) Get(nodeID string) (PeerInfo, bool) {
 }
 
 // GetTransport returns a RequestTransport for the given nodeID, dialing lazily on first use.
-// Returns an error if nodeID is unknown or dial fails.
+// The returned transport auto-invalidates on error: if Request() fails, the cached
+// connection is cleared so the next GetTransport call redials transparently.
 func (p *PeerManager) GetTransport(nodeID string) (transport.RequestTransport, error) {
 	p.mu.RLock()
 	entry, exists := p.peers[nodeID]
@@ -95,7 +97,7 @@ func (p *PeerManager) GetTransport(nodeID string) (transport.RequestTransport, e
 	if entry.transport != nil {
 		t := entry.transport
 		p.mu.RUnlock()
-		return t, nil
+		return &reconnectTransport{inner: t, pm: p, nodeID: nodeID}, nil
 	}
 	p.mu.RUnlock()
 
@@ -109,7 +111,7 @@ func (p *PeerManager) GetTransport(nodeID string) (transport.RequestTransport, e
 		return nil, fmt.Errorf("peer manager: peer removed during dial %s", nodeID)
 	}
 	if entry.transport != nil {
-		return entry.transport, nil
+		return &reconnectTransport{inner: entry.transport, pm: p, nodeID: nodeID}, nil
 	}
 
 	t, err := p.dial(entry.addr)
@@ -117,7 +119,7 @@ func (p *PeerManager) GetTransport(nodeID string) (transport.RequestTransport, e
 		return nil, fmt.Errorf("peer manager: dial %s (%s): %w", nodeID, entry.addr, err)
 	}
 	entry.transport = t
-	return t, nil
+	return &reconnectTransport{inner: t, pm: p, nodeID: nodeID}, nil
 }
 
 // Snapshot returns a copy of all currently-connected transports, keyed by nodeID.
@@ -196,4 +198,44 @@ func (p *PeerManager) Close() {
 		}
 		delete(p.peers, nodeID)
 	}
+}
+
+// invalidate clears the cached transport for a peer so the next GetTransport redials.
+// Only clears if the cached transport matches the one that failed (avoids racing with a fresh dial).
+func (p *PeerManager) invalidate(nodeID string, failed transport.RequestTransport) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	entry, exists := p.peers[nodeID]
+	if !exists {
+		return
+	}
+	if entry.transport == failed {
+		_ = entry.transport.Close()
+		entry.transport = nil
+	}
+}
+
+// reconnectTransport wraps a RequestTransport and invalidates the PeerManager's
+// cached connection when Request returns an error, so the next call redials.
+type reconnectTransport struct {
+	inner  transport.RequestTransport
+	pm     *PeerManager
+	nodeID string
+}
+
+func (r *reconnectTransport) Request(ctx context.Context, payload []byte) ([]byte, error) {
+	resp, err := r.inner.Request(ctx, payload)
+	if err != nil {
+		r.pm.invalidate(r.nodeID, r.inner)
+	}
+	return resp, err
+}
+
+func (r *reconnectTransport) Close() error {
+	return r.inner.Close()
+}
+
+func (r *reconnectTransport) RemoteAddr() string {
+	return r.inner.RemoteAddr()
 }
