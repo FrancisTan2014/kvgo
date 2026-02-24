@@ -402,22 +402,22 @@ func TestDiscoverCluster_IgnoresBadStatus(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PeerManager.Any
+// PeerManager has peers check
 // ---------------------------------------------------------------------------
 
-func TestPeerManager_Any(t *testing.T) {
+func TestPeerManager_HasPeers(t *testing.T) {
 	t.Run("empty", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
-		if pm.Any() {
-			t.Error("Any() = true on empty PeerManager")
+		if len(pm.NodeIDs()) > 0 {
+			t.Error("NodeIDs() non-empty on empty PeerManager")
 		}
 	})
 
 	t.Run("with peers", func(t *testing.T) {
 		pm := NewPeerManager(nil, noopLogger)
 		pm.MergePeers([]PeerInfo{{NodeID: "n1", Addr: "a:1"}})
-		if !pm.Any() {
-			t.Error("Any() = false after MergePeers")
+		if len(pm.NodeIDs()) == 0 {
+			t.Error("NodeIDs() empty after MergePeers")
 		}
 	})
 }

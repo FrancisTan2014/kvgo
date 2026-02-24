@@ -65,6 +65,7 @@ const (
 	CmdDiscovery      Cmd = 14 // Discovery request
 	CmdTransferLeader Cmd = 15 // Leader transfer start
 	CmdTimeoutNow     Cmd = 16 // Tell the target follower to start an election right now
+	CmdHealth         Cmd = 17 // General liveness check (no heartbeat/term semantics)
 )
 
 type Status uint8

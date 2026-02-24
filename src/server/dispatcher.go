@@ -33,6 +33,7 @@ func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdDiscovery] = (*Server).handleDiscovery
 	s.requestHandlers[protocol.CmdTransferLeader] = (*Server).handleTransferLeader
 	s.requestHandlers[protocol.CmdTimeoutNow] = (*Server).handleTimeoutNow
+	s.requestHandlers[protocol.CmdHealth] = (*Server).handleHealth
 }
 
 func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duration) (takenOver bool) {

@@ -6,6 +6,7 @@ import (
 	"kvgo/transport"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 // DialFunc dials a peer and returns a RequestTransport.
@@ -27,8 +28,9 @@ type PeerManager struct {
 }
 
 type peerEntry struct {
-	addr      string
-	transport transport.RequestTransport // nil until first use
+	addr  string
+	inner transport.RequestTransport // raw transport (nil until first dial)
+	wrap  transport.RequestTransport // reconnect wrapper around inner (nil until first dial)
 }
 
 func NewPeerManager(dial DialFunc, logger *slog.Logger) *PeerManager {
@@ -36,6 +38,45 @@ func NewPeerManager(dial DialFunc, logger *slog.Logger) *PeerManager {
 		peers:  make(map[string]*peerEntry),
 		dial:   dial,
 		logger: logger,
+	}
+}
+
+// Run starts the peer health loop. It periodically dials unconnected peers and
+// probes connected ones via probe(). Failed probes trigger auto-invalidation
+// (handled by reconnectTransport), so the next tick re-dials. Exits when ctx
+// is canceled.
+func (p *PeerManager) Run(ctx context.Context, interval time.Duration, probe func(ctx context.Context, t transport.RequestTransport) error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.healthCheck(ctx, probe)
+		}
+	}
+}
+
+func (p *PeerManager) healthCheck(ctx context.Context, probe func(ctx context.Context, t transport.RequestTransport) error) {
+	p.mu.RLock()
+	ids := make([]string, 0, len(p.peers))
+	for id := range p.peers {
+		ids = append(ids, id)
+	}
+	p.mu.RUnlock()
+
+	for _, id := range ids {
+		t, err := p.GetTransport(id)
+		if err != nil {
+			p.logger.Debug("peer health: dial failed", "node_id", id, "error", err)
+			continue
+		}
+		if err := probe(ctx, t); err != nil {
+			p.logger.Warn("peer health: probe failed", "node_id", id, "error", err)
+			// reconnectTransport.Request already invalidated the connection
+		}
 	}
 }
 
@@ -59,11 +100,12 @@ func (p *PeerManager) MergePeers(topology []PeerInfo) {
 		if existing, exists := p.peers[pi.NodeID]; exists {
 			if existing.addr != pi.Addr {
 				// Address changed — close old transport so next Get re-dials
-				if existing.transport != nil {
-					_ = existing.transport.Close()
+				if existing.inner != nil {
+					_ = existing.inner.Close()
 				}
 				existing.addr = pi.Addr
-				existing.transport = nil
+				existing.inner = nil
+				existing.wrap = nil
 				p.logger.Info("peer manager: peer address updated", "node_id", pi.NodeID, "addr", pi.Addr)
 			}
 			continue
@@ -94,10 +136,10 @@ func (p *PeerManager) GetTransport(nodeID string) (transport.RequestTransport, e
 		p.mu.RUnlock()
 		return nil, fmt.Errorf("peer manager: unknown peer %s", nodeID)
 	}
-	if entry.transport != nil {
-		t := entry.transport
+	if entry.wrap != nil {
+		t := entry.wrap
 		p.mu.RUnlock()
-		return &reconnectTransport{inner: t, pm: p, nodeID: nodeID}, nil
+		return t, nil
 	}
 	p.mu.RUnlock()
 
@@ -110,31 +152,17 @@ func (p *PeerManager) GetTransport(nodeID string) (transport.RequestTransport, e
 	if !exists {
 		return nil, fmt.Errorf("peer manager: peer removed during dial %s", nodeID)
 	}
-	if entry.transport != nil {
-		return &reconnectTransport{inner: entry.transport, pm: p, nodeID: nodeID}, nil
+	if entry.wrap != nil {
+		return entry.wrap, nil
 	}
 
 	t, err := p.dial(entry.addr)
 	if err != nil {
 		return nil, fmt.Errorf("peer manager: dial %s (%s): %w", nodeID, entry.addr, err)
 	}
-	entry.transport = t
-	return &reconnectTransport{inner: t, pm: p, nodeID: nodeID}, nil
-}
-
-// Snapshot returns a copy of all currently-connected transports, keyed by nodeID.
-// Peers that haven't been dialed yet are excluded.
-func (p *PeerManager) Snapshot() map[string]transport.RequestTransport {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	out := make(map[string]transport.RequestTransport)
-	for nodeID, entry := range p.peers {
-		if entry.transport != nil {
-			out[nodeID] = entry.transport
-		}
-	}
-	return out
+	entry.inner = t
+	entry.wrap = &reconnectTransport{inner: t, pm: p, nodeID: nodeID}
+	return entry.wrap, nil
 }
 
 // NodeIDs returns the nodeIDs of all known peers (connected or not).
@@ -149,17 +177,6 @@ func (p *PeerManager) NodeIDs() []string {
 	return out
 }
 
-// Addr returns the address of a known peer, or ("", false) if unknown.
-func (p *PeerManager) Addr(nodeID string) (string, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	entry, exists := p.peers[nodeID]
-	if !exists {
-		return "", false
-	}
-	return entry.addr, true
-}
-
 // PeerInfos returns a snapshot of all known peers (connected or not).
 func (p *PeerManager) PeerInfos() []PeerInfo {
 	p.mu.RLock()
@@ -171,37 +188,21 @@ func (p *PeerManager) PeerInfos() []PeerInfo {
 	return out
 }
 
-// AnyAddr returns the address of an arbitrary known peer, or ("", false) if none.
-func (p *PeerManager) AnyAddr() (string, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	for _, entry := range p.peers {
-		return entry.addr, true
-	}
-	return "", false
-}
-
-func (p *PeerManager) Any() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.peers) > 0
-}
-
 // Close closes all peer transports and clears the peer map.
 func (p *PeerManager) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for nodeID, entry := range p.peers {
-		if entry.transport != nil {
-			_ = entry.transport.Close()
+		if entry.inner != nil {
+			_ = entry.inner.Close()
 		}
 		delete(p.peers, nodeID)
 	}
 }
 
 // invalidate clears the cached transport for a peer so the next GetTransport redials.
-// Only clears if the cached transport matches the one that failed (avoids racing with a fresh dial).
+// Only clears if the cached inner transport matches the one that failed (avoids racing with a fresh dial).
 func (p *PeerManager) invalidate(nodeID string, failed transport.RequestTransport) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -210,14 +211,15 @@ func (p *PeerManager) invalidate(nodeID string, failed transport.RequestTranspor
 	if !exists {
 		return
 	}
-	if entry.transport == failed {
-		_ = entry.transport.Close()
-		entry.transport = nil
+	if entry.inner == failed {
+		_ = entry.inner.Close()
+		entry.inner = nil
+		entry.wrap = nil
 	}
 }
 
-// reconnectTransport wraps a RequestTransport and invalidates the PeerManager's
-// cached connection when Request returns an error, so the next call redials.
+// reconnectTransport wraps a raw RequestTransport and invalidates the
+// PeerManager cache on error so the next GetTransport call redials.
 type reconnectTransport struct {
 	inner  transport.RequestTransport
 	pm     *PeerManager
@@ -232,10 +234,6 @@ func (r *reconnectTransport) Request(ctx context.Context, payload []byte) ([]byt
 	return resp, err
 }
 
-func (r *reconnectTransport) Close() error {
-	return r.inner.Close()
-}
+func (r *reconnectTransport) Close() error { return r.inner.Close() }
 
-func (r *reconnectTransport) RemoteAddr() string {
-	return r.inner.RemoteAddr()
-}
+func (r *reconnectTransport) RemoteAddr() string { return r.inner.RemoteAddr() }

@@ -229,7 +229,7 @@ func (s *Server) Start() (err error) {
 
 	// Role determination
 	if s.opts.ReplicaOf == "" {
-		if s.peerManager.Any() {
+		if len(s.peerManager.NodeIDs()) > 0 {
 			s.role.Store(uint32(RoleFollower))
 			leader, term, found := s.discoverCluster()
 			if found {
@@ -293,6 +293,7 @@ func (s *Server) Start() (err error) {
 	go s.heartbeatLoop()
 	go s.fenceLoop()
 	go s.reconcileLoop()
+	go s.peerManager.Run(s.ctx, peerHealthInterval, s.probePeerHealth)
 
 	return nil
 }

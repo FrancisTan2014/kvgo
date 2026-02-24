@@ -35,9 +35,10 @@ func (s *Server) fenceLoop() {
 				// that cancels our replication loop before it can connect.
 				s.lastHeartbeat = time.Now()
 				s.fenced.Store(true)
-				if addr, ok := s.peerManager.AnyAddr(); ok {
-					if err := s.relocate(addr); err != nil {
-						s.log().Error("fence relocate failed", "addr", addr, "error", err)
+				if ids := s.peerManager.NodeIDs(); len(ids) > 0 {
+					pi, _ := s.peerManager.Get(ids[0])
+					if err := s.relocate(pi.Addr); err != nil {
+						s.log().Error("fence relocate failed", "addr", pi.Addr, "error", err)
 					}
 				} else {
 					s.log().Error("fence detected but no peers available")

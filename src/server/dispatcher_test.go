@@ -33,6 +33,7 @@ func TestCommandRegistration(t *testing.T) {
 		{protocol.CmdDiscovery, "DISCOVERY"},
 		{protocol.CmdTransferLeader, "TRANSFER_LEADER"},
 		{protocol.CmdTimeoutNow, "TIMEOUT_NOW"},
+		{protocol.CmdHealth, "HEALTH"},
 	}
 
 	for _, tc := range expectedCommands {

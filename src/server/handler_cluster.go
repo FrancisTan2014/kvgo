@@ -368,10 +368,10 @@ func (s *Server) handleVoteRequest(ctx *RequestContext) error {
 		// After stepping down from leader, reconnect to the cluster
 		// via the candidate (or any known peer).
 		if wasLeader {
-			if addr, ok := s.peerManager.Addr(vr.NodeID); ok {
+			if pi, ok := s.peerManager.Get(vr.NodeID); ok {
 				go func() {
-					if err := s.relocate(addr); err != nil {
-						s.log().Warn("post-stepdown relocate failed", "addr", addr, "error", err)
+					if err := s.relocate(pi.Addr); err != nil {
+						s.log().Warn("post-stepdown relocate failed", "addr", pi.Addr, "error", err)
 					}
 				}()
 			}

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"kvgo/protocol"
+	"kvgo/transport"
 	"time"
 )
 
@@ -98,10 +100,11 @@ func (s *Server) processPongResponse(respPayload []byte, rc *replicaConn) {
 		}
 
 		if wasLeader {
-			if addr, ok := s.peerManager.AnyAddr(); ok {
+			if ids := s.peerManager.NodeIDs(); len(ids) > 0 {
+				pi, _ := s.peerManager.Get(ids[0])
 				go func() {
-					if err := s.relocate(addr); err != nil {
-						s.log().Warn("post-stepdown relocate failed", "addr", addr, "error", err)
+					if err := s.relocate(pi.Addr); err != nil {
+						s.log().Warn("post-stepdown relocate failed", "addr", pi.Addr, "error", err)
 					}
 				}()
 			}
@@ -144,4 +147,22 @@ func (s *Server) heartbeatLoop() {
 			}
 		}
 	}
+}
+
+// handleHealth responds immediately to liveness checks.
+// Any service (peer probe, client, monitor) can use CmdHealth to check
+// whether this node is alive. Separate from handlePing (replication
+// heartbeat) to avoid polluting lastHeartbeat / primarySeq / term state.
+func (s *Server) handleHealth(ctx *RequestContext) error {
+	return s.writeResponse(ctx.StreamTransport, protocol.Response{Status: protocol.StatusOK})
+}
+
+// probePeerHealth sends a CmdHealth to a peer transport and waits for the
+// response within peerPingTimeout. Used by PeerManager.Run as the probe.
+func (s *Server) probePeerHealth(ctx context.Context, t transport.RequestTransport) error {
+	payload, _ := protocol.EncodeRequest(protocol.Request{Cmd: protocol.CmdHealth})
+	pingCtx, cancel := context.WithTimeout(ctx, peerPingTimeout)
+	defer cancel()
+	_, err := t.Request(pingCtx, payload)
+	return err
 }

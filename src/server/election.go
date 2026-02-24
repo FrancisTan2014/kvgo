@@ -250,10 +250,10 @@ func (s *Server) runElection(round electionRound) {
 					s.becomeFollower()
 					s.lastHeartbeat = time.Now()
 
-					if addr, ok := s.peerManager.Addr(pid); ok {
+					if pi, ok := s.peerManager.Get(pid); ok {
 						go func() {
-							if err := s.relocate(addr); err != nil {
-								s.log().Warn("post-stepdown relocate failed", "addr", addr, "error", err)
+							if err := s.relocate(pi.Addr); err != nil {
+								s.log().Warn("post-stepdown relocate failed", "addr", pi.Addr, "error", err)
 							}
 						}()
 					}
