@@ -39,3 +39,4 @@ wal.db
 redis/
 etcd/
 tikv/
+raft/
