@@ -80,6 +80,16 @@ At this point, the subject is alive.
 
 036c can then add persistence against this boundary, instead of mixing persistence into algorithm logic.
 
+## What I learned
+
+The `run()` goroutine is a single-thread event loop. All mutations to Raft state happen inside it; external callers communicate only through channels. A nil channel never fires in `select`, so the Ready→Advance protocol is enforced structurally — the wrong call order is unrepresentable, not just undocumented.
+
+I kept trying to make 036b bigger than it needed to be. The final implementation is ~80 lines of code and ~80 lines of tests. That felt too small, but every line is proven and every boundary is respected. CommitTo exists at the `Raft` level as a test shortcut; it does not appear in the `Node` channel loop because in real Raft, commit index advances as a side effect of `Step` processing messages — not as a separate external event.
+
+When reading etcd's source, I kept wandering into beautiful code that had nothing to do with my question. The lesson: enter with a concrete purpose, find the evidence, stop, and return to your own workspace. A giant codebase is a trap if you browse without intent.
+
+Ten years of shipping code taught me to implement. This episode taught me to stop before the boundary and prove what I have.
+
 ## References
 
 1. [The Raft paper](https://raft.github.io/raft.pdf)
