@@ -39,7 +39,7 @@ type Raft struct {
 	stableIndex  uint64
 }
 
-func New(id uint64) *Raft {
+func NewRaft(id uint64) *Raft {
 	return &Raft{
 		id:    id,
 		state: Follower,
@@ -63,6 +63,11 @@ func (r *Raft) Ready() Ready {
 		Entries:          r.log[r.stableIndex:r.lastLogIndex],
 		CommittedEntries: r.log[r.appliedIndex:r.commitIndex],
 	}
+}
+
+func (r *Raft) HasReady() bool {
+	return r.stableIndex < r.lastLogIndex ||
+		r.appliedIndex < r.commitIndex
 }
 
 func (r *Raft) Advance() {

@@ -73,3 +73,24 @@ func TestReadyExposesCommittedEntsOnlyAfterCommitTo(t *testing.T) {
 	ready = r.Ready()
 	require.Len(t, ready.CommittedEntries, 1)
 }
+
+func TestFullLifecycle(t *testing.T) {
+	r := Raft{}
+	r.Propose([]byte("x"))
+
+	// Phase 1: unstable only
+	rd := r.Ready()
+	require.Len(t, rd.Entries, 1)
+	require.Len(t, rd.CommittedEntries, 0) // ← invariant: not applied yet
+	r.Advance()
+
+	// Phase 2: committed
+	r.CommitTo(1)
+	rd = r.Ready()
+	require.Len(t, rd.Entries, 0)
+	require.Len(t, rd.CommittedEntries, 1) // ← now safe to apply
+	r.Advance()
+
+	// Phase 3: idle
+	require.False(t, r.HasReady())
+}
