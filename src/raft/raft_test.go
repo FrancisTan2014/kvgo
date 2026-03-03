@@ -9,9 +9,9 @@ import (
 func TestProposeIncreasesLastLogIndex(t *testing.T) {
 	r := Raft{}
 	e1 := r.Propose([]byte("foo"))
-	require.Equal(t, e1.Index, uint64(1))
+	require.Equal(t, uint64(1), e1.Index)
 	e2 := r.Propose([]byte("foo"))
-	require.Equal(t, e2.Index, uint64(2))
+	require.Equal(t, uint64(2), e2.Index)
 }
 
 func TestProposeNotChangeCommitIndex(t *testing.T) {
@@ -31,11 +31,45 @@ func TestReadyReturnsProposedEntry(t *testing.T) {
 func TestAdvanceClearReadyEntries(t *testing.T) {
 	r := Raft{}
 	r.Propose([]byte("foo"))
+	r.CommitTo(1)
 
 	ready := r.Ready()
 	require.Len(t, ready.Entries, 1)
+	require.Len(t, ready.CommittedEntries, 1)
 
 	r.Advance()
 	ready = r.Ready()
 	require.Len(t, ready.Entries, 0)
+	require.Len(t, ready.CommittedEntries, 0)
+}
+
+func TestCommitToIncreasesCommitIndex(t *testing.T) {
+	r := Raft{}
+	r.Propose([]byte("foo"))
+
+	r.CommitTo(1)
+	require.Equal(t, uint64(1), r.commitIndex)
+}
+
+func TestCommitToNeverDecreasesCommitIndex(t *testing.T) {
+	r := Raft{}
+	r.Propose([]byte("foo"))
+
+	r.CommitTo(1)
+	require.Equal(t, uint64(1), r.commitIndex)
+
+	r.CommitTo(0)
+	require.Equal(t, uint64(1), r.commitIndex)
+}
+
+func TestReadyExposesCommittedEntsOnlyAfterCommitTo(t *testing.T) {
+	r := Raft{}
+	r.Propose([]byte("foo"))
+
+	ready := r.Ready()
+	require.Len(t, ready.CommittedEntries, 0)
+
+	r.CommitTo(1)
+	ready = r.Ready()
+	require.Len(t, ready.CommittedEntries, 1)
 }

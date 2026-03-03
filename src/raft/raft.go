@@ -1,4 +1,3 @@
-// Invariant #1: Only committed entries may be applied to state machine.
 package raft
 
 type State uint8
@@ -20,6 +19,13 @@ type Ready struct {
 	CommittedEntries []Entry
 }
 
+/*
+Raft presents the pure state machine of the RAFT algorithm.
+Invariants:
+
+	#1: Only committed entries may be applied to state machine.
+	#2: appliedIndex <= commitIndex
+*/
 type Raft struct {
 	id           uint64
 	term         uint64
@@ -53,21 +59,20 @@ func (r *Raft) Propose(data []byte) Entry {
 }
 
 func (r *Raft) Ready() Ready {
-	if r.stableIndex >= r.lastLogIndex {
-		return Ready{}
-	}
-
-	start := int(r.stableIndex)
-	end := int(r.lastLogIndex)
 	return Ready{
-		Entries:          r.log[start:end],
-		CommittedEntries: make([]Entry, 0),
+		Entries:          r.log[r.stableIndex:r.lastLogIndex],
+		CommittedEntries: r.log[r.appliedIndex:r.commitIndex],
 	}
 }
 
 func (r *Raft) Advance() {
-	if r.stableIndex >= r.lastLogIndex {
+	r.stableIndex = r.lastLogIndex
+	r.appliedIndex = r.commitIndex
+}
+
+func (r *Raft) CommitTo(index uint64) {
+	if index < r.commitIndex || index > r.lastLogIndex {
 		return
 	}
-	r.stableIndex = r.lastLogIndex
+	r.commitIndex = index
 }
