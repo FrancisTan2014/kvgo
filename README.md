@@ -32,3 +32,18 @@ Episode 036 (the-raft) is not another feature. It's an identity change. The syst
 **Phase 2 — The consensus system (episodes 036–)**
 
 From here, every write enters through the replicated log, gets majority agreement, then reaches the database. Adding a new consensus feature means defining a new entry type — not building a new fan-out, counter, and quorum check.
+
+## References & Acknowledgements
+
+`kv-go` is a learning-first project built with heavy inspiration from excellent open source systems.
+
+- Raft paper (Ongaro & Ousterhout) — core consensus model reference: https://raft.github.io/raft.pdf
+- Raft dissertation (Diego Ongaro) — deeper design rationale and proof details: https://github.com/ongardie/dissertation
+
+- `etcd` — Raft-driven distributed KV architecture and production-grade failure handling: https://github.com/etcd-io/etcd
+- `raft` (etcd-io) — standalone Raft library design and algorithm implementation reference: https://github.com/etcd-io/raft
+- `redis` — practical single-primary replication model, simplicity, and operational pragmatism: https://github.com/redis/redis
+- `tikv` — large-scale distributed KV design and storage/consensus integration ideas: https://github.com/tikv/tikv
+- `bbolt` — embedded storage engine concepts relevant to local persistence and indexing: https://github.com/etcd-io/bbolt
+
+Thanks to the maintainers and contributors of these projects for publishing deeply educational systems and code.

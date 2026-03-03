@@ -36,7 +36,4 @@ wal.db
 .test/
 
 .github
-redis/
-etcd/
-tikv/
-raft/
+oss/
