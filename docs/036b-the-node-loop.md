@@ -14,9 +14,13 @@ The question here is not "why Raft." The question is: **what is the smallest liv
 
 In scope:
 - Raft node state
-- State transitions (`Step`, `Tick`)
+- Local proposals (`Propose`)
 - Output channel (`Ready`)
 - Acknowledge processed output (`Advance`)
+
+Deferred:
+- `Step` (inter-node messages) — needs elections and replication
+- `Tick` (timer driver) — needs election timeout and heartbeat
 
 Out of scope:
 - Persistent storage implementation
@@ -34,7 +38,7 @@ That happened because state alone is dead.
 A state machine is not a struct; it is **state + transitions + observable output**.
 
 So the first object to make real is the loop:
-- input comes in (`Tick`, `Step`, local proposal)
+- input comes in (local proposal)
 - state changes
 - output comes out (`Ready`)
 
