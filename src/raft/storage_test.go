@@ -44,8 +44,6 @@ func TestPersistentStateSurvivesRestart(t *testing.T) {
 
 func TestEntriesUsesHalfOpenRange(t *testing.T) {
 	s := &DurableStorage{
-		firstIndex: 1,
-		lastIndex:  3,
 		entries: []Entry{
 			{Index: 1, Term: 1, Data: []byte("one")},
 			{Index: 2, Term: 1, Data: []byte("two")},
@@ -63,8 +61,6 @@ func TestEntriesUsesHalfOpenRange(t *testing.T) {
 
 func TestEntriesRejectsOutOfRange(t *testing.T) {
 	s := &DurableStorage{
-		firstIndex: 1,
-		lastIndex:  2,
 		entries: []Entry{
 			{Index: 1, Term: 1, Data: []byte("one")},
 			{Index: 2, Term: 1, Data: []byte("two")},
@@ -96,7 +92,7 @@ func TestReplayTruncatesCorruptedTail(t *testing.T) {
 	require.NoError(t, s1.Save(expectedEntries, expectedHard))
 	require.NoError(t, s1.Close())
 
-	path := filepath.Join(dir, filename)
+	path := filepath.Join(dir, logFilename)
 	infoBefore, err := os.Stat(path)
 	require.NoError(t, err)
 
@@ -136,8 +132,7 @@ func TestSaveRejectsNonContiguousEntries(t *testing.T) {
 	require.NoError(t, s.Save([]Entry{{Index: 1, Term: 1, Data: []byte("one")}}, HardState{Term: 1}))
 
 	err = s.Save([]Entry{{Index: 3, Term: 1, Data: []byte("gap")}}, HardState{Term: 1})
-	require.Error(t, err)
-	require.ErrorContains(t, err, "non-contiguous")
+	require.ErrorIs(t, err, ErrNonContiguous)
 
 	entries, err := s.Entries(1, 2)
 	require.NoError(t, err)
@@ -154,7 +149,7 @@ func TestReplayFailsOnMalformedFullBatch(t *testing.T) {
 	require.NoError(t, s1.Save([]Entry{{Index: 1, Term: 1, Data: []byte("ok")}}, HardState{Term: 1}))
 	require.NoError(t, s1.Close())
 
-	path := filepath.Join(dir, filename)
+	path := filepath.Join(dir, logFilename)
 	infoBefore, err := os.Stat(path)
 	require.NoError(t, err)
 
@@ -187,4 +182,71 @@ func TestComputeTotalSizeReturnsExpectedNumber(t *testing.T) {
 
 	total := computeTotalSize(batch)
 	require.Equal(t, 45, total)
+}
+
+func TestEntriesBeforeBoundaryReturnErrCompacted(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, s.Close())
+	}()
+
+	require.NoError(t, s.Save([]Entry{{Index: 1, Term: 1, Data: []byte("one")}}, HardState{Term: 1}))
+	require.NoError(t, s.Save([]Entry{{Index: 2, Term: 1, Data: []byte("two")}}, HardState{Term: 1}))
+	require.NoError(t, s.Save([]Entry{{Index: 3, Term: 2, Data: []byte("three")}}, HardState{Term: 2}))
+
+	require.NoError(t, s.Compact(2))
+	_, err = s.Entries(1, 3)
+	require.ErrorIs(t, err, ErrCompacted)
+
+	ents, err := s.Entries(3, 4)
+	require.NoError(t, err)
+	require.Len(t, ents, 1)
+	require.Equal(t, Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
+}
+
+func TestCompactionSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+
+	require.NoError(t, s1.Save([]Entry{{Index: 1, Term: 1, Data: []byte("one")}}, HardState{Term: 1}))
+	require.NoError(t, s1.Save([]Entry{{Index: 2, Term: 1, Data: []byte("two")}}, HardState{Term: 1}))
+	require.NoError(t, s1.Save([]Entry{{Index: 3, Term: 2, Data: []byte("three")}}, HardState{Term: 2}))
+
+	require.NoError(t, s1.Compact(2))
+	require.NoError(t, s1.Close())
+
+	s2, err := NewDurableStorage(dir)
+	defer require.NoError(t, s2.Close())
+	require.NoError(t, err)
+	_, err = s2.Entries(1, 3)
+	require.ErrorIs(t, err, ErrCompacted)
+
+	ents, err := s2.Entries(3, 4)
+	require.NoError(t, err)
+	require.Len(t, ents, 1)
+	require.Equal(t, Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
+}
+
+func TestReplayFailsOnGapAfterSnapshotBoundary(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+
+	snap := SnapshotMeta{LastIncludedIndex: 2, LastIncludedTerm: 1}
+	buf := make([]byte, SnapshotMetaBytes)
+	snap.EncodeTo(buf)
+	require.NoError(t, s.sw.write(buf))
+	require.NoError(t, s.sw.sync())
+
+	hard := HardState{Term: 2, VotedFor: 1, CommittedIndex: 2}
+	gapEntries := []Entry{{Index: 4, Term: 2, Data: []byte("four")}}
+	require.NoError(t, s.rw.write(encodeSaveBatch(hard, gapEntries)))
+	require.NoError(t, s.rw.sync())
+	require.NoError(t, s.Close())
+
+	_, err = NewDurableStorage(dir)
+	require.ErrorIs(t, err, ErrNonContiguous)
 }

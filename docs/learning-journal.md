@@ -140,3 +140,158 @@ Coverage can still be a useful signal, but it should come after the invariant is
 The same skill shows up again: seeing hidden boundaries. In system design, the boundary makes the architecture coherent. In testing, the seam makes the invariant testable.
 
 ---
+
+## 2026-03-10 — Three Skills Behind Clear Design Docs
+
+### The claim
+
+Clear technical prose is usually a downstream effect of three design skills:
+
+1. **Name one invariant**
+2. **Name one boundary**
+3. **Cut everything else out**
+
+When those three skills are weak, the doc feels muddy. When they are sharp, the prose becomes simple almost by itself.
+
+### 1. Name one invariant
+
+The first question is not, "What am I building?" It is, "What must remain true?"
+
+An invariant compresses the episode into one sentence. Without it, the doc starts collecting related ideas instead of protecting one truth. That is when the writing turns broad, repetitive, or speculative.
+
+The practical test:
+
+- Can I summarize the episode in one sentence?
+- Does every paragraph strengthen that same sentence?
+
+If not, the invariant is still blurry.
+
+### 2. Name one boundary
+
+Once the invariant is visible, the next question is: where does it become testable?
+
+The boundary is the seam where the invariant can fail in a controllable way. Naming it prevents the design from drifting into the whole system at once.
+
+Examples from the Raft series:
+
+- 036b: execution boundary
+- 036c: persistence boundary
+- 036d: visibility boundary
+- 036e: compaction boundary
+
+If the boundary is unnamed, the doc usually compensates with too much explanation.
+
+### 3. Cut everything else out
+
+After the invariant and boundary are named, most of the remaining work is removal.
+
+This is the hard part emotionally. Extra context feels helpful, but it often hides uncertainty. Future episodes, implementation details, and neighboring concerns should be removed unless they directly support the current invariant.
+
+This is not oversimplification. It is scope discipline.
+
+### The methodology
+
+When writing a design doc, use this sequence:
+
+1. **State the invariant in one sentence.**
+2. **State the boundary that makes it testable.**
+3. **List what is explicitly out of scope.**
+4. **Delete any paragraph that does not strengthen 1–3.**
+
+If the prose still feels muddy, the problem is usually not grammar. The problem is that one of those three design steps is still incomplete.
+
+### What to remember
+
+Beautiful technical prose is rarely produced by decorative writing. It usually appears after the idea has been compressed enough. First compress the design. Then the prose has room to become clear.
+
+---
+
+## 2026-03-10 — Design Moves Back and Forth Through Proven Boundaries
+
+### The claim
+
+The most valuable thing I am learning from `kv-go` is not a specific Raft API or storage trick. It is a deeper model of software design: good architecture is not built by walking only from the ground up or only from the top down. It stabilizes by moving back and forth until the boundaries are proved.
+
+### The old naive model
+
+I used to think design should happen in one direction:
+
+- either start from low-level pieces and build upward
+- or start from the big picture and push downward
+
+Both views contain part of the truth, but neither is enough on its own.
+
+### The better model
+
+Real design moves in both directions.
+
+1. Start with a pressure, invariant, or architectural guess.
+2. Build enough to touch the problem directly.
+3. Notice where the model becomes awkward or unstable.
+4. Name the boundary that resolves that pressure.
+5. Prove the boundary with tests, failures, or implementation constraints.
+6. Reuse that proved boundary as a trustworthy abstraction barrier at the next level up.
+
+That is the key: a boundary becomes reusable only after it has been earned.
+
+### What 036e made visible
+
+036e did not just teach me compaction. It exposed several deeper moves:
+
+- `SnapshotMeta` appeared because the compaction boundary needed a name
+- `FirstIndex` and `LastIndex` became methods only after stored fields started overlapping awkwardly
+- the no-gap rule after the snapshot boundary appeared only after replay semantics were made concrete
+
+None of those abstractions should have been imported early just because etcd has them. They became legitimate only when the problem forced them into view.
+
+### Why this feels important
+
+This is the first time software design feels less like arranging ideas and more like discovering stable joints. Once a boundary has been proved, higher-level structure no longer feels forced together. The architecture begins to hold naturally because each part leans on a boundary that already survived contact with reality.
+
+### What to remember next time
+
+- Do not force design into one direction.
+- Go down to touch the problem, then back up to name the boundary.
+- Borrow abstractions cautiously.
+- Add a piece only when the problem has earned it.
+- When discomfort appears, ask the question immediately. That discomfort often marks the exact place where the next boundary is hiding.
+
+---
+
+## 2026-03-10 — Real Work Does Not End When the Doc Is Written
+
+### The claim
+
+Real work is not a straight pipeline of `doc done -> code -> code done -> publish`. Thinking continues through all of it. A design doc is not a contract frozen in advance. It is an anchor that helps the mind stay oriented while reality pushes back.
+
+### What I felt during 036e
+
+I could have finished the code earlier if I had stopped asking questions. But the more important thing was that each question made 036e more solid:
+
+- the compaction boundary became explicit as `SnapshotMeta`
+- `FirstIndex` and `LastIndex` shifted from fields to derived methods
+- the no-gap rule after the snapshot boundary became visible as a fatal validity check
+
+Those were not distractions from implementation. They were implementation doing its real job: forcing the design to become more truthful.
+
+### The better model of work
+
+1. Write a design doc to establish an initial invariant and boundary.
+2. Start implementing before the ideas feel perfectly complete.
+3. Ask questions whenever the implementation creates real discomfort.
+4. Let the doc change when reality exposes a better shape.
+5. Keep repeating until the design stops feeling approximate and starts feeling solid.
+
+That is not indecision. That is the design being tested by contact with the real problem.
+
+### Why this matters
+
+If I treat the doc as fixed too early, I start protecting the document instead of protecting the invariant. Then implementation becomes mechanical and the deeper learning disappears.
+
+If I treat the doc as an anchor instead, I can keep my direction without pretending the first version was complete. The doc holds the throughline while the implementation sharpens the truth.
+
+### What to remember next time
+
+Finishing code quickly is not the only measure of progress. Sometimes the highest-value work is the questioning that makes the design trustworthy before it hardens.
+
+---

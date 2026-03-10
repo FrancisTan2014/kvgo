@@ -18,6 +18,7 @@ type wal struct {
 	path     string
 	filename string
 	file     *os.File
+	size     int64
 }
 
 func newWAL(path string, filename string) (*wal, error) {
@@ -25,11 +26,17 @@ func newWAL(path string, filename string) (*wal, error) {
 	if file == nil {
 		return nil, err
 	}
+	size, err := fileSize(file)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
 
 	return &wal{
 		path:     path,
 		filename: filename,
 		file:     file,
+		size:     size,
 	}, nil
 }
 
@@ -39,6 +46,14 @@ func openFile(path string) (*os.File, error) {
 		return nil, err
 	}
 	return os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+}
+
+func fileSize(file *os.File) (int64, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }
 
 func (w *wal) close() error {
@@ -61,7 +76,8 @@ func (w *wal) write(batch []byte) error {
 	framed := make([]byte, frameHeaderSize+len(batch))
 	binary.LittleEndian.PutUint32(framed[0:], uint32(len(batch)))
 	copy(framed[frameHeaderSize:], batch)
-	_, err := w.file.Write(framed)
+	n, err := w.file.Write(framed)
+	w.size += int64(n)
 	return err
 }
 
@@ -79,11 +95,7 @@ func (w *wal) read() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, err := w.file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	remaining := info.Size() - current
+	remaining := w.size - current
 	if int64(size) > remaining {
 		return nil, ErrTailCorruption
 	}
@@ -112,5 +124,6 @@ func (w *wal) truncate(offset int64) error {
 		return err
 	}
 	w.file = file
+	w.size = offset
 	return nil
 }
