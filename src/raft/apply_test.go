@@ -22,10 +22,11 @@ func (f *fakeApplyTarget) Apply(entries []Entry) error {
 
 func TestApplierDoesNotApplyUncommittedEntries(t *testing.T) {
 	r := NewRaft(1)
+	r.state = Leader
 	target := &fakeApplyTarget{}
 	a := NewApplier(r, target)
 
-	r.Propose([]byte("foo"))
+	require.NoError(t, r.Propose([]byte("foo")))
 	rd, err := a.ConsumeReady()
 	require.NoError(t, err)
 	require.Len(t, rd.Entries, 1)
@@ -36,28 +37,39 @@ func TestApplierDoesNotApplyUncommittedEntries(t *testing.T) {
 
 func TestApplierAppliesCommittedEntriesBeforeAdvance(t *testing.T) {
 	r := NewRaft(1)
+	r.state = Leader
 	target := &fakeApplyTarget{}
 	a := NewApplier(r, target)
 
-	proposed := r.Propose([]byte("foo"))
-	_, err := a.ConsumeReady()
+	// Before 036f, Propose returned the created Entry directly.
+	// After 036f, Propose only drives the state machine and the created work is
+	// observed through Ready. This test still protects the 036d invariant: once
+	// an entry is committed, the Applier must apply exactly that committed entry
+	// before calling Advance.
+	err := r.Propose([]byte("foo"))
 	require.NoError(t, err)
+
+	unstable, err := a.ConsumeReady()
+	require.NoError(t, err)
+	require.Len(t, unstable.Entries, 1)
+	require.Len(t, unstable.CommittedEntries, 0)
 
 	r.CommitTo(1)
 	rd, err := a.ConsumeReady()
 	require.NoError(t, err)
 	require.Len(t, rd.Entries, 0)
 	require.Len(t, rd.CommittedEntries, 1)
-	require.Equal(t, []Entry{proposed}, target.applied)
+	require.Equal(t, rd.CommittedEntries, target.applied)
 	require.False(t, r.HasReady())
 }
 
 func TestApplierBlocksAdvanceOnApplyFailure(t *testing.T) {
 	r := NewRaft(1)
+	r.state = Leader
 	target := &fakeApplyTarget{err: errors.New("apply failed")}
 	a := NewApplier(r, target)
 
-	r.Propose([]byte("foo"))
+	require.NoError(t, r.Propose([]byte("foo")))
 	_, err := a.ConsumeReady()
 	require.NoError(t, err)
 

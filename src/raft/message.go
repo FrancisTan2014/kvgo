@@ -4,6 +4,18 @@ import "encoding/binary"
 
 const SnapshotMetaBytes = 16
 
+type MessageType int32
+
+const (
+	MsgApp     MessageType = 1
+	MsgAppResp MessageType = 2
+)
+
+type Message struct {
+	Type    MessageType
+	Entries []Entry
+}
+
 func (e *Entry) Size() int {
 	return 8 + 8 + len(e.Data)
 }

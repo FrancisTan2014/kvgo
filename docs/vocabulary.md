@@ -9,12 +9,18 @@
 - **conclude** — finish, or reach a judgment through reasoning (not "gather")
 - **crucially** — to a decisive degree; intensifier for importance
 - **discontinuity** — a break in continuity; a point where something no longer feels smoothly connected to what came before
+- **frustrated** — feeling upset, blocked, or discouraged because progress is harder or slower than expected
 - **heuristic** — a practical rule of thumb used to guide thinking or problem-solving. A heuristic is simpler than a full theory but still useful
 - **hesitant** — uncertain, reluctant to act
 - **hugely** — to a great extent; intensifier (not "holy")
 - **hypothesis** — a testable claim you form *before* looking at evidence. Plural: hypotheses. "I hypothesize that Ready blocks until Propose" → then you write a test to confirm or disprove
+- **legitimate** — valid, justified, or properly earned. In system design, a legitimate leader or decision is one that is correct under the rules of the system, not just convenient
+- **north star** — the main long-term guiding goal or direction used to keep decisions aligned and avoid getting lost in local details
 - **obstacle** — something that blocks progress or makes movement harder. In engineering, an obstacle can be a bug, missing concept, or design constraint
+- **originate** — begin, arise, or be created from a source. In systems, a leader may originate a proposal, while a follower only receives or replicates it
 - **polish** — refine or improve something that already works. Noun form: "polishing" (not "polishment"). "The doc needs polishing" = small improvements, not a rewrite
+- **pollute** — make something impure, contaminated, or cluttered. In engineering writing, "pollute the design" means introduce unrelated concerns that make the structure less clean
+- **profoundly** — deeply and in a way that changes understanding at a serious level
 - **prose** — ordinary written language, especially explanatory or narrative writing rather than code, bullet points, or poetry
 - **rationale** — the underlying reason or justification for a design choice. "What is the rationale?" means "Why does this choice make sense?"
 - **separate** — divide apart; keep distinct (not "seperate")

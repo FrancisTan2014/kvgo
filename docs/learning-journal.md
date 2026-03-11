@@ -295,3 +295,49 @@ If I treat the doc as an anchor instead, I can keep my direction without pretend
 Finishing code quickly is not the only measure of progress. Sometimes the highest-value work is the questioning that makes the design trustworthy before it hardens.
 
 ---
+
+## 2026-03-11 — Truth Before Shape
+
+### The claim
+
+Elegant shape is dangerous when it arrives before semantic truth.
+
+### What happened in 036f
+
+I saw that etcd has one `Step()` and copied the surface shape too early. That made leader proposal and follower append look more uniform than they really are.
+
+The missing truth was authority:
+
+- leader originates proposals
+- follower accepts replication
+- candidate drops proposals
+
+One entry path in code did not mean one meaning in the state machine.
+
+### The lesson
+
+Do not choose structure by symmetry first. Choose it by invariant and authority first.
+
+Local guards do not automatically compose into global clarity. Once multiple behaviors share state and transitions, composition starts forcing the real shape of the design.
+
+That is why elegance is often late. It may look intuitive in mature code, but it is usually the result of refactoring after the truth has already been paid for.
+
+Bad order:
+
+1. see a clean shape
+2. imitate it
+3. discover the semantics were different
+
+Better order:
+
+1. name the invariant
+2. name who is allowed to cause the transition
+3. let the structure follow
+
+### What to remember next time
+
+- unified entry does not mean uniform behavior
+- similar code paths may carry different authority
+- shape should compress truth, not hide it
+
+---
