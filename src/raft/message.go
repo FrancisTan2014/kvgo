@@ -13,6 +13,10 @@ const (
 
 type Message struct {
 	Type    MessageType
+	From    uint64
+	To      uint64
+	Index   uint64
+	Term    uint64
 	Entries []Entry
 }
 

@@ -341,3 +341,29 @@ Better order:
 - shape should compress truth, not hide it
 
 ---
+
+## 2026-03-12 — Provisional Shapes Are Normal
+
+Some shapes appear early because shared paths already need a wider container. That does not make them final.
+
+Example: `Message` already carries `[]Entry` even though 036g only needs one-entry append semantics. The wider slice shape leaked in early because the same append path will later carry one entry, many entries, and catch-up entries.
+
+The real job is to keep the current invariant honest even if part of the future shape leaks in early. If later evidence proves the shape wrong, change it.
+
+---
+
+## 2026-03-12 — Coding Exposes Missing Ownership
+
+The design looked locally coherent until code reached `To:` in `Propose`. That was the moment the missing truth appeared: who owns routing?
+
+The fix was not to widen `Propose(data)`. The fix was to put peer knowledge back inside `Raft`, where outbound replication decisions belong.
+
+---
+
+## 2026-03-12 — Surface Beauty, Hidden Truth
+
+Art shocks twice. First through color and form. Then through the tiny details behind them.
+
+Software is similar. A mature design looks beautiful on the surface, but the deeper shock comes from the small details quietly carrying the truth.
+
+---

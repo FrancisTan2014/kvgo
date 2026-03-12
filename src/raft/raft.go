@@ -18,6 +18,15 @@ type Entry struct {
 	Data  []byte
 }
 
+type entryID struct {
+	index uint64
+	term  uint64
+}
+
+func (e *Entry) EntryId() entryID {
+	return entryID{index: e.Index, term: e.Term}
+}
+
 var ErrUnexpectedBytes = errors.New("unexpected bytes")
 
 const HardStateBytes = 24
@@ -54,13 +63,18 @@ type Raft struct {
 	stableIndex  uint64
 
 	messages []Message
+	acks     map[entryID]map[uint64]bool
+	peers    []uint64
 }
 
 func NewRaft(id uint64) *Raft {
 	return &Raft{
-		id:    id,
-		state: Follower,
-		log:   make([]Entry, 0),
+		id:       id,
+		state:    Follower,
+		log:      make([]Entry, 0),
+		acks:     make(map[entryID]map[uint64]bool),
+		peers:    make([]uint64, 0),
+		messages: make([]Message, 0),
 	}
 }
 
@@ -75,10 +89,22 @@ func (r *Raft) Propose(data []byte) error {
 		Data:  data,
 	}
 	r.appendEntries([]Entry{e})
-	r.messages = append(r.messages, Message{
-		Type:    MsgApp,
-		Entries: []Entry{e},
-	})
+
+	id := e.EntryId()
+	r.acks[id] = make(map[uint64]bool)
+
+	// ack leader itself
+	r.acks[id][r.id] = true
+
+	for _, pid := range r.peers {
+		r.messages = append(r.messages, Message{
+			From:    r.id,
+			To:      pid,
+			Type:    MsgApp,
+			Entries: []Entry{e},
+		})
+		r.acks[id][pid] = false
+	}
 
 	return nil
 }
@@ -100,7 +126,7 @@ func (r *Raft) HasReady() bool {
 func (r *Raft) Advance() {
 	r.stableIndex = r.lastLogIndex
 	r.appliedIndex = r.commitIndex
-	r.messages = nil
+	r.messages = make([]Message, 0)
 }
 
 func (r *Raft) CommitTo(index uint64) {
@@ -118,9 +144,53 @@ func (r *Raft) Step(m Message) error {
 		}
 
 		r.appendEntries(m.Entries)
+		last := m.Entries[len(m.Entries)-1]
+		resp := Message{
+			Type:  MsgAppResp,
+			From:  r.id,
+			To:    m.From,
+			Index: last.Index,
+			Term:  last.Term,
+		}
+		r.messages = append(r.messages, resp)
+
+	case MsgAppResp:
+		if r.state != Leader {
+			return nil
+		}
+
+		id := entryID{index: m.Index, term: m.Term}
+		tracker, ok := r.acks[id]
+		if !ok {
+			return nil
+		}
+
+		if _, exists := tracker[m.From]; exists {
+			tracker[m.From] = true
+			if r.quorumReached(id) {
+				r.CommitTo(id.index)
+			}
+		}
 	}
 
 	return nil
+}
+
+func (r Raft) quorumReached(id entryID) bool {
+	tracker, ok := r.acks[id]
+	if !ok {
+		return false
+	}
+
+	var cnt int
+	for _, acked := range tracker {
+		if acked {
+			cnt++
+		}
+	}
+
+	quorum := len(tracker)/2 + 1
+	return cnt >= quorum
 }
 
 func (r *Raft) appendEntries(entries []Entry) {

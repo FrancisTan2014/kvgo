@@ -6,8 +6,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newLeaderRaft() Raft {
-	return Raft{state: Leader}
+func newLeaderRaftWithOnePeer() Raft {
+	r := *NewRaft(0)
+	r.id = 1
+	r.term = 1
+	r.state = Leader
+	r.peers = append(r.peers, 2)
+	return r
 }
 
 // Historical: pre-036f, Propose returned the created Entry directly.
@@ -22,13 +27,13 @@ func newLeaderRaft() Raft {
 // }
 
 func TestProposeNotChangeCommitIndex(t *testing.T) {
-	r := newLeaderRaft()
+	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("")))
 	require.Zero(t, r.commitIndex)
 }
 
 func TestReadyReturnsProposedEntry(t *testing.T) {
-	r := newLeaderRaft()
+	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("")))
 	ready := r.Ready()
 	require.Len(t, ready.Entries, 1)
@@ -36,7 +41,7 @@ func TestReadyReturnsProposedEntry(t *testing.T) {
 }
 
 func TestAdvanceClearReadyEntries(t *testing.T) {
-	r := newLeaderRaft()
+	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 	r.CommitTo(1)
 
@@ -53,7 +58,7 @@ func TestAdvanceClearReadyEntries(t *testing.T) {
 }
 
 func TestCommitToIncreasesCommitIndex(t *testing.T) {
-	r := newLeaderRaft()
+	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
 	r.CommitTo(1)
@@ -61,7 +66,7 @@ func TestCommitToIncreasesCommitIndex(t *testing.T) {
 }
 
 func TestCommitToNeverDecreasesCommitIndex(t *testing.T) {
-	r := newLeaderRaft()
+	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
 	r.CommitTo(1)
@@ -72,7 +77,7 @@ func TestCommitToNeverDecreasesCommitIndex(t *testing.T) {
 }
 
 func TestReadyExposesCommittedEntsOnlyAfterCommitTo(t *testing.T) {
-	r := newLeaderRaft()
+	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
 	ready := r.Ready()
@@ -84,7 +89,7 @@ func TestReadyExposesCommittedEntsOnlyAfterCommitTo(t *testing.T) {
 }
 
 func TestFullLifecycle(t *testing.T) {
-	r := newLeaderRaft()
+	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("x")))
 
 	// Phase 1: unstable only
@@ -105,17 +110,22 @@ func TestFullLifecycle(t *testing.T) {
 }
 
 func TestAppendMessageIsReadyAfterLeaderPropose(t *testing.T) {
-	r := newLeaderRaft()
+	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
 	rd := r.Ready()
 	require.Len(t, rd.Messages, 1)
 	require.Len(t, rd.CommittedEntries, 0)
-	require.Equal(t, Message{Type: MsgApp, Entries: []Entry{{Index: 1, Data: []byte("foo")}}}, rd.Messages[0])
+
+	msg := rd.Messages[0]
+	require.Equal(t, MsgApp, msg.Type)
+	require.Len(t, msg.Entries, 1)
+	require.Equal(t, uint64(1), msg.Entries[0].Index)
+	require.Equal(t, []byte("foo"), msg.Entries[0].Data)
 }
 
 func TestNewEntryIsReadyAfterFollowerStepMsgApp(t *testing.T) {
-	leader := newLeaderRaft()
+	leader := newLeaderRaftWithOnePeer()
 	require.NoError(t, leader.Propose([]byte("foo")))
 
 	msg := leader.Ready().Messages[0]
@@ -133,4 +143,47 @@ func TestNewEntryIsReadyAfterFollowerStepMsgApp(t *testing.T) {
 	rd = r2.Ready()
 	require.Len(t, rd.Messages, 0)
 	require.Len(t, rd.Entries, 0)
+}
+
+func TestTrackerCreatedOnPropose(t *testing.T) {
+	leader := newLeaderRaftWithOnePeer()
+	require.NoError(t, leader.Propose([]byte("foo")))
+
+	id := entryID{index: 1, term: 1}
+	require.Contains(t, leader.acks, id)
+	require.True(t, leader.acks[id][leader.id])
+}
+
+func TestTrackerUpdatedOnStepMsgAppResp(t *testing.T) {
+	leader := newLeaderRaftWithOnePeer()
+	require.NoError(t, leader.Propose([]byte("foo")))
+
+	msg := leader.Ready().Messages[0]
+	follower := *NewRaft(2)
+	follower.state = Follower
+	require.NoError(t, follower.Step(msg))
+
+	resp := follower.Ready().Messages[0]
+	require.NoError(t, leader.Step(resp))
+
+	id := entryID{index: 1, term: 1}
+	require.Contains(t, leader.acks, id)
+	require.True(t, leader.acks[id][2])
+}
+
+func TestCommittedEntriesReadyAfterQuorumReached(t *testing.T) {
+	leader := newLeaderRaftWithOnePeer()
+	require.NoError(t, leader.Propose([]byte("foo")))
+
+	msg := leader.Ready().Messages[0]
+	follower := *NewRaft(2)
+	follower.state = Follower
+	require.NoError(t, follower.Step(msg))
+
+	resp := follower.Ready().Messages[0]
+	require.NoError(t, leader.Step(resp))
+
+	rd := leader.Ready()
+	require.Len(t, rd.CommittedEntries, 1)
+	require.Equal(t, []byte("foo"), rd.CommittedEntries[0].Data)
 }
