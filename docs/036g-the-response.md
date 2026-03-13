@@ -88,9 +88,9 @@ With that in place, leader `Step(MsgAppResp)` can finally move `commitIndex` for
 
  ## Minimum tests
  
- #1 `TestTrackerCreatedOnPropose` proves a tracker exists after a new `Entry` is created.
- #2 `TestTrackerUpdatedOnStepMsgAppResp` proves follower evidence is recorded. For now, duplicate acks are harmless because the tracker shape is already idempotent.
- #3 `TestCommittedEntriesReadyAfterQuorumReached` proves the leader commits an entry only after quorum is reached.
+ #1 `TestTrackerCreatedOnPropose_036g` proves a tracker exists after a new `Entry` is created.
+ #2 `TestTrackerUpdatedOnStepMsgAppResp_036g` proves follower evidence is recorded. For now, duplicate acks are harmless because the tracker shape is already idempotent.
+ #3 `TestCommittedEntriesReadyAfterAppendQuorumReached_036g` proves the leader commits an entry only after quorum is reached.
 
  ## Bounded scope
 

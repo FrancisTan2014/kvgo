@@ -41,7 +41,7 @@ type Storage interface {
 
 Now we have the shape of Storage. We can write a simple test to protect the invariant of 036c:
 ```go
-func TestPersistentStateSurvivesRestart(t *testing.T) {
+func TestPersistentStateSurvivesRestart_036c(t *testing.T) {
     expectedHard := HardState{...}
     expectedEntries := []Entry{...}
 
@@ -70,5 +70,5 @@ For replay, 036c scans the WAL frame by frame on startup — no indexing, no ran
 036c is complete when:
 - an internal `wal.go` with simple APIs is built and tested
 - `DurableStorage` is built and tested
-- `TestPersistentStateSurvivesRestart` passes
+- `TestPersistentStateSurvivesRestart_036c` passes
 - torn tail corruption is recoverable without violating restart safety

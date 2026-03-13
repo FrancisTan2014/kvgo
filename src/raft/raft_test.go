@@ -26,13 +26,13 @@ func newLeaderRaftWithOnePeer() Raft {
 // 	require.Equal(t, uint64(2), e2.Index)
 // }
 
-func TestProposeNotChangeCommitIndex(t *testing.T) {
+func TestProposeNotChangeCommitIndex_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("")))
 	require.Zero(t, r.commitIndex)
 }
 
-func TestReadyReturnsProposedEntry(t *testing.T) {
+func TestReadyReturnsProposedEntry_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("")))
 	ready := r.Ready()
@@ -40,7 +40,7 @@ func TestReadyReturnsProposedEntry(t *testing.T) {
 	require.Len(t, ready.CommittedEntries, 0)
 }
 
-func TestAdvanceClearReadyEntries(t *testing.T) {
+func TestAdvanceClearReadyEntries_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 	r.CommitTo(1)
@@ -57,7 +57,7 @@ func TestAdvanceClearReadyEntries(t *testing.T) {
 	require.Len(t, ready.Messages, 0)
 }
 
-func TestCommitToIncreasesCommitIndex(t *testing.T) {
+func TestCommitToIncreasesCommitIndex_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
@@ -65,7 +65,7 @@ func TestCommitToIncreasesCommitIndex(t *testing.T) {
 	require.Equal(t, uint64(1), r.commitIndex)
 }
 
-func TestCommitToNeverDecreasesCommitIndex(t *testing.T) {
+func TestCommitToNeverDecreasesCommitIndex_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
@@ -76,7 +76,7 @@ func TestCommitToNeverDecreasesCommitIndex(t *testing.T) {
 	require.Equal(t, uint64(1), r.commitIndex)
 }
 
-func TestReadyExposesCommittedEntsOnlyAfterCommitTo(t *testing.T) {
+func TestReadyExposesCommittedEntsOnlyAfterCommitTo_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
@@ -88,7 +88,7 @@ func TestReadyExposesCommittedEntsOnlyAfterCommitTo(t *testing.T) {
 	require.Len(t, ready.CommittedEntries, 1)
 }
 
-func TestFullLifecycle(t *testing.T) {
+func TestFullLifecycle_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("x")))
 
@@ -109,7 +109,7 @@ func TestFullLifecycle(t *testing.T) {
 	require.False(t, r.HasReady())
 }
 
-func TestAppendMessageIsReadyAfterLeaderPropose(t *testing.T) {
+func TestAppendMessageIsReadyAfterLeaderPropose_036f(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
@@ -124,7 +124,7 @@ func TestAppendMessageIsReadyAfterLeaderPropose(t *testing.T) {
 	require.Equal(t, []byte("foo"), msg.Entries[0].Data)
 }
 
-func TestNewEntryIsReadyAfterFollowerStepMsgApp(t *testing.T) {
+func TestNewEntryIsReadyAfterFollowerStepMsgApp_036f(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
 	require.NoError(t, leader.Propose([]byte("foo")))
 
@@ -145,7 +145,7 @@ func TestNewEntryIsReadyAfterFollowerStepMsgApp(t *testing.T) {
 	require.Len(t, rd.Entries, 0)
 }
 
-func TestTrackerCreatedOnPropose(t *testing.T) {
+func TestTrackerCreatedOnPropose_036g(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
 	require.NoError(t, leader.Propose([]byte("foo")))
 
@@ -154,7 +154,7 @@ func TestTrackerCreatedOnPropose(t *testing.T) {
 	require.True(t, leader.acks[id][leader.id])
 }
 
-func TestTrackerUpdatedOnStepMsgAppResp(t *testing.T) {
+func TestTrackerUpdatedOnStepMsgAppResp_036g(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
 	require.NoError(t, leader.Propose([]byte("foo")))
 
@@ -171,7 +171,7 @@ func TestTrackerUpdatedOnStepMsgAppResp(t *testing.T) {
 	require.True(t, leader.acks[id][2])
 }
 
-func TestCommittedEntriesReadyAfterQuorumReached(t *testing.T) {
+func TestCommittedEntriesReadyAfterAppendQuorumReached_036g(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
 	require.NoError(t, leader.Propose([]byte("foo")))
 
@@ -186,4 +186,121 @@ func TestCommittedEntriesReadyAfterQuorumReached(t *testing.T) {
 	rd := leader.Ready()
 	require.Len(t, rd.CommittedEntries, 1)
 	require.Equal(t, []byte("foo"), rd.CommittedEntries[0].Data)
+}
+
+func TestCandidateDoesNotBecomeLeaderWithOnlySelfVote_036h(t *testing.T) {
+	voterId := uint64(2)
+
+	n := NewRaft(1)
+	n.peers = append(n.peers, voterId)
+
+	require.NoError(t, n.Campaign())
+	rd := n.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, MsgVote, rd.Messages[0].Type)
+	require.Equal(t, voterId, rd.Messages[0].To)
+	require.Equal(t, Candidate, n.state)
+
+	require.NoError(t, n.Step(Message{
+		Type:   MsgVoteResp,
+		From:   voterId,
+		To:     n.id,
+		Term:   n.term,
+		Reject: true,
+	}))
+	require.Equal(t, Candidate, n.state)
+}
+
+func TestCandidateBecomesLeaderAfterMajorityVoteResponses_036h(t *testing.T) {
+	voterId := uint64(2)
+
+	n := NewRaft(1)
+	n.peers = append(n.peers, voterId)
+
+	require.NoError(t, n.Campaign())
+	require.Equal(t, Candidate, n.state)
+
+	require.NoError(t, n.Step(Message{
+		Type:   MsgVoteResp,
+		From:   voterId,
+		To:     n.id,
+		Term:   1,
+		Reject: false,
+	}))
+	require.Equal(t, Leader, n.state)
+}
+
+func TestVoteRejectedForOlderTerm_036h(t *testing.T) {
+	n := NewRaft(1)
+	n.term = 2
+
+	require.NoError(t, n.Step(Message{
+		Type: MsgVote,
+		Term: 1,
+	}))
+	rd := n.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, MsgVoteResp, rd.Messages[0].Type)
+	require.True(t, rd.Messages[0].Reject)
+}
+
+func TestVoteRejectedWhenExistingVote_036h(t *testing.T) {
+	n := NewRaft(2)
+	n.term = 1
+	n.votedFor = 3
+
+	require.NoError(t, n.Step(Message{
+		Type: MsgVote,
+		From: 1,
+		Term: 1,
+	}))
+	rd := n.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, MsgVoteResp, rd.Messages[0].Type)
+	require.True(t, rd.Messages[0].Reject)
+}
+
+func TestVoteGrantUpdatesTermAndVotedFor_036h(t *testing.T) {
+	n := NewRaft(2)
+	n.term = 1
+
+	require.NoError(t, n.Step(Message{
+		Type: MsgVote,
+		From: 1,
+		Term: 2,
+	}))
+
+	require.Equal(t, uint64(2), n.term)
+	require.Equal(t, uint64(1), n.votedFor)
+}
+
+func TestGrantingHigherTermVoteStepsDownToFollower_036h(t *testing.T) {
+	n := NewRaft(2)
+	n.term = 1
+	n.state = Candidate
+
+	require.NoError(t, n.Step(Message{
+		Type: MsgVote,
+		From: 1,
+		Term: 2,
+	}))
+	require.Equal(t, Follower, n.state)
+}
+
+func TestStaleVoteRespIgnored_036h(t *testing.T) {
+	voterId := uint64(2)
+
+	n := NewRaft(1)
+	n.term = 1
+	n.peers = append(n.peers, voterId)
+
+	require.NoError(t, n.Campaign())
+	require.NoError(t, n.Step(Message{
+		Type:   MsgVoteResp,
+		From:   voterId,
+		To:     n.id,
+		Term:   1,
+		Reject: false,
+	}))
+	require.Equal(t, Candidate, n.state)
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPersistentStateSurvivesRestart(t *testing.T) {
+func TestPersistentStateSurvivesRestart_036c(t *testing.T) {
 	expectedHard := HardState{
 		Term:           1,
 		CommittedIndex: 1,
@@ -42,7 +42,7 @@ func TestPersistentStateSurvivesRestart(t *testing.T) {
 	require.Equal(t, expectedEntries, actualEntries)
 }
 
-func TestEntriesUsesHalfOpenRange(t *testing.T) {
+func TestEntriesUsesHalfOpenRange_036c(t *testing.T) {
 	s := &DurableStorage{
 		entries: []Entry{
 			{Index: 1, Term: 1, Data: []byte("one")},
@@ -59,7 +59,7 @@ func TestEntriesUsesHalfOpenRange(t *testing.T) {
 	}, entries)
 }
 
-func TestEntriesRejectsOutOfRange(t *testing.T) {
+func TestEntriesRejectsOutOfRange_036c(t *testing.T) {
 	s := &DurableStorage{
 		entries: []Entry{
 			{Index: 1, Term: 1, Data: []byte("one")},
@@ -74,7 +74,7 @@ func TestEntriesRejectsOutOfRange(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestEntriesAllowsEmptyRange(t *testing.T) {
+func TestEntriesAllowsEmptyRange_036c(t *testing.T) {
 	s := &DurableStorage{}
 
 	entries, err := s.Entries(0, 0)
@@ -82,7 +82,7 @@ func TestEntriesAllowsEmptyRange(t *testing.T) {
 	require.Empty(t, entries)
 }
 
-func TestReplayTruncatesCorruptedTail(t *testing.T) {
+func TestReplayTruncatesCorruptedTail_036c(t *testing.T) {
 	expectedHard := HardState{Term: 2, VotedFor: 1, CommittedIndex: 1}
 	expectedEntries := []Entry{{Index: 1, Term: 2, Data: []byte("ok")}}
 
@@ -121,7 +121,7 @@ func TestReplayTruncatesCorruptedTail(t *testing.T) {
 	require.Equal(t, infoBefore.Size(), infoAfter.Size())
 }
 
-func TestSaveRejectsNonContiguousEntries(t *testing.T) {
+func TestSaveRejectsNonContiguousEntries_036c(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewDurableStorage(dir)
 	require.NoError(t, err)
@@ -142,7 +142,7 @@ func TestSaveRejectsNonContiguousEntries(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestReplayFailsOnMalformedFullBatch(t *testing.T) {
+func TestReplayFailsOnMalformedFullBatch_036c(t *testing.T) {
 	dir := t.TempDir()
 	s1, err := NewDurableStorage(dir)
 	require.NoError(t, err)
@@ -174,7 +174,7 @@ func TestReplayFailsOnMalformedFullBatch(t *testing.T) {
 	require.Equal(t, infoBefore.Size()+int64(len(badBatch)), infoAfter.Size())
 }
 
-func TestComputeTotalSizeReturnsExpectedNumber(t *testing.T) {
+func TestComputeTotalSizeReturnsExpectedNumber_036c(t *testing.T) {
 	batch := []Entry{
 		{Data: []byte("foo")},
 		{Data: []byte("ba")},
@@ -184,7 +184,7 @@ func TestComputeTotalSizeReturnsExpectedNumber(t *testing.T) {
 	require.Equal(t, 45, total)
 }
 
-func TestEntriesBeforeBoundaryReturnErrCompacted(t *testing.T) {
+func TestEntriesBeforeBoundaryReturnErrCompacted_036e(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewDurableStorage(dir)
 	require.NoError(t, err)
@@ -206,7 +206,7 @@ func TestEntriesBeforeBoundaryReturnErrCompacted(t *testing.T) {
 	require.Equal(t, Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
 }
 
-func TestCompactionSurvivesRestart(t *testing.T) {
+func TestCompactionSurvivesRestart_036e(t *testing.T) {
 	dir := t.TempDir()
 	s1, err := NewDurableStorage(dir)
 	require.NoError(t, err)
@@ -230,7 +230,7 @@ func TestCompactionSurvivesRestart(t *testing.T) {
 	require.Equal(t, Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
 }
 
-func TestReplayFailsOnGapAfterSnapshotBoundary(t *testing.T) {
+func TestReplayFailsOnGapAfterSnapshotBoundary_036e(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewDurableStorage(dir)
 	require.NoError(t, err)

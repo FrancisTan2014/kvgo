@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestConsumeEntryAfterPropose(t *testing.T) {
+func TestConsumeEntryAfterPropose_036b(t *testing.T) {
 	n := setupNode(1)
 	n.r.state = Leader
 	ctx := context.Background()
@@ -19,7 +19,7 @@ func TestConsumeEntryAfterPropose(t *testing.T) {
 	require.Len(t, r.Entries, 1)
 }
 
-func TestAdvanceMovesForward(t *testing.T) {
+func TestAdvanceMovesForward_036b(t *testing.T) {
 	n := setupNode(1)
 	n.r.state = Leader
 	ctx := context.Background()

@@ -20,7 +20,7 @@ func (f *fakeApplyTarget) Apply(entries []Entry) error {
 	return nil
 }
 
-func TestApplierDoesNotApplyUncommittedEntries(t *testing.T) {
+func TestApplierDoesNotApplyUncommittedEntries_036d(t *testing.T) {
 	r := NewRaft(1)
 	r.state = Leader
 	target := &fakeApplyTarget{}
@@ -35,7 +35,7 @@ func TestApplierDoesNotApplyUncommittedEntries(t *testing.T) {
 	require.False(t, r.HasReady())
 }
 
-func TestApplierAppliesCommittedEntriesBeforeAdvance(t *testing.T) {
+func TestApplierAppliesCommittedEntriesBeforeAdvance_036d(t *testing.T) {
 	r := NewRaft(1)
 	r.state = Leader
 	target := &fakeApplyTarget{}
@@ -63,7 +63,7 @@ func TestApplierAppliesCommittedEntriesBeforeAdvance(t *testing.T) {
 	require.False(t, r.HasReady())
 }
 
-func TestApplierBlocksAdvanceOnApplyFailure(t *testing.T) {
+func TestApplierBlocksAdvanceOnApplyFailure_036d(t *testing.T) {
 	r := NewRaft(1)
 	r.state = Leader
 	target := &fakeApplyTarget{err: errors.New("apply failed")}

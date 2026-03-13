@@ -7,8 +7,10 @@ const SnapshotMetaBytes = 16
 type MessageType int32
 
 const (
-	MsgApp     MessageType = 1
-	MsgAppResp MessageType = 2
+	MsgApp      MessageType = 1
+	MsgAppResp  MessageType = 2
+	MsgVote     MessageType = 3
+	MsgVoteResp MessageType = 4
 )
 
 type Message struct {
@@ -18,6 +20,7 @@ type Message struct {
 	Index   uint64
 	Term    uint64
 	Entries []Entry
+	Reject  bool
 }
 
 func (e *Entry) Size() int {

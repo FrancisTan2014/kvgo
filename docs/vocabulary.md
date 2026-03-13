@@ -72,6 +72,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `gap` is simpler; `break` is more general; `discontinuity` highlights the loss of a continuous line
 - **where it breaks:** too heavy for small missing details; use it when continuity itself matters
 
+## emerge
+- **meaning:** come into view, become noticeable, or take shape from something less clear
+- **pressure:** use it when a pattern, truth, structure, or result becomes visible through time, evidence, or pressure
+- **tone:** thoughtful, natural, slightly formal
+- **nearby alternatives:** `appear` is more surface-level; `arise` stresses coming into existence; `surface` stresses becoming visible; `emerge` fits best when something gradually becomes clear
+- **where it breaks:** do not use it for abrupt mechanical events when plain `appear` or `happen` is enough; `emerge` usually carries a sense of gradual revealing
+
 ## frustrated
 - **meaning:** upset or discouraged because progress is blocked or harder than expected
 - **pressure:** use it when there is effort plus obstruction

@@ -65,6 +65,8 @@ type Raft struct {
 	messages []Message
 	acks     map[entryID]map[uint64]bool
 	peers    []uint64
+	votes    map[uint64]bool
+	votedFor uint64
 }
 
 func NewRaft(id uint64) *Raft {
@@ -167,16 +169,48 @@ func (r *Raft) Step(m Message) error {
 
 		if _, exists := tracker[m.From]; exists {
 			tracker[m.From] = true
-			if r.quorumReached(id) {
+			if r.appendQuorumReached(id) {
 				r.CommitTo(id.index)
 			}
+		}
+
+	case MsgVote:
+		rejected := m.Term < r.term ||
+			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From)
+		if !rejected {
+			r.term = m.Term
+			r.votedFor = m.From
+			r.state = Follower
+		}
+		resp := Message{
+			Type:   MsgVoteResp,
+			From:   r.id,
+			To:     m.From,
+			Term:   m.Term,
+			Reject: rejected,
+		}
+		r.messages = append(r.messages, resp)
+
+	case MsgVoteResp:
+		if r.state != Candidate {
+			return nil
+		}
+		if m.Term < r.term {
+			return nil
+		}
+		if _, exists := r.votes[m.From]; !exists {
+			return nil
+		}
+		r.votes[m.From] = !m.Reject
+		if r.voteQuorumReached() {
+			r.state = Leader
 		}
 	}
 
 	return nil
 }
 
-func (r Raft) quorumReached(id entryID) bool {
+func (r *Raft) appendQuorumReached(id entryID) bool {
 	tracker, ok := r.acks[id]
 	if !ok {
 		return false
@@ -193,6 +227,18 @@ func (r Raft) quorumReached(id entryID) bool {
 	return cnt >= quorum
 }
 
+func (r *Raft) voteQuorumReached() bool {
+	var cnt int
+	for _, granted := range r.votes {
+		if granted {
+			cnt++
+		}
+	}
+
+	quorum := len(r.votes)/2 + 1
+	return cnt >= quorum
+}
+
 func (r *Raft) appendEntries(entries []Entry) {
 	if len(entries) == 0 {
 		return
@@ -200,4 +246,29 @@ func (r *Raft) appendEntries(entries []Entry) {
 
 	r.log = append(r.log, entries...)
 	r.lastLogIndex = entries[len(entries)-1].Index
+}
+
+func (r *Raft) Campaign() error {
+	if r.state == Leader {
+		return nil
+	}
+
+	r.term++
+	r.state = Candidate
+	r.votedFor = r.id
+
+	r.votes = make(map[uint64]bool)
+	r.votes[r.id] = true
+
+	for _, pid := range r.peers {
+		r.votes[pid] = false
+		r.messages = append(r.messages, Message{
+			Type: MsgVote,
+			From: r.id,
+			To:   pid,
+			Term: r.term,
+		})
+	}
+
+	return nil
 }

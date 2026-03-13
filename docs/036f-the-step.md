@@ -78,9 +78,9 @@ I have left a hole above: where does the message get created? It should be insid
 
 When I think about the tests, mocking the whole outside world comes up immediately. That expands the scope and blurs the boundary. But `Step` is the entry point and the new thing built in 036f, so the tests should only prove that the new message-driven path becomes visible through `Ready`. No larger mock is needed yet.
 
-#1 `TestAppendMessageIsReadyAfterLeaderPropose` proves that after leader `Propose`, `Ready` exposes an append message but the entry is not committed.
+#1 `TestAppendMessageIsReadyAfterLeaderPropose_036f` proves that after leader `Propose`, `Ready` exposes an append message but the entry is not committed.
 
-#2 `TestNewEntryIsReadyAfterFollowerStepMsgApp` proves that after follower `Step(MsgApp)`, follower `Ready` exposes the new entry for persistence.
+#2 `TestNewEntryIsReadyAfterFollowerStepMsgApp_036f` proves that after follower `Step(MsgApp)`, follower `Ready` exposes the new entry for persistence.
 
 ## Bounded scope
 

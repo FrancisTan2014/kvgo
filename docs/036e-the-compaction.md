@@ -62,11 +62,11 @@ One more validity rule appears here: after replay, the retained entries must be 
 
 ## Minimum test
 
-#1 `TestEntriesBeforeBoundaryReturnErrCompacted` proves `Entries` keeps its meaning after compaction.
+#1 `TestEntriesBeforeBoundaryReturnErrCompacted_036e` proves `Entries` keeps its meaning after compaction.
 
-#2 `TestCompactionSurvivesRestart` proves the compacted boundary remains durable and retained entries are still readable after restart.
+#2 `TestCompactionSurvivesRestart_036e` proves the compacted boundary remains durable and retained entries are still readable after restart.
 
-#3 `TestReplayFailsOnGapAfterSnapshotBoundary` proves a retained-log gap after the snapshot boundary is fatal corruption, not a recoverable tail issue.
+#3 `TestReplayFailsOnGapAfterSnapshotBoundary_036e` proves a retained-log gap after the snapshot boundary is fatal corruption, not a recoverable tail issue.
 
 ## Bounded scope
 
