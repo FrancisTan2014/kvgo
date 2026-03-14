@@ -367,3 +367,29 @@ Art shocks twice. First through color and form. Then through the tiny details be
 Software is similar. A mature design looks beautiful on the surface, but the deeper shock comes from the small details quietly carrying the truth.
 
 ---
+
+## 2026-03-14 — A Small Design Doc Can Still Tell a Real Story
+
+### The lesson
+
+036i showed me that a design doc does not need to choose between "real-world story" and "small provable step." It can do both, if the story is used only to motivate one bounded invariant.
+
+### The pattern
+
+The writing shape was:
+
+1. Start with a real failure pressure
+2. State that the full coordination story is out of scope
+3. Extract one local rule from that pressure
+4. Show the smallest design consequence
+5. End by naming the invariant explicitly
+
+### Why this worked
+
+Without the motivating race, log freshness would feel arbitrary. Without the bounded rule, the doc would drift into full election design. The useful middle path was: tell just enough story to make the invariant feel necessary, then stop.
+
+### What to remember
+
+Professional technical writing does not need to sound large. One real pressure, one bounded rule, one small design consequence, and one explicit invariant are enough.
+
+This structure works for me because it forces thinking within boundaries and builds upper layers only on proved invariants. I may not be able to apply it perfectly at work under time pressure, but it has already changed how I read code, shape designs, and write technical prose.

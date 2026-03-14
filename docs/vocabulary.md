@@ -136,6 +136,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `experienced` fits people more; `refined` stresses polish; `stable` stresses reliability; `mature` carries all of these with time-pressure behind them
 - **where it breaks:** do not use it for something merely old; age alone does not make a system mature
 
+## motivate
+- **meaning:** provide the reason for doing, explaining, or justifying something
+- **pressure:** use it when the point is not only that something exists, but why a design, action, or rule is worth introducing
+- **tone:** analytical, explanatory, purposeful
+- **nearby alternatives:** `justify` is stronger and more defensive; `explain` is broader; `inspire` is more emotional; `motivate` fits best when one thing gives another its reason
+- **where it breaks:** do not use it when you mean emotional encouragement only; in technical writing, `motivate` usually means supplying rationale, not cheering someone up
+
 ## north star
 - **meaning:** the main long-term guiding goal
 - **pressure:** use it when many local decisions need one stable direction

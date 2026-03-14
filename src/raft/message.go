@@ -18,6 +18,7 @@ type Message struct {
 	From    uint64
 	To      uint64
 	Index   uint64
+	LogTerm uint64
 	Term    uint64
 	Entries []Entry
 	Reject  bool

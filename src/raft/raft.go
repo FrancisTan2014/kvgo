@@ -176,7 +176,8 @@ func (r *Raft) Step(m Message) error {
 
 	case MsgVote:
 		rejected := m.Term < r.term ||
-			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From)
+			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From) ||
+			!r.isCandidateUpToDate(m)
 		if !rejected {
 			r.term = m.Term
 			r.votedFor = m.From
@@ -208,6 +209,23 @@ func (r *Raft) Step(m Message) error {
 	}
 
 	return nil
+}
+
+func (r *Raft) lastLog() Entry {
+	lastLog := Entry{}
+	size := len(r.log)
+	if size > 0 {
+		lastLog = r.log[size-1]
+	}
+	return lastLog
+}
+
+func (r *Raft) isCandidateUpToDate(candidate Message) bool {
+	lastLog := r.lastLog()
+	if candidate.LogTerm != lastLog.Term {
+		return candidate.LogTerm > lastLog.Term
+	}
+	return candidate.Index >= lastLog.Index
 }
 
 func (r *Raft) appendQuorumReached(id entryID) bool {
@@ -260,13 +278,16 @@ func (r *Raft) Campaign() error {
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
 
+	lastLog := r.lastLog()
 	for _, pid := range r.peers {
 		r.votes[pid] = false
 		r.messages = append(r.messages, Message{
-			Type: MsgVote,
-			From: r.id,
-			To:   pid,
-			Term: r.term,
+			Type:    MsgVote,
+			From:    r.id,
+			To:      pid,
+			Term:    r.term,
+			Index:   lastLog.Index,
+			LogTerm: lastLog.Term,
 		})
 	}
 
