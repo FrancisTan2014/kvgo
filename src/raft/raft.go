@@ -103,6 +103,7 @@ func (r *Raft) Propose(data []byte) error {
 			From:    r.id,
 			To:      pid,
 			Type:    MsgApp,
+			Term:    r.term,
 			Entries: []Entry{e},
 		})
 		r.acks[id][pid] = false
@@ -139,6 +140,13 @@ func (r *Raft) CommitTo(index uint64) {
 }
 
 func (r *Raft) Step(m Message) error {
+	if m.Term > r.term {
+		r.term = m.Term
+		r.state = Follower
+		r.votedFor = 0
+		r.votes = nil
+	}
+
 	switch m.Type {
 	case MsgApp:
 		if r.state != Follower || len(m.Entries) == 0 {
@@ -148,11 +156,12 @@ func (r *Raft) Step(m Message) error {
 		r.appendEntries(m.Entries)
 		last := m.Entries[len(m.Entries)-1]
 		resp := Message{
-			Type:  MsgAppResp,
-			From:  r.id,
-			To:    m.From,
-			Index: last.Index,
-			Term:  last.Term,
+			Type:    MsgAppResp,
+			From:    r.id,
+			To:      m.From,
+			Index:   last.Index,
+			LogTerm: last.Term,
+			Term:    r.term,
 		}
 		r.messages = append(r.messages, resp)
 
@@ -161,7 +170,7 @@ func (r *Raft) Step(m Message) error {
 			return nil
 		}
 
-		id := entryID{index: m.Index, term: m.Term}
+		id := entryID{index: m.Index, term: m.LogTerm}
 		tracker, ok := r.acks[id]
 		if !ok {
 			return nil
@@ -175,11 +184,6 @@ func (r *Raft) Step(m Message) error {
 		}
 
 	case MsgVote:
-		if m.Term > r.term {
-			r.term = m.Term
-			r.state = Follower
-			r.votedFor = 0
-		}
 		rejected := m.Term < r.term ||
 			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From) ||
 			!r.isCandidateUpToDate(m)

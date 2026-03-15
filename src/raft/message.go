@@ -14,11 +14,16 @@ const (
 )
 
 type Message struct {
-	Type    MessageType
-	From    uint64
-	To      uint64
-	Index   uint64
+	Type  MessageType
+	From  uint64
+	To    uint64
+	Index uint64
+	// LogTerm is context-dependent.
+	// On MsgVote it carries the candidate's last log term for the election
+	// freshness check. On MsgAppResp it carries the acknowledged entry term so
+	// the leader can identify which append tracker the response belongs to.
 	LogTerm uint64
+	// Term is the sender's current term for authority comparison.
 	Term    uint64
 	Entries []Entry
 	Reject  bool

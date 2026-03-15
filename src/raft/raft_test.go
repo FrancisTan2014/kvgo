@@ -405,3 +405,112 @@ func TestHigherTermRejectionClearsVoteForLaterSameTermGrant_036j(t *testing.T) {
 	require.False(t, rd.Messages[0].Reject)
 	require.Equal(t, uint64(3), n.votedFor)
 }
+
+func TestHigherTermGrantedVoteResponseMakesCandidateYield_036j(t *testing.T) {
+	n := NewRaft(1)
+	n.peers = append(n.peers, 2)
+
+	require.NoError(t, n.Campaign())
+	require.Equal(t, Candidate, n.state)
+	require.Equal(t, uint64(1), n.term)
+	require.Equal(t, n.id, n.votedFor)
+
+	require.NoError(t, n.Step(Message{
+		Type:   MsgVoteResp,
+		From:   2,
+		To:     n.id,
+		Term:   2,
+		Reject: false,
+	}))
+
+	require.Equal(t, Follower, n.state)
+	require.Equal(t, uint64(2), n.term)
+	require.Zero(t, n.votedFor)
+	require.Nil(t, n.votes)
+}
+
+func TestHigherTermVoteResponseClearsSelfVoteForLaterGrant_036j(t *testing.T) {
+	n := NewRaft(2)
+	n.peers = append(n.peers, 1, 3)
+
+	require.NoError(t, n.Campaign())
+	require.Equal(t, Candidate, n.state)
+
+	require.NoError(t, n.Step(Message{
+		Type:   MsgVoteResp,
+		From:   1,
+		To:     n.id,
+		Term:   2,
+		Reject: true,
+	}))
+	require.Equal(t, Follower, n.state)
+	n.messages = nil
+
+	require.NoError(t, n.Step(Message{
+		Type:    MsgVote,
+		From:    3,
+		Term:    2,
+		LogTerm: 0,
+		Index:   0,
+	}))
+
+	rd := n.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.False(t, rd.Messages[0].Reject)
+	require.Equal(t, uint64(3), n.votedFor)
+}
+
+func TestHigherTermAppendRevokesStaleAuthorityBeforeAppendLogic_036j(t *testing.T) {
+	n := NewRaft(2)
+	n.term = 1
+	n.state = Candidate
+	n.votedFor = n.id
+	n.votes = map[uint64]bool{n.id: true, 1: false}
+
+	require.NoError(t, n.Step(Message{
+		Type:    MsgApp,
+		From:    1,
+		To:      n.id,
+		Term:    2,
+		Entries: []Entry{{Index: 1, Term: 2, Data: []byte("x")}},
+	}))
+
+	require.Equal(t, uint64(2), n.term)
+	require.Equal(t, Follower, n.state)
+	require.Zero(t, n.votedFor)
+	require.Nil(t, n.votes)
+
+	rd := n.Ready()
+	require.Len(t, rd.Entries, 1)
+	require.Equal(t, Entry{Index: 1, Term: 2, Data: []byte("x")}, rd.Entries[0])
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, MsgAppResp, rd.Messages[0].Type)
+	require.Equal(t, uint64(2), rd.Messages[0].Term)
+	require.Equal(t, uint64(2), rd.Messages[0].LogTerm)
+}
+
+func TestHigherTermAppendRespRevokesStaleLeaderAuthorityBeforeAckTracking_036j(t *testing.T) {
+	leader := newLeaderRaftWithOnePeer()
+	leader.votedFor = leader.id
+	leader.votes = map[uint64]bool{leader.id: true, 2: false}
+	require.NoError(t, leader.Propose([]byte("foo")))
+
+	id := entryID{index: 1, term: 1}
+	require.False(t, leader.acks[id][2])
+
+	require.NoError(t, leader.Step(Message{
+		Type:    MsgAppResp,
+		From:    2,
+		To:      leader.id,
+		Term:    2,
+		Index:   1,
+		LogTerm: 1,
+	}))
+
+	require.Equal(t, uint64(2), leader.term)
+	require.Equal(t, Follower, leader.state)
+	require.Zero(t, leader.votedFor)
+	require.Nil(t, leader.votes)
+	require.False(t, leader.acks[id][2])
+	require.Zero(t, leader.commitIndex)
+}
