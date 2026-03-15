@@ -72,6 +72,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `gap` is simpler; `break` is more general; `discontinuity` highlights the loss of a continuous line
 - **where it breaks:** too heavy for small missing details; use it when continuity itself matters
 
+## diverge
+- **meaning:** move apart from a shared path, direction, or conclusion
+- **pressure:** use it when two ideas, states, code paths, or outcomes start from a common point but then separate meaningfully
+- **tone:** analytical, process-aware, slightly formal
+- **nearby alternatives:** `separate` is broader and plainer; `split` is sharper and more forceful; `drift` suggests gradual unintended movement; `diverge` fits best when the emphasis is on branching away from a common line
+- **where it breaks:** do not use it for simple physical distance unless the path or direction matters; it is strongest when the important point is that something once aligned and now no longer does
+
 ## emerge
 - **meaning:** come into view, become noticeable, or take shape from something less clear
 - **pressure:** use it when a pattern, truth, structure, or result becomes visible through time, evidence, or pressure

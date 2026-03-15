@@ -352,3 +352,56 @@ func TestCampaignIncludesLastLogPositionInVoteRequest_036i(t *testing.T) {
 	require.Equal(t, uint64(2), rd.Messages[0].LogTerm)
 	require.Equal(t, uint64(2), rd.Messages[0].Index)
 }
+
+func TestRejectingHigherTermStaleVoteUpdatesTermAndClearsOldVote_036j(t *testing.T) {
+	n := NewRaft(2)
+	n.term = 1
+	n.state = Candidate
+	n.votedFor = n.id
+	n.log = append(n.log, Entry{Term: 1, Index: 2})
+
+	require.NoError(t, n.Step(Message{
+		Type:    MsgVote,
+		From:    1,
+		Term:    2,
+		LogTerm: 0,
+		Index:   0,
+	}))
+
+	rd := n.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.True(t, rd.Messages[0].Reject)
+	require.Equal(t, uint64(2), n.term)
+	require.Equal(t, Follower, n.state)
+	require.Zero(t, n.votedFor)
+}
+
+func TestHigherTermRejectionClearsVoteForLaterSameTermGrant_036j(t *testing.T) {
+	n := NewRaft(2)
+	n.term = 1
+	n.state = Candidate
+	n.votedFor = n.id
+	n.log = append(n.log, Entry{Term: 1, Index: 2})
+
+	require.NoError(t, n.Step(Message{
+		Type:    MsgVote,
+		From:    1,
+		Term:    2,
+		LogTerm: 0,
+		Index:   0,
+	}))
+	n.messages = nil
+
+	require.NoError(t, n.Step(Message{
+		Type:    MsgVote,
+		From:    3,
+		Term:    2,
+		LogTerm: 1,
+		Index:   2,
+	}))
+
+	rd := n.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.False(t, rd.Messages[0].Reject)
+	require.Equal(t, uint64(3), n.votedFor)
+}

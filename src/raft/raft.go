@@ -175,19 +175,22 @@ func (r *Raft) Step(m Message) error {
 		}
 
 	case MsgVote:
+		if m.Term > r.term {
+			r.term = m.Term
+			r.state = Follower
+			r.votedFor = 0
+		}
 		rejected := m.Term < r.term ||
 			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From) ||
 			!r.isCandidateUpToDate(m)
 		if !rejected {
-			r.term = m.Term
 			r.votedFor = m.From
-			r.state = Follower
 		}
 		resp := Message{
 			Type:   MsgVoteResp,
 			From:   r.id,
 			To:     m.From,
-			Term:   m.Term,
+			Term:   r.term,
 			Reject: rejected,
 		}
 		r.messages = append(r.messages, resp)
