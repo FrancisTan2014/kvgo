@@ -250,3 +250,67 @@ func TestReplayFailsOnGapAfterSnapshotBoundary_036e(t *testing.T) {
 	_, err = NewDurableStorage(dir)
 	require.ErrorIs(t, err, ErrNonContiguous)
 }
+
+func TestStorageApplySnapshotDropsCoveredEntries_036k(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+
+	entries := []Entry{
+		{Index: 1, Term: 1, Data: []byte("one")},
+		{Index: 2, Term: 1, Data: []byte("two")},
+		{Index: 3, Term: 2, Data: []byte("three")},
+		{Index: 4, Term: 2, Data: []byte("four")},
+	}
+	require.NoError(t, s1.Save(entries, HardState{Term: 2, CommittedIndex: 3}))
+
+	snap := SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 2}
+	require.NoError(t, s1.ApplySnapshot(snap))
+
+	actualSnap, err := s1.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, snap, actualSnap)
+	require.Equal(t, uint64(4), s1.FirstIndex())
+	require.Equal(t, uint64(4), s1.LastIndex())
+
+	_, err = s1.Entries(1, 4)
+	require.ErrorIs(t, err, ErrCompacted)
+
+	retained, err := s1.Entries(4, 5)
+	require.NoError(t, err)
+	require.Equal(t, []Entry{{Index: 4, Term: 2, Data: []byte("four")}}, retained)
+	require.NoError(t, s1.Close())
+
+	s2, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, s2.Close())
+	}()
+
+	actualSnap, err = s2.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, snap, actualSnap)
+	_, err = s2.Entries(1, 4)
+	require.ErrorIs(t, err, ErrCompacted)
+
+	retained, err = s2.Entries(4, 5)
+	require.NoError(t, err)
+	require.Equal(t, []Entry{{Index: 4, Term: 2, Data: []byte("four")}}, retained)
+}
+
+func TestApplySnapshotRejectsStaleBoundary_036k(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, s.Close())
+	}()
+
+	require.NoError(t, s.ApplySnapshot(SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}))
+	err = s.ApplySnapshot(SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 2})
+	require.ErrorIs(t, err, ErrSnapOutOfDate)
+
+	snap, err := s.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}, snap)
+}

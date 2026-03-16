@@ -15,13 +15,13 @@ type node struct {
 	advancec chan struct{}
 }
 
-func NewNode(id uint64) Node {
-	return setupNode(id)
+func NewNode(id uint64, storage Storage) Node {
+	return setupNode(id, storage)
 }
 
-func setupNode(id uint64) *node {
+func setupNode(id uint64, storage Storage) *node {
 	return &node{
-		r:        NewRaft(id),
+		r:        NewRaft(id, storage),
 		recvc:    make(chan []byte),
 		readyc:   make(chan Ready),
 		advancec: make(chan struct{}),

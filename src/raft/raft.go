@@ -67,9 +67,15 @@ type Raft struct {
 	peers    []uint64
 	votes    map[uint64]bool
 	votedFor uint64
+
+	storage Storage
 }
 
-func NewRaft(id uint64) *Raft {
+func NewRaft(id uint64, storage Storage) *Raft {
+	if storage == nil {
+		panic("raft: nil storage")
+	}
+
 	return &Raft{
 		id:       id,
 		state:    Follower,
@@ -77,6 +83,7 @@ func NewRaft(id uint64) *Raft {
 		acks:     make(map[entryID]map[uint64]bool),
 		peers:    make([]uint64, 0),
 		messages: make([]Message, 0),
+		storage:  storage,
 	}
 }
 
@@ -85,8 +92,9 @@ func (r *Raft) Propose(data []byte) error {
 		return nil
 	}
 
+	prev := r.lastLog()
 	e := Entry{
-		Index: r.lastLogIndex + 1,
+		Index: prev.Index + 1,
 		Term:  r.term,
 		Data:  data,
 	}
@@ -104,6 +112,8 @@ func (r *Raft) Propose(data []byte) error {
 			To:      pid,
 			Type:    MsgApp,
 			Term:    r.term,
+			Index:   prev.Index,
+			LogTerm: prev.Term,
 			Entries: []Entry{e},
 		})
 		r.acks[id][pid] = false
@@ -114,8 +124,8 @@ func (r *Raft) Propose(data []byte) error {
 
 func (r *Raft) Ready() Ready {
 	return Ready{
-		Entries:          r.log[r.stableIndex:r.lastLogIndex],
-		CommittedEntries: r.log[r.appliedIndex:r.commitIndex],
+		Entries:          r.entriesBetween(r.stableIndex, r.lastLogIndex),
+		CommittedEntries: r.entriesBetween(r.appliedIndex, r.commitIndex),
 		Messages:         r.messages,
 	}
 }
@@ -153,15 +163,23 @@ func (r *Raft) Step(m Message) error {
 			return nil
 		}
 
-		r.appendEntries(m.Entries)
-		last := m.Entries[len(m.Entries)-1]
 		resp := Message{
-			Type:    MsgAppResp,
-			From:    r.id,
-			To:      m.From,
-			Index:   last.Index,
-			LogTerm: last.Term,
-			Term:    r.term,
+			Type: MsgAppResp,
+			From: r.id,
+			To:   m.From,
+			Term: r.term,
+		}
+		if r.anchorExists(m.Index, m.LogTerm) {
+			r.appendEntries(m.Entries)
+			last := m.Entries[len(m.Entries)-1]
+			resp.Index = last.Index
+			resp.LogTerm = last.Term
+		} else {
+			resp.Reject = true
+			resp.Index = m.Index
+			if snap, err := r.storage.Snapshot(); err == nil {
+				resp.RejectHint = snap.LastIncludedIndex
+			}
 		}
 		r.messages = append(r.messages, resp)
 
@@ -170,16 +188,31 @@ func (r *Raft) Step(m Message) error {
 			return nil
 		}
 
-		id := entryID{index: m.Index, term: m.LogTerm}
-		tracker, ok := r.acks[id]
-		if !ok {
-			return nil
-		}
+		if m.Reject {
+			firstIndex := r.storage.FirstIndex()
+			if firstIndex > 0 && m.RejectHint < firstIndex-1 {
+				if snap, err := r.storage.Snapshot(); err == nil {
+					r.messages = append(r.messages, Message{
+						Type:     MsgSnap,
+						From:     r.id,
+						Term:     r.term,
+						To:       m.From,
+						Snapshot: snap,
+					})
+				}
+			}
+		} else {
+			id := entryID{index: m.Index, term: m.LogTerm}
+			tracker, ok := r.acks[id]
+			if !ok {
+				return nil
+			}
 
-		if _, exists := tracker[m.From]; exists {
-			tracker[m.From] = true
-			if r.appendQuorumReached(id) {
-				r.CommitTo(id.index)
+			if _, exists := tracker[m.From]; exists {
+				tracker[m.From] = true
+				if r.appendQuorumReached(id) {
+					r.CommitTo(id.index)
+				}
 			}
 		}
 
@@ -213,18 +246,97 @@ func (r *Raft) Step(m Message) error {
 		if r.voteQuorumReached() {
 			r.state = Leader
 		}
+
+	case MsgSnap:
+		if r.state != Follower {
+			return nil
+		}
+
+		if err := r.storage.ApplySnapshot(m.Snapshot); err != nil {
+			// TODO: log the failure
+			return nil
+		}
+
+		r.log = filterRetainedEntries(r.log, m.Snapshot.LastIncludedIndex)
+		if len(r.log) > 0 {
+			r.lastLogIndex = r.log[len(r.log)-1].Index
+		} else {
+			r.lastLogIndex = m.Snapshot.LastIncludedIndex
+		}
+		if r.stableIndex < m.Snapshot.LastIncludedIndex {
+			r.stableIndex = m.Snapshot.LastIncludedIndex
+		}
+		if r.commitIndex < m.Snapshot.LastIncludedIndex {
+			r.commitIndex = m.Snapshot.LastIncludedIndex
+		}
+		if r.appliedIndex < m.Snapshot.LastIncludedIndex {
+			r.appliedIndex = m.Snapshot.LastIncludedIndex
+		}
 	}
 
 	return nil
 }
 
+// anchorExists proves if the specified anchor exists locally
+func (r *Raft) anchorExists(index uint64, term uint64) bool {
+	if index == 0 && term == 0 {
+		return true
+	}
+
+	snap, err := r.storage.Snapshot()
+	if err == nil {
+		// followers should reject anchors before the compaction boundary
+		// because they are no longer verifiable anymore
+		if index == snap.LastIncludedIndex && term == snap.LastIncludedTerm {
+			return true
+		}
+	}
+
+	for _, e := range r.log {
+		if err == nil && e.Index <= snap.LastIncludedIndex {
+			continue
+		}
+		if e.Index == index && e.Term == term {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (r *Raft) lastLog() Entry {
 	lastLog := Entry{}
+	if snap, err := r.storage.Snapshot(); err == nil && snap.LastIncludedIndex > 0 {
+		lastLog = Entry{Index: snap.LastIncludedIndex, Term: snap.LastIncludedTerm}
+	}
 	size := len(r.log)
 	if size > 0 {
-		lastLog = r.log[size-1]
+		if r.log[size-1].Index >= lastLog.Index {
+			lastLog = r.log[size-1]
+		}
 	}
 	return lastLog
+}
+
+func (r *Raft) entriesBetween(lo, hi uint64) []Entry {
+	if hi <= lo || len(r.log) == 0 {
+		return nil
+	}
+
+	first := r.log[0].Index
+	startIndex := lo + 1
+	if startIndex < first {
+		startIndex = first
+	}
+	if hi < startIndex {
+		return nil
+	}
+
+	start := int(startIndex - first)
+	end := int(hi-first) + 1
+	ents := make([]Entry, end-start)
+	copy(ents, r.log[start:end])
+	return ents
 }
 
 func (r *Raft) isCandidateUpToDate(candidate Message) bool {

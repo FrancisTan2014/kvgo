@@ -8,7 +8,7 @@ import (
 )
 
 func TestConsumeEntryAfterPropose_036b(t *testing.T) {
-	n := setupNode(1)
+	n := setupNode(1, &mockStorage{})
 	n.r.state = Leader
 	ctx := context.Background()
 	defer ctx.Done()
@@ -20,7 +20,7 @@ func TestConsumeEntryAfterPropose_036b(t *testing.T) {
 }
 
 func TestAdvanceMovesForward_036b(t *testing.T) {
-	n := setupNode(1)
+	n := setupNode(1, &mockStorage{})
 	n.r.state = Leader
 	ctx := context.Background()
 	defer ctx.Done()

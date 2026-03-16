@@ -393,3 +393,53 @@ Without the motivating race, log freshness would feel arbitrary. Without the bou
 Professional technical writing does not need to sound large. One real pressure, one bounded rule, one small design consequence, and one explicit invariant are enough.
 
 This structure works for me because it forces thinking within boundaries and builds upper layers only on proved invariants. I may not be able to apply it perfectly at work under time pressure, but it has already changed how I read code, shape designs, and write technical prose.
+
+---
+
+## 2026-03-16 — Human Reasoning Needs Small State Spaces
+
+### The claim
+
+Human reasoning works only in a small state space. Stable architecture appears only when upper layers stand on proved boundaries.
+
+### Why this matters
+
+When a design feels hard because there are too many possible failure paths, the real problem is usually not lack of effort. The real problem is that the state space is too large to hold clearly.
+
+That is why invariants matter. A good invariant removes many states at once. A proved boundary preserves that simplification so the next layer can safely build on top of it.
+
+### The architectural lesson
+
+Without a proved boundary, the upper layer keeps re-opening old questions. It cannot trust what is below.
+
+With a proved boundary, many earlier ambiguities stop leaking upward. The architecture becomes calmer because the next layer is built on something already earned.
+
+### What to remember
+
+If the state space feels too large, stop building upward.
+
+1. find the missing invariant
+2. prove it at a real boundary
+3. then continue from the smaller state space
+
+Small state spaces make reasoning possible. Proved boundaries make architecture stable.
+
+---
+
+## 2026-03-16 — Architectural Progress Is Often Invisible Until a Boundary Holds
+
+Architectural work can feel slow because much of the progress is not visible as features.
+
+But the real progress is this: a boundary becomes clear, proved, and safe for the next layer to trust.
+
+Feature progress is easy to see. Architectural progress is easier to feel after the system becomes calmer.
+
+---
+
+## 2026-03-16 — Wanting One More Guard Is Often a Signal
+
+When I feel like adding one more guard before writing a method, it often means the boundary below that method is not yet trusted.
+
+Sometimes the right fix is the guard. But often the better question is: what invariant is still missing underneath?
+
+That makes the feeling useful. The urge to add a guard is not only caution. It can be a sign that the design still needs a clearer boundary.

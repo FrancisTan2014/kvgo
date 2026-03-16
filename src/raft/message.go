@@ -11,6 +11,7 @@ const (
 	MsgAppResp  MessageType = 2
 	MsgVote     MessageType = 3
 	MsgVoteResp MessageType = 4
+	MsgSnap     MessageType = 5
 )
 
 type Message struct {
@@ -24,9 +25,11 @@ type Message struct {
 	// the leader can identify which append tracker the response belongs to.
 	LogTerm uint64
 	// Term is the sender's current term for authority comparison.
-	Term    uint64
-	Entries []Entry
-	Reject  bool
+	Term       uint64
+	Entries    []Entry
+	Reject     bool
+	RejectHint uint64
+	Snapshot   SnapshotMeta
 }
 
 func (e *Entry) Size() int {

@@ -21,7 +21,7 @@ func (f *fakeApplyTarget) Apply(entries []Entry) error {
 }
 
 func TestApplierDoesNotApplyUncommittedEntries_036d(t *testing.T) {
-	r := NewRaft(1)
+	r := NewRaft(1, &mockStorage{})
 	r.state = Leader
 	target := &fakeApplyTarget{}
 	a := NewApplier(r, target)
@@ -36,7 +36,7 @@ func TestApplierDoesNotApplyUncommittedEntries_036d(t *testing.T) {
 }
 
 func TestApplierAppliesCommittedEntriesBeforeAdvance_036d(t *testing.T) {
-	r := NewRaft(1)
+	r := NewRaft(1, &mockStorage{})
 	r.state = Leader
 	target := &fakeApplyTarget{}
 	a := NewApplier(r, target)
@@ -64,7 +64,7 @@ func TestApplierAppliesCommittedEntriesBeforeAdvance_036d(t *testing.T) {
 }
 
 func TestApplierBlocksAdvanceOnApplyFailure_036d(t *testing.T) {
-	r := NewRaft(1)
+	r := NewRaft(1, &mockStorage{})
 	r.state = Leader
 	target := &fakeApplyTarget{err: errors.New("apply failed")}
 	a := NewApplier(r, target)

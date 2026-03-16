@@ -9,6 +9,7 @@ import (
 
 var ErrCompacted = errors.New("requested index is unavailable due to compaction")
 var ErrNonContiguous = errors.New("non-contiguous entry index")
+var ErrSnapOutOfDate = errors.New("requested snapshot is older than existing snapshot")
 
 type SnapshotMeta struct {
 	LastIncludedIndex uint64
@@ -23,6 +24,8 @@ type Storage interface {
 	LastIndex() uint64
 	Compact(index uint64) error
 	Close() error
+	Snapshot() (SnapshotMeta, error)
+	ApplySnapshot(snap SnapshotMeta) error
 }
 
 const logFilename = "replication.log"
@@ -366,4 +369,27 @@ func filterRetainedEntries(entries []Entry, lastIncludedIndex uint64) []Entry {
 		return nil
 	}
 	return entries[start:]
+}
+
+func (s *DurableStorage) Snapshot() (SnapshotMeta, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.snap, nil
+}
+
+func (s *DurableStorage) ApplySnapshot(snap SnapshotMeta) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.snap.LastIncludedIndex > 0 && snap.LastIncludedIndex <= s.snap.LastIncludedIndex {
+		return ErrSnapOutOfDate
+	}
+
+	if err := s.persistSnapshotMeta(snap); err != nil {
+		return err
+	}
+
+	s.snap = snap
+	s.entries = filterRetainedEntries(s.entries, snap.LastIncludedIndex)
+	return nil
 }
