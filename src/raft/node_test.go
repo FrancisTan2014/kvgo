@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -74,4 +75,37 @@ func TestNodeCampaignExposesVoteMessages_036l(t *testing.T) {
 func TestNodeConfigOwnsInitialMembership_036l(t *testing.T) {
 	n := setupNode(Config{ID: 1, Peers: []uint64{2, 3}, Storage: &mockStorage{}})
 	require.Equal(t, []uint64{2, 3}, n.r.peers)
+}
+
+func TestNodeReadyCarriesHardStateFromRaft_036m(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n := newStartedNode(ctx, 1, 2)
+	require.NoError(t, n.Campaign(ctx))
+
+	rd := <-n.Ready()
+	require.Equal(t, HardState{Term: 1, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
+}
+
+func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}})
+	n.r.state = Leader
+	n.r.term = 1
+	go n.run(ctx)
+
+	require.NoError(t, n.Step(ctx, Message{Type: MsgApp, From: 2, To: 1, Term: 2}))
+
+	select {
+	case rd := <-n.Ready():
+		require.Equal(t, HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, rd.HardState)
+		require.Len(t, rd.Messages, 0)
+		require.Len(t, rd.Entries, 0)
+		require.Len(t, rd.CommittedEntries, 0)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for node ready carrying hard state")
+	}
 }

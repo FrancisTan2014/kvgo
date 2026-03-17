@@ -142,6 +142,52 @@ func TestReadyExposesCommittedEntsOnlyAfterCommitTo_036b(t *testing.T) {
 	require.Len(t, ready.CommittedEntries, 1)
 }
 
+func TestReadyExposesHardStateAfterCampaign_036m(t *testing.T) {
+	r := *newTestRaft(1)
+	r.peers = []uint64{2}
+
+	require.NoError(t, r.Campaign())
+
+	rd := r.Ready()
+	require.Equal(t, HardState{Term: 1, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
+}
+
+func TestReadyExposesHardStateAfterGrantingVote_036m(t *testing.T) {
+	r := *newTestRaft(2)
+	r.state = Follower
+
+	require.NoError(t, r.Step(Message{Type: MsgVote, From: 1, To: 2, Term: 3}))
+
+	rd := r.Ready()
+	require.Equal(t, HardState{Term: 3, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
+}
+
+func TestReadyExposesHardStateAfterCommit_036m(t *testing.T) {
+	r := newLeaderRaftWithOnePeer()
+	require.NoError(t, r.Propose([]byte("foo")))
+	r.CommitTo(1)
+
+	rd := r.Ready()
+	require.Equal(t, HardState{Term: 1, VotedFor: 0, CommittedIndex: 1}, rd.HardState)
+}
+
+func TestHardStateChangesWithoutMessagesOrEntries_036m(t *testing.T) {
+	r := newLeaderRaftWithOnePeer()
+
+	require.NoError(t, r.Step(Message{Type: MsgApp, From: 2, To: 1, Term: 2}))
+	require.Equal(t, HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+}
+
+func TestAdvanceDoesNotChangeHardState_036m(t *testing.T) {
+	r := newLeaderRaftWithOnePeer()
+
+	require.NoError(t, r.Step(Message{Type: MsgApp, From: 2, To: 1, Term: 2}))
+	require.Equal(t, HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+
+	r.Advance()
+	require.Equal(t, HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+}
+
 func TestFullLifecycle_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("x")))

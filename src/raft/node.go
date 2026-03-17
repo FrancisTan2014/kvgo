@@ -23,6 +23,7 @@ type node struct {
 	campaignc chan campaignRequest
 	readyc    chan Ready
 	advancec  chan struct{}
+	prevHard  HardState
 }
 
 type proposeRequest struct {
@@ -62,14 +63,13 @@ func (n *node) run(ctx context.Context) {
 	var advancec chan struct{}
 
 	for {
-		if n.r.HasReady() {
+		if advancec == nil && n.hasReady() {
 			readyc = n.readyc
-			rd = n.r.Ready()
+			rd = n.ready()
 		}
 		select {
 		case readyc <- rd:
 			readyc = nil
-			rd = Ready{}
 			advancec = n.advancec
 		case req := <-n.propc:
 			req.resp <- n.r.Propose(req.data)
@@ -78,12 +78,33 @@ func (n *node) run(ctx context.Context) {
 		case req := <-n.campaignc:
 			req.resp <- n.r.Campaign()
 		case <-advancec:
+			if rd.HardState != (HardState{}) {
+				n.prevHard = rd.HardState
+			}
 			n.r.Advance()
+			rd = Ready{}
 			advancec = nil
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func (n *node) hasReady() bool {
+	hard := n.r.HardState()
+	if hard != (HardState{}) && hard != n.prevHard {
+		return true
+	}
+
+	return n.r.HasReady()
+}
+
+func (n *node) ready() Ready {
+	rd := n.r.Ready()
+	if rd.HardState == n.prevHard {
+		rd.HardState = HardState{}
+	}
+	return rd
 }
 
 func (n *node) Propose(ctx context.Context, data []byte) error {

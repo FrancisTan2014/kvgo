@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"kvgo/protocol"
+	"kvgo/raft"
 )
 
 // mockStreamTransport for testing - captures writes and provides configurable behavior
@@ -116,3 +117,150 @@ func (f *fakeStreamTransport) Send(ctx context.Context, payload []byte) error { 
 func (f *fakeStreamTransport) Receive(ctx context.Context) ([]byte, error)    { return nil, nil }
 func (f *fakeStreamTransport) Close() error                                   { return nil }
 func (f *fakeStreamTransport) RemoteAddr() string                             { return "fake:1234" }
+
+type mockStorage struct {
+	firstIndex uint64
+	snap       raft.SnapshotMeta
+	applied    []raft.SnapshotMeta
+	saved      []raft.Entry
+	savedHard  raft.HardState
+	saveErr    error
+	savedCh    chan []raft.Entry
+	events     chan string
+}
+
+func (m *mockStorage) InitialState() (raft.HardState, error) {
+	return raft.HardState{}, nil
+}
+
+func (m *mockStorage) Save(entries []raft.Entry, hard raft.HardState) error {
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	m.saved = entries
+	m.savedHard = hard
+	if m.savedCh != nil {
+		saved := append([]raft.Entry(nil), entries...)
+		m.savedCh <- saved
+	}
+	if m.events != nil {
+		m.events <- "save"
+	}
+	return nil
+}
+
+func (m *mockStorage) Entries(lo, hi uint64) ([]raft.Entry, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) FirstIndex() uint64 {
+	return m.firstIndex
+}
+
+func (m *mockStorage) LastIndex() uint64 {
+	if m.snap.LastIncludedIndex > 0 {
+		return m.snap.LastIncludedIndex
+	}
+	if m.firstIndex > 0 {
+		return m.firstIndex - 1
+	}
+	return 0
+}
+
+func (m *mockStorage) Compact(index uint64) error {
+	return nil
+}
+
+func (m *mockStorage) Close() error {
+	return nil
+}
+
+func (m *mockStorage) Snapshot() (raft.SnapshotMeta, error) {
+	return m.snap, nil
+}
+
+func (m *mockStorage) ApplySnapshot(snap raft.SnapshotMeta) error {
+	m.snap = snap
+	m.applied = append(m.applied, snap)
+	return nil
+}
+
+type mockRaftTransport struct {
+	sent   chan raft.Message
+	events chan string
+}
+
+func (t *mockRaftTransport) Send(msgs []raft.Message) {
+	for _, m := range msgs {
+		if t.sent != nil {
+			t.sent <- m
+		}
+		if t.events != nil {
+			t.events <- "send"
+		}
+	}
+}
+
+type mockApplier struct {
+	appliedEntries []raft.Entry
+	applyErr       error
+	appliedCh      chan []raft.Entry
+	events         chan string
+}
+
+func (a *mockApplier) Apply(entries []raft.Entry) error {
+	if a.applyErr != nil {
+		return a.applyErr
+	}
+	a.appliedEntries = entries
+	if a.appliedCh != nil {
+		applied := append([]raft.Entry(nil), entries...)
+		a.appliedCh <- applied
+	}
+	if a.events != nil {
+		a.events <- "apply"
+	}
+	return nil
+}
+
+type fakeNode struct {
+	c           chan raft.Ready
+	proposed    []byte
+	proposeErr  error
+	steppedMsg  *raft.Message
+	stepErr     error
+	campaigned  bool
+	campaignErr error
+	advanced    bool
+	advancedCh  chan struct{}
+	events      chan string
+}
+
+func (n *fakeNode) Ready() <-chan raft.Ready {
+	return n.c
+}
+
+func (n *fakeNode) Propose(ctx context.Context, data []byte) error {
+	n.proposed = append([]byte(nil), data...)
+	return n.proposeErr
+}
+
+func (n *fakeNode) Step(ctx context.Context, m raft.Message) error {
+	n.steppedMsg = &m
+	return n.stepErr
+}
+
+func (n *fakeNode) Campaign(ctx context.Context) error {
+	n.campaigned = true
+	return n.campaignErr
+}
+
+func (n *fakeNode) Advance() {
+	n.advanced = true
+	if n.advancedCh != nil {
+		n.advancedCh <- struct{}{}
+	}
+	if n.events != nil {
+		n.events <- "advance"
+	}
+}

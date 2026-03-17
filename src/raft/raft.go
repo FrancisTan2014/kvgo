@@ -37,10 +37,15 @@ type HardState struct {
 	CommittedIndex uint64
 }
 
+func IsEmptyHardState(hard HardState) bool {
+	return hard == (HardState{})
+}
+
 type Ready struct {
 	Entries          []Entry
 	CommittedEntries []Entry
 	Messages         []Message
+	HardState        HardState
 }
 
 /*
@@ -129,11 +134,20 @@ func (r *Raft) Propose(data []byte) error {
 	return nil
 }
 
+func (r *Raft) HardState() HardState {
+	return HardState{
+		Term:           r.term,
+		VotedFor:       r.votedFor,
+		CommittedIndex: r.commitIndex,
+	}
+}
+
 func (r *Raft) Ready() Ready {
 	return Ready{
 		Entries:          r.entriesBetween(r.stableIndex, r.lastLogIndex),
 		CommittedEntries: r.entriesBetween(r.appliedIndex, r.commitIndex),
 		Messages:         r.messages,
+		HardState:        r.HardState(),
 	}
 }
 

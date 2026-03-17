@@ -87,11 +87,18 @@ func computeTotalSize(entries []Entry) int {
 func (s *DurableStorage) Save(entries []Entry, hard HardState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(entries) == 0 && IsEmptyHardState(hard) {
+		return nil
+	}
 	if err := s.validateAppend(entries); err != nil {
 		return err
 	}
+	effectiveHard := hard
+	if IsEmptyHardState(effectiveHard) {
+		effectiveHard = s.hd
+	}
 
-	buf := encodeSaveBatch(hard, entries)
+	buf := encodeSaveBatch(effectiveHard, entries)
 	we := s.rw.write(buf)
 	var se error
 	if we == nil {
@@ -101,7 +108,7 @@ func (s *DurableStorage) Save(entries []Entry, hard HardState) error {
 		return err
 	}
 
-	s.hd = hard
+	s.hd = effectiveHard
 	s.appendEntries(entries)
 	return nil
 }

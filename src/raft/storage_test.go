@@ -121,6 +121,34 @@ func TestReplayTruncatesCorruptedTail_036c(t *testing.T) {
 	require.Equal(t, infoBefore.Size(), infoAfter.Size())
 }
 
+func TestSaveWithEmptyHardStatePreservesExistingHardState_036m(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+
+	initial := HardState{Term: 2, VotedFor: 1, CommittedIndex: 1}
+	require.NoError(t, s1.Save([]Entry{{Index: 1, Term: 2, Data: []byte("one")}}, initial))
+	require.NoError(t, s1.Save([]Entry{{Index: 2, Term: 2, Data: []byte("two")}}, HardState{}))
+	require.NoError(t, s1.Close())
+
+	s2, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, s2.Close())
+	}()
+
+	actualHard, err := s2.InitialState()
+	require.NoError(t, err)
+	require.Equal(t, initial, actualHard)
+
+	actualEntries, err := s2.Entries(1, 3)
+	require.NoError(t, err)
+	require.Equal(t, []Entry{
+		{Index: 1, Term: 2, Data: []byte("one")},
+		{Index: 2, Term: 2, Data: []byte("two")},
+	}, actualEntries)
+}
+
 func TestSaveRejectsNonContiguousEntries_036c(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewDurableStorage(dir)
