@@ -72,18 +72,25 @@ type Raft struct {
 }
 
 func NewRaft(id uint64, storage Storage) *Raft {
-	if storage == nil {
+	return newRaft(Config{ID: id, Storage: storage})
+}
+
+func newRaft(cfg Config) *Raft {
+	if cfg.Storage == nil {
 		panic("raft: nil storage")
 	}
 
+	peers := make([]uint64, len(cfg.Peers))
+	copy(peers, cfg.Peers)
+
 	return &Raft{
-		id:       id,
+		id:       cfg.ID,
 		state:    Follower,
 		log:      make([]Entry, 0),
 		acks:     make(map[entryID]map[uint64]bool),
-		peers:    make([]uint64, 0),
+		peers:    peers,
 		messages: make([]Message, 0),
-		storage:  storage,
+		storage:  cfg.Storage,
 	}
 }
 
