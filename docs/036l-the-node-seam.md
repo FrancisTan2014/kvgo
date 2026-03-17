@@ -1,8 +1,8 @@
 # 036l - The Node Seam
 
-We left 036 after [036k-the-snapshot-transfer](036k-the-snapshot-transfer.md) with a thin Raft core that can now survive the compaction boundary honestly. But the server still does not host Raft through a stable runtime seam.
+We left 036 after [036k-the-snapshot-transfer](036k-the-snapshot-transfer.md) with a thin Raft core that can now survive the compaction boundary honestly. But the system still did not host Raft through a stable runtime seam.
 
-That gap matters more than it first appears. The next target of 036 is to rewrite one real server write path so that the log owns the write. But today the application layer still has no complete, honest contract for talking to Raft at runtime.
+That gap matters more than it first appears. Once Raft becomes the center, the next upper layer cannot honestly be the old write path. It has to be the runtime contract that lets the rest of the system host Raft at all.
 
 `Raft` already knows how to do proposal, voting, append response handling, and snapshot transfer. What it does not yet have is a clean boundary for the outside world to drive it.
 
@@ -22,7 +22,7 @@ Right now only part of that shape exists. `Ready` already exposes outbound work,
 - peer membership is hidden inside `Raft` instead of being supplied by the host
 - Raft node IDs and server peer IDs live in different identity spaces
 
-If we replace the server write path before those seams are stabilized, we will wire the new architecture through temporary glue and then rewrite it again.
+If we build upper layers before those seams are stabilized, we will wire the new architecture through temporary glue and then rewrite it again.
 
 ## What real systems do
 
@@ -97,7 +97,7 @@ There is also an unavoidable integration fact in `kv-go`: Raft node identity and
 
 That mismatch should not be pushed down into `Raft`.
 
-036l only makes that boundary visible. The actual server-side adapter that translates between:
+036l only makes that boundary visible. The actual host-side layer that resolves the mismatch between:
 
 - Raft IDs used by the algorithm
 - peer keys used by `PeerManager`
@@ -128,9 +128,9 @@ So `ProgressTracker` should wait for the next step.
 
 ## Reusing existing server pieces
 
-036l should reuse `PeerManager` as transport and peer lookup infrastructure, but not as the meaning of replication.
+036l does not bless `PeerManager` as the long-term architecture.
 
-The old local-write-first quorum path remains the legacy architecture. Reusing `PeerManager` is acceptable because it solves dialing and peer-address ownership, not because it preserves the old write semantics.
+The old local-write-first quorum path remains the legacy architecture. The next upper layer should be built from Raft outward, not by connecting Raft back into the old model.
 
 So the host shape becomes:
 
@@ -148,7 +148,7 @@ That is the seam 036l exists to make explicit.
 
 **the server can host Raft through one clear runtime seam: ingress through `Node`, egress through `Ready`.**
 
-That is enough to make the next episode safe. Once this seam is real, one actual server write path can be rewritten onto the Raft-owned log without building on unstable glue.
+That is enough to make the next episode safe. Once this seam is real, the next upper layer can be a Raft-native host/runtime layer instead of another bridge back into the old primary/replica world.
 
 ## Minimum tests
 
@@ -170,3 +170,5 @@ Peer membership is supplied by node configuration rather than hidden mutation af
 - outbound persistence / transport / apply work leaves only through `Ready`
 - initial peer membership is supplied by config instead of hidden inside `Raft`
 - tests pass
+
+The next episode should not begin with client `PUT`. It should begin by making the Raft host/runtime layer real above `Node`.
