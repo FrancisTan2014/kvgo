@@ -26,6 +26,7 @@ type Message struct {
 	LogTerm uint64
 	// Term is the sender's current term for authority comparison.
 	Term       uint64
+	Commit     uint64
 	Entries    []Entry
 	Reject     bool
 	RejectHint uint64

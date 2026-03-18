@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"sort"
 )
 
 type State uint8
@@ -48,6 +49,11 @@ type Ready struct {
 	HardState        HardState
 }
 
+type Progress struct {
+	MatchIndex uint64
+	NextIndex  uint64
+}
+
 /*
 Raft presents the pure state machine of the RAFT algorithm.
 Invariants:
@@ -68,7 +74,7 @@ type Raft struct {
 	stableIndex  uint64
 
 	messages []Message
-	acks     map[entryID]map[uint64]bool
+	progress map[uint64]*Progress
 	peers    []uint64
 	votes    map[uint64]bool
 	votedFor uint64
@@ -92,7 +98,6 @@ func newRaft(cfg Config) *Raft {
 		id:       cfg.ID,
 		state:    Follower,
 		log:      make([]Entry, 0),
-		acks:     make(map[entryID]map[uint64]bool),
 		peers:    peers,
 		messages: make([]Message, 0),
 		storage:  cfg.Storage,
@@ -112,13 +117,11 @@ func (r *Raft) Propose(data []byte) error {
 	}
 	r.appendEntries([]Entry{e})
 
-	id := e.EntryId()
-	r.acks[id] = make(map[uint64]bool)
-
-	// ack leader itself
-	r.acks[id][r.id] = true
-
 	for _, pid := range r.peers {
+		prs, exists := r.progress[pid]
+		if !exists {
+			return errors.New("TODO: will be replace with real coordination code later")
+		}
 		r.messages = append(r.messages, Message{
 			From:    r.id,
 			To:      pid,
@@ -126,9 +129,9 @@ func (r *Raft) Propose(data []byte) error {
 			Term:    r.term,
 			Index:   prev.Index,
 			LogTerm: prev.Term,
-			Entries: []Entry{e},
+			Commit:  r.commitIndex,
+			Entries: r.entriesBetween(prs.NextIndex-1, r.lastLogIndex),
 		})
-		r.acks[id][pid] = false
 	}
 
 	return nil
@@ -195,6 +198,10 @@ func (r *Raft) Step(m Message) error {
 			last := m.Entries[len(m.Entries)-1]
 			resp.Index = last.Index
 			resp.LogTerm = last.Term
+
+			if m.Commit > r.commitIndex {
+				r.CommitTo(m.Commit)
+			}
 		} else {
 			resp.Reject = true
 			resp.Index = m.Index
@@ -207,6 +214,11 @@ func (r *Raft) Step(m Message) error {
 	case MsgAppResp:
 		if r.state != Leader {
 			return nil
+		}
+
+		prs, exists := r.progress[m.From]
+		if !exists {
+			return errors.New("TODO: will be replace with real coordination code later")
 		}
 
 		if m.Reject {
@@ -222,19 +234,16 @@ func (r *Raft) Step(m Message) error {
 					})
 				}
 			}
-		} else {
-			id := entryID{index: m.Index, term: m.LogTerm}
-			tracker, ok := r.acks[id]
-			if !ok {
-				return nil
-			}
 
-			if _, exists := tracker[m.From]; exists {
-				tracker[m.From] = true
-				if r.appendQuorumReached(id) {
-					r.CommitTo(id.index)
-				}
-			}
+			prs.NextIndex--
+		} else {
+			prs.MatchIndex = m.Index
+			prs.NextIndex = m.Index + 1
+		}
+
+		median := r.getMedian()
+		if median > r.commitIndex {
+			r.CommitTo(median)
 		}
 
 	case MsgVote:
@@ -266,6 +275,13 @@ func (r *Raft) Step(m Message) error {
 		r.votes[m.From] = !m.Reject
 		if r.voteQuorumReached() {
 			r.state = Leader
+			r.progress = make(map[uint64]*Progress, len(r.peers))
+			for _, pid := range r.peers {
+				r.progress[pid] = &Progress{
+					MatchIndex: 0,
+					NextIndex:  r.lastLogIndex + 1,
+				}
+			}
 		}
 
 	case MsgSnap:
@@ -296,6 +312,16 @@ func (r *Raft) Step(m Message) error {
 	}
 
 	return nil
+}
+
+func (r *Raft) getMedian() uint64 {
+	matches := []uint64{r.lastLogIndex} // leader's own match
+	for _, p := range r.progress {
+		matches = append(matches, p.MatchIndex)
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i] > matches[j] })
+	median := matches[len(matches)/2]
+	return median
 }
 
 // anchorExists proves if the specified anchor exists locally
@@ -366,23 +392,6 @@ func (r *Raft) isCandidateUpToDate(candidate Message) bool {
 		return candidate.LogTerm > lastLog.Term
 	}
 	return candidate.Index >= lastLog.Index
-}
-
-func (r *Raft) appendQuorumReached(id entryID) bool {
-	tracker, ok := r.acks[id]
-	if !ok {
-		return false
-	}
-
-	var cnt int
-	for _, acked := range tracker {
-		if acked {
-			cnt++
-		}
-	}
-
-	quorum := len(tracker)/2 + 1
-	return cnt >= quorum
 }
 
 func (r *Raft) voteQuorumReached() bool {

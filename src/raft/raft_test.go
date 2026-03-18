@@ -247,48 +247,54 @@ func TestNewEntryIsReadyAfterFollowerStepMsgApp_036f(t *testing.T) {
 	require.Len(t, rd.Entries, 0)
 }
 
-func TestTrackerCreatedOnPropose_036g(t *testing.T) {
-	leader := newLeaderRaftWithOnePeer()
-	require.NoError(t, leader.Propose([]byte("foo")))
+// Superseded by 036n: per-follower progress replaces per-entry ack tracking
+//
+// func TestTrackerCreatedOnPropose_036g(t *testing.T) {
+// 	leader := newLeaderRaftWithOnePeer()
+// 	require.NoError(t, leader.Propose([]byte("foo")))
 
-	id := entryID{index: 1, term: 1}
-	require.Contains(t, leader.acks, id)
-	require.True(t, leader.acks[id][leader.id])
-}
+// 	id := entryID{index: 1, term: 1}
+// 	require.Contains(t, leader.acks, id)
+// 	require.True(t, leader.acks[id][leader.id])
+// }
 
-func TestTrackerUpdatedOnStepMsgAppResp_036g(t *testing.T) {
-	leader := newLeaderRaftWithOnePeer()
-	require.NoError(t, leader.Propose([]byte("foo")))
+// Superseded by 036n: per-follower progress replaces per-entry ack tracking
+//
+// func TestTrackerUpdatedOnStepMsgAppResp_036g(t *testing.T) {
+// 	leader := newLeaderRaftWithOnePeer()
+// 	require.NoError(t, leader.Propose([]byte("foo")))
 
-	msg := leader.Ready().Messages[0]
-	follower := *newTestRaft(2)
-	follower.state = Follower
-	require.NoError(t, follower.Step(msg))
+// 	msg := leader.Ready().Messages[0]
+// 	follower := *newTestRaft(2)
+// 	follower.state = Follower
+// 	require.NoError(t, follower.Step(msg))
 
-	resp := follower.Ready().Messages[0]
-	require.NoError(t, leader.Step(resp))
+// 	resp := follower.Ready().Messages[0]
+// 	require.NoError(t, leader.Step(resp))
 
-	id := entryID{index: 1, term: 1}
-	require.Contains(t, leader.acks, id)
-	require.True(t, leader.acks[id][2])
-}
+// 	id := entryID{index: 1, term: 1}
+// 	require.Contains(t, leader.acks, id)
+// 	require.True(t, leader.acks[id][2])
+// }
 
-func TestCommittedEntriesReadyAfterAppendQuorumReached_036g(t *testing.T) {
-	leader := newLeaderRaftWithOnePeer()
-	require.NoError(t, leader.Propose([]byte("foo")))
+// Superseded by 036n: per-follower progress replaces per-entry ack tracking
+//
+// func TestCommittedEntriesReadyAfterAppendQuorumReached_036g(t *testing.T) {
+// 	leader := newLeaderRaftWithOnePeer()
+// 	require.NoError(t, leader.Propose([]byte("foo")))
 
-	msg := leader.Ready().Messages[0]
-	follower := *newTestRaft(2)
-	follower.state = Follower
-	require.NoError(t, follower.Step(msg))
+// 	msg := leader.Ready().Messages[0]
+// 	follower := *newTestRaft(2)
+// 	follower.state = Follower
+// 	require.NoError(t, follower.Step(msg))
 
-	resp := follower.Ready().Messages[0]
-	require.NoError(t, leader.Step(resp))
+// 	resp := follower.Ready().Messages[0]
+// 	require.NoError(t, leader.Step(resp))
 
-	rd := leader.Ready()
-	require.Len(t, rd.CommittedEntries, 1)
-	require.Equal(t, []byte("foo"), rd.CommittedEntries[0].Data)
-}
+// 	rd := leader.Ready()
+// 	require.Len(t, rd.CommittedEntries, 1)
+// 	require.Equal(t, []byte("foo"), rd.CommittedEntries[0].Data)
+// }
 
 func TestCandidateDoesNotBecomeLeaderWithOnlySelfVote_036h(t *testing.T) {
 	voterId := uint64(2)
@@ -591,31 +597,33 @@ func TestHigherTermAppendRevokesStaleAuthorityBeforeAppendLogic_036j(t *testing.
 	require.Equal(t, uint64(2), rd.Messages[0].LogTerm)
 }
 
-func TestHigherTermAppendRespRevokesStaleLeaderAuthorityBeforeAckTracking_036j(t *testing.T) {
-	leader := newLeaderRaftWithOnePeer()
-	leader.votedFor = leader.id
-	leader.votes = map[uint64]bool{leader.id: true, 2: false}
-	require.NoError(t, leader.Propose([]byte("foo")))
+// Superseded by 036n: per-follower progress replaces per-entry ack tracking
+//
+// func TestHigherTermAppendRespRevokesStaleLeaderAuthorityBeforeAckTracking_036j(t *testing.T) {
+// 	leader := newLeaderRaftWithOnePeer()
+// 	leader.votedFor = leader.id
+// 	leader.votes = map[uint64]bool{leader.id: true, 2: false}
+// 	require.NoError(t, leader.Propose([]byte("foo")))
 
-	id := entryID{index: 1, term: 1}
-	require.False(t, leader.acks[id][2])
+// 	id := entryID{index: 1, term: 1}
+// 	require.False(t, leader.acks[id][2])
 
-	require.NoError(t, leader.Step(Message{
-		Type:    MsgAppResp,
-		From:    2,
-		To:      leader.id,
-		Term:    2,
-		Index:   1,
-		LogTerm: 1,
-	}))
+// 	require.NoError(t, leader.Step(Message{
+// 		Type:    MsgAppResp,
+// 		From:    2,
+// 		To:      leader.id,
+// 		Term:    2,
+// 		Index:   1,
+// 		LogTerm: 1,
+// 	}))
 
-	require.Equal(t, uint64(2), leader.term)
-	require.Equal(t, Follower, leader.state)
-	require.Zero(t, leader.votedFor)
-	require.Nil(t, leader.votes)
-	require.False(t, leader.acks[id][2])
-	require.Zero(t, leader.commitIndex)
-}
+// 	require.Equal(t, uint64(2), leader.term)
+// 	require.Equal(t, Follower, leader.state)
+// 	require.Zero(t, leader.votedFor)
+// 	require.Nil(t, leader.votes)
+// 	require.False(t, leader.acks[id][2])
+// 	require.Zero(t, leader.commitIndex)
+// }
 
 func TestMsgAppIsRejectedWhenAnchorCannotBeProved_036k(t *testing.T) {
 	follower := newTestRaft(2)
@@ -715,4 +723,99 @@ func TestAppendAfterInstalledSnapshotIsReady_036k(t *testing.T) {
 	rd := follower.Ready()
 	require.Len(t, rd.Entries, 1)
 	require.Equal(t, Entry{Index: 5, Term: 3, Data: []byte("x")}, rd.Entries[0])
+}
+
+func TestProgressInitializedOnElection_036n(t *testing.T) {
+	candidate := newTestRaft(1)
+	candidate.state = Candidate
+	candidate.peers = []uint64{2}
+
+	candidate.votes = make(map[uint64]bool)
+	candidate.votes[1] = true
+	candidate.votes[2] = false
+
+	require.NoError(t, candidate.Step(Message{
+		Type:   MsgVoteResp,
+		From:   2,
+		Reject: false,
+	}))
+
+	require.Len(t, candidate.progress, 1)
+	require.Equal(t, Progress{MatchIndex: 0, NextIndex: 1}, *candidate.progress[2])
+}
+
+func TestProposeSendsEntriesFromNextIndex_036n(t *testing.T) {
+	leader := newLeaderRaftWithOnePeer()
+	leader.log = []Entry{
+		{Index: 1, Term: 1},
+	}
+	leader.progress = make(map[uint64]*Progress)
+	leader.progress[2] = &Progress{
+		MatchIndex: 0,
+		NextIndex:  1,
+	}
+
+	require.NoError(t, leader.Propose([]byte("foo")))
+
+	rd := leader.Ready()
+	require.Equal(t, []Entry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1, Data: []byte("foo")},
+	}, rd.Messages[0].Entries)
+}
+
+func TestCommitAdvancesOnMajorityMatch_036n(t *testing.T) {
+	leader := newLeaderRaftWithOnePeer()
+	leader.peers = append(leader.peers, 3)
+
+	leader.lastLogIndex = 3
+	leader.log = []Entry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+	}
+
+	leader.progress = make(map[uint64]*Progress)
+	leader.progress[2] = &Progress{MatchIndex: 0, NextIndex: 1}
+	leader.progress[3] = &Progress{MatchIndex: 1, NextIndex: 2}
+
+	require.NoError(t, leader.Step(Message{
+		Type:  MsgAppResp,
+		From:  2,
+		Index: 2,
+	}))
+	// matches: [leader=3, peer2=2, peer3=1] → median=2, not max=3
+	require.Equal(t, uint64(2), leader.commitIndex)
+}
+
+func TestFollowerAdvancesCommitFromMsgApp_036n(t *testing.T) {
+	follower := newTestRaft(2)
+	follower.term = 1
+	follower.lastLogIndex = 1
+
+	require.Equal(t, uint64(0), follower.commitIndex)
+	require.NoError(t, follower.Step(Message{
+		Type:    MsgApp,
+		Term:    1,
+		Commit:  1,
+		Entries: []Entry{{Index: 1, Term: 1, Data: []byte("foo")}},
+	}))
+
+	require.Equal(t, uint64(1), follower.commitIndex)
+}
+
+func TestNextIndexBacksUpOnRejection_036n(t *testing.T) {
+	leader := newLeaderRaftWithOnePeer()
+	leader.progress = make(map[uint64]*Progress)
+	leader.progress[2] = &Progress{MatchIndex: 2, NextIndex: 4}
+
+	require.NoError(t, leader.Step(Message{
+		Type:   MsgAppResp,
+		From:   2,
+		Reject: true,
+	}))
+
+	// conservative backup: decrement by 1. Update this assertion
+	// when the RejectHint fast path is introduced.
+	require.Equal(t, uint64(3), leader.progress[2].NextIndex)
 }
