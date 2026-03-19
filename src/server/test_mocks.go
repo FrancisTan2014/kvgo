@@ -201,28 +201,6 @@ func (t *mockRaftTransport) Send(msgs []raft.Message) {
 	}
 }
 
-type mockApplier struct {
-	appliedEntries []raft.Entry
-	applyErr       error
-	appliedCh      chan []raft.Entry
-	events         chan string
-}
-
-func (a *mockApplier) Apply(entries []raft.Entry) error {
-	if a.applyErr != nil {
-		return a.applyErr
-	}
-	a.appliedEntries = entries
-	if a.appliedCh != nil {
-		applied := append([]raft.Entry(nil), entries...)
-		a.appliedCh <- applied
-	}
-	if a.events != nil {
-		a.events <- "apply"
-	}
-	return nil
-}
-
 type fakeNode struct {
 	c           chan raft.Ready
 	proposed    []byte

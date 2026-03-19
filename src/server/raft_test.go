@@ -28,7 +28,6 @@ func newRaftHostConfig() RaftHostConfig {
 		Peers:     []Peer{{ID: 2}},
 		Storage:   &mockStorage{},
 		Transport: &mockRaftTransport{},
-		Applier:   &mockApplier{},
 	}
 }
 
@@ -59,13 +58,6 @@ func TestInternalRaftHostRequiresDependencies_036m(t *testing.T) {
 				cfg.Transport = nil
 			},
 			wantErr: "transport is not presented",
-		},
-		{
-			name: "missing applier",
-			mutate: func(cfg *raftHostConfig) {
-				cfg.Applier = nil
-			},
-			wantErr: "applier is not presented",
 		},
 		{
 			name: "missing node",
@@ -109,13 +101,6 @@ func TestNewRaftHostRequiresDependencies_036m(t *testing.T) {
 				cfg.Transport = nil
 			},
 			wantErr: "transport is not presented",
-		},
-		{
-			name: "missing applier",
-			mutate: func(cfg *RaftHostConfig) {
-				cfg.Applier = nil
-			},
-			wantErr: "applier is not presented",
 		},
 	}
 
@@ -297,16 +282,14 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	events := make(chan string, 4)
+	events := make(chan string, 3)
 	transport := &mockRaftTransport{sent: make(chan raft.Message, 1), events: events}
 	cfg := newRaftHostConfig()
 	cfg.Transport = transport
 
 	fakeNode := &fakeNode{c: make(chan raft.Ready, 1), advancedCh: make(chan struct{}, 1), events: events}
 	fakeStorage := &mockStorage{savedCh: make(chan []raft.Entry, 1), events: events}
-	fakeApplier := &mockApplier{appliedCh: make(chan []raft.Entry, 1), events: events}
 	cfg.Storage = fakeStorage
-	cfg.Applier = fakeApplier
 
 	rc := raftHostConfig{
 		RaftHostConfig: cfg,
@@ -341,11 +324,12 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 		t.Fatal("timeout waiting for raft storage save")
 	}
 
+	// handleBatch blocks on unbuffered applyc — read to unblock
 	select {
-	case applied := <-fakeApplier.appliedCh:
-		require.Equal(t, []raft.Entry{commitEnt}, applied)
+	case applied := <-host.Apply():
+		require.Equal(t, toApply{data: [][]byte{[]byte("foo")}}, applied)
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timeout waiting for raft apply")
+		t.Fatal("timeout waiting for apply channel")
 	}
 
 	select {
@@ -359,10 +343,9 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 		waitForEvent_036m(t, events),
 		waitForEvent_036m(t, events),
 		waitForEvent_036m(t, events),
-		waitForEvent_036m(t, events),
 	}
-	require.Equal(t, "advance", seen[3])
-	require.ElementsMatch(t, []string{"send", "save", "apply"}, seen[:3])
+	require.Equal(t, "advance", seen[2])
+	require.ElementsMatch(t, []string{"send", "save"}, seen[:2])
 }
 
 func TestHostPersistsHardStateOnlyBatch_036m(t *testing.T) {

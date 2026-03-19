@@ -12,10 +12,6 @@ type Peer struct {
 	ID uint64
 }
 
-type Applier interface {
-	Apply(entries []raft.Entry) error
-}
-
 type RaftTransporter interface {
 	Send(msgs []raft.Message)
 }
@@ -25,7 +21,6 @@ type RaftHostConfig struct {
 	Peers     []Peer
 	Storage   raft.Storage
 	Transport RaftTransporter
-	Applier   Applier
 }
 
 type raftHostConfig struct {
@@ -33,10 +28,15 @@ type raftHostConfig struct {
 	n raft.Node
 }
 
+type toApply struct {
+	data [][]byte
+}
+
 type RaftHost interface {
 	Propose(ctx context.Context, data []byte) error
 	Step(ctx context.Context, m raft.Message) error
 	Campaign(ctx context.Context) error
+	Apply() <-chan toApply
 
 	Start()
 	Stop()
@@ -51,7 +51,7 @@ type raftHost struct {
 	peers     []Peer
 	storage   raft.Storage
 	transport RaftTransporter
-	applier   Applier
+	applyc    chan toApply
 
 	started  atomic.Bool
 	stopped  atomic.Bool
@@ -69,9 +69,6 @@ func validatePublicRaftHostConfig(cfg RaftHostConfig) error {
 	if cfg.Transport == nil {
 		return errors.New("transport is not presented")
 	}
-	if cfg.Applier == nil {
-		return errors.New("applier is not presented")
-	}
 	return nil
 }
 
@@ -81,9 +78,6 @@ func validateRaftHostConfig(cfg raftHostConfig) error {
 	}
 	if cfg.Transport == nil {
 		return errors.New("transport is not presented")
-	}
-	if cfg.Applier == nil {
-		return errors.New("applier is not presented")
 	}
 	if cfg.n == nil {
 		return errors.New("node is not presented")
@@ -106,7 +100,7 @@ func newRaftHost(ctx context.Context, cfg raftHostConfig) (*raftHost, error) {
 		peers:     peers,
 		storage:   cfg.Storage,
 		transport: cfg.Transport,
-		applier:   cfg.Applier,
+		applyc:    make(chan toApply),
 		errc:      make(chan error, 1),
 		done:      make(chan struct{}),
 	}
@@ -141,7 +135,7 @@ func NewRaftHost(ctx context.Context, cfg RaftHostConfig) (*raftHost, error) {
 		peers:     peers,
 		storage:   cfg.Storage,
 		transport: cfg.Transport,
-		applier:   cfg.Applier,
+		applyc:    make(chan toApply),
 		errc:      make(chan error, 1),
 		done:      make(chan struct{}),
 	}, nil
@@ -193,9 +187,20 @@ func (r *raftHost) handleBatch(rd raft.Ready) error {
 		r.transport.Send(rd.Messages)
 	}
 	if len(rd.CommittedEntries) > 0 {
-		if err := r.applier.Apply(rd.CommittedEntries); err != nil {
-			return err
+		total := 0
+		for _, e := range rd.CommittedEntries {
+			total += len(e.Data)
 		}
+		// single contiguous allocation — one make instead of N, cache-friendly iteration
+		buf := make([]byte, total)
+		data := make([][]byte, len(rd.CommittedEntries))
+		for i, e := range rd.CommittedEntries {
+			n := copy(buf, e.Data)
+			data[i] = buf[:n]
+			buf = buf[n:]
+		}
+		// unbuffered — blocks until the server consumes the batch
+		r.applyc <- toApply{data: data}
 	}
 	return nil
 }
@@ -210,6 +215,10 @@ func (r *raftHost) Step(ctx context.Context, m raft.Message) error {
 
 func (r *raftHost) Campaign(ctx context.Context) error {
 	return r.n.Campaign(ctx)
+}
+
+func (r *raftHost) Apply() <-chan toApply {
+	return r.applyc
 }
 
 func (r *raftHost) Errors() <-chan error {

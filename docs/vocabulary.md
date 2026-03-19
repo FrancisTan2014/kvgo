@@ -58,6 +58,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `decide` is broader and more active; `infer` stresses deduction; `conclude` stresses arriving at a final view
 - **where it breaks:** do not use it when the statement is only a guess; `conclude` needs support
 
+## cosmetic
+- **meaning:** relating to appearance only, not substance or function
+- **pressure:** use it when a change improves how something looks but does not affect correctness or behavior
+- **tone:** mildly dismissive — implies the change is superficial, not deep
+- **nearby alternatives:** `superficial` is harsher; `trivial` questions the value; `cosmetic` specifically means appearance-only without judging worth
+- **where it breaks:** do not use it when the change actually fixes a real boundary or correctness problem; calling a meaningful fix "cosmetic" minimizes it
+
 ## crucially
 - **meaning:** to a decisive degree; in a way that is critically important
 - **pressure:** use it to mark the one point the argument depends on

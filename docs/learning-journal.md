@@ -443,3 +443,53 @@ When I feel like adding one more guard before writing a method, it often means t
 Sometimes the right fix is the guard. But often the better question is: what invariant is still missing underneath?
 
 That makes the feeling useful. The urge to add a guard is not only caution. It can be a sign that the design still needs a clearer boundary.
+
+---
+
+## 2026-03-19 — Coordination Belongs Where Both Ends Are Visible
+
+### The problem
+
+A client proposes a write through Raft. Raft commits it asynchronously. The handler needs to block until the entry is applied. Something must bridge the two — a waiter registry keyed by request ID.
+
+The question: where does the waiter map live?
+
+### The wrong path
+
+My first instinct was to put the waiter inside `RaftHost`. It owns the run loop, it sees `Ready.Entries` and `Ready.CommittedEntries` — it feels like the natural place. I tried:
+
+1. **Pass-in channel** — the handler passes `chan error` into `Propose`. But `RaftHost`'s run loop would depend on an externally created channel. The caller controls the buffer size, the lifecycle, the correctness. The run loop has to trust what it was given.
+
+2. **Queue bridge** — `Propose` pushes the channel into a FIFO queue, the run loop pops and pairs it with the index from `Ready.Entries`. Breaks under concurrency: two concurrent proposals may enter the queue in a different order than Raft assigns indices.
+
+3. **Return channel** — `Propose` returns `<-chan error`, created by the run loop. Requires routing proposals through the run loop to serialize assignment. Works but couples propose submission to the run loop's processing cadence.
+
+4. **Log index as key** — use the Raft-assigned index to key the waiter map. But the handler can't register before proposing because it doesn't know the index yet. The index is only visible in `Ready.Entries`, which arrives later in a different goroutine.
+
+Each attempt hit a wall. The common root cause: `RaftHost` knows delivery (which entries committed) but doesn't know identity (which caller proposed which entry). Pushing identity downward forces the transport layer to understand application semantics.
+
+### What etcd does
+
+etcd doesn't put the waiter map in `raftNode` at all. The server generates a request ID, embeds it in the proposal's data payload, registers a waiter *before* proposing, and fires `Propose` as a fire-and-forget call. The apply loop — which lives in the *server* layer, not the raft layer — deserializes committed entries, extracts the ID, and signals the matching waiter.
+
+`raftNode` is pure plumbing. It moves `CommittedEntries` from `Ready` to an apply channel. It never touches the waiter map.
+
+### The principle
+
+**Coordination belongs at the layer that can see both the request identity and the apply outcome.** The server layer creates the ID and the channel (request side). The server's `Applier` implementation receives committed entries and extracts the ID (apply side). Both ends are visible at the same level. No lower layer is violated.
+
+### What I missed initially
+
+The request ID isn't only for idempotency — that's a bonus. Its primary job is to carry identity across the Raft boundary so the apply path can match a committed entry back to the waiting caller. The log index can't do this because it's invisible at propose time. The ID solves the coordination problem first; deduplication comes free later.
+
+### The Applier leak
+
+While working out coordination ownership, I noticed a second smell: `Applier.Apply([]raft.Entry)` forces the server layer to import `raft.Entry` — a Raft-internal type leaking upward through the interface. The server shouldn't need to know what a Raft entry looks like; it only cares about committed data bytes.
+
+The fix: remove the injected `Applier` interface entirely. RaftHost pushes committed data as `[][]byte` onto a `toApply` channel. The server pulls from the channel and deserializes using its own envelope format. No Raft type crosses the boundary.
+
+This is the same principle again — the boundary between layers should carry only what the upper layer actually needs. `[]raft.Entry` carried index, term, type, and data; the server only needed data. The interface was shaped around what the *producer* had, not what the *consumer* needed.
+
+### What triggered the discovery
+
+Defending discomfort each time a proposed shape felt wrong. The waiter map placement was uncomfortable because identity was invisible below. The `Applier` interface was uncomfortable because the import felt wrong. Both discomforts pointed at the same root: a layer boundary carrying more than it should. The feeling is a useful architectural signal — not perfectionism, but a smell worth investigating.
