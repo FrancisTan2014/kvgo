@@ -242,3 +242,86 @@ func (n *fakeNode) Advance() {
 		n.events <- "advance"
 	}
 }
+
+type fakeStateMachine struct {
+	data map[string][]byte
+}
+
+func newFakeStateMachine() *fakeStateMachine {
+	return &fakeStateMachine{
+		data: make(map[string][]byte),
+	}
+}
+
+func (s *fakeStateMachine) Get(key string) ([]byte, bool) {
+	v, ok := s.data[key]
+	return v, ok
+}
+
+func (s *fakeStateMachine) Put(key string, value []byte) error {
+	s.data[key] = append([]byte(nil), value...)
+	return nil
+}
+
+type fakeRaftHost struct {
+	applyc chan toApply
+	errorc chan error
+}
+
+func newFakeRaftHost() *fakeRaftHost {
+	return &fakeRaftHost{
+		applyc: make(chan toApply),
+		errorc: make(chan error),
+	}
+}
+
+func (r *fakeRaftHost) Propose(ctx context.Context, data []byte) error {
+	return nil
+}
+
+func (r *fakeRaftHost) Step(ctx context.Context, m raft.Message) error {
+	return nil
+}
+
+func (r *fakeRaftHost) Campaign(ctx context.Context) error {
+	return nil
+}
+
+func (r *fakeRaftHost) Apply() <-chan toApply {
+	return r.applyc
+}
+
+func (r *fakeRaftHost) Start() {}
+
+func (r *fakeRaftHost) Stop() {}
+
+func (r *fakeRaftHost) Errors() <-chan error {
+	return r.errorc
+}
+
+type fakeWait struct {
+	m map[uint64]chan any
+}
+
+func newFakeWait() *fakeWait {
+	return &fakeWait{m: make(map[uint64]chan any)}
+}
+
+func (w *fakeWait) Register(id uint64) <-chan any {
+	ch := make(chan any, 1)
+	w.m[id] = ch
+	return ch
+}
+
+func (w *fakeWait) Trigger(id uint64, x any) {
+	ch, ok := w.m[id]
+	if ok {
+		delete(w.m, id)
+		ch <- x
+	}
+}
+
+func (w *fakeWait) IsRegistered(id uint64) bool {
+	_, ok := w.m[id]
+	return ok
+}

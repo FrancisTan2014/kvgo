@@ -78,6 +78,11 @@ type quorumWriteState struct {
 	ackedReplicas map[string]struct{} // Track which replicas ACK'd by address (protected by mu)
 }
 
+type StateMachine interface {
+	Get(key string) ([]byte, bool)
+	Put(key string, value []byte) error
+}
+
 type Server struct {
 	opts    Options
 	started atomic.Bool
@@ -148,6 +153,13 @@ type Server struct {
 
 	// Persistence
 	metaFile *os.File
+
+	//==================================================
+	// The Raft era
+	//==================================================
+	raftHost RaftHost
+	sm       StateMachine
+	w        Wait
 }
 
 func NewServer(opts Options) (*Server, error) {
@@ -468,4 +480,50 @@ func (s *Server) log() *slog.Logger {
 		return s.opts.Logger
 	}
 	return noopLogger
+}
+
+func (s *Server) run() {
+	applyc := s.raftHost.Apply()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case ap := <-applyc:
+			s.applyBatch(ap)
+		}
+	}
+}
+
+func (s *Server) applyBatch(ap toApply) {
+	for _, raw := range ap.data {
+		s.applyEntry(raw)
+	}
+}
+
+func (s *Server) applyEntry(raw []byte) {
+	id, payload, err := unmarshalEnvelope(raw)
+	if err != nil {
+		s.log().Warn("apply: malformed envelope", "error", err)
+		return
+	}
+
+	req, err := protocol.DecodeRequest(payload)
+	if err != nil {
+		s.log().Warn("apply: decode failed", "error", err)
+		s.w.Trigger(id, err)
+		return
+	}
+
+	switch req.Cmd {
+	case protocol.CmdPut:
+		err := s.sm.Put(string(req.Key), req.Value)
+		if err != nil {
+			s.w.Trigger(id, err)
+		} else {
+			s.w.Trigger(id, nil)
+		}
+	default:
+		s.log().Warn("apply: unknown command", "cmd", req.Cmd)
+		s.w.Trigger(id, fmt.Errorf("unknown command in apply: %d", req.Cmd))
+	}
 }
