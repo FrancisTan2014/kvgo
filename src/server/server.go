@@ -160,6 +160,7 @@ type Server struct {
 	raftHost RaftHost
 	sm       StateMachine
 	w        Wait
+	reqIDGen atomic.Uint64
 }
 
 func NewServer(opts Options) (*Server, error) {
@@ -525,5 +526,37 @@ func (s *Server) applyEntry(raw []byte) {
 	default:
 		s.log().Warn("apply: unknown command", "cmd", req.Cmd)
 		s.w.Trigger(id, fmt.Errorf("unknown command in apply: %d", req.Cmd))
+	}
+}
+
+func (s *Server) nextRequestID() uint64 {
+	return s.reqIDGen.Add(1)
+}
+
+func (s *Server) raftPut(ctx *RequestContext) error {
+	id := s.nextRequestID()
+	ch := s.w.Register(id)
+
+	timeoutCtx, cancel := context.WithTimeout(s.ctx, s.opts.WriteTimeout)
+	defer cancel()
+
+	encoded, err := protocol.EncodeRequest(ctx.Request)
+	if err != nil {
+		s.w.Trigger(id, err)
+	} else {
+		data := marshalEnvelope(id, encoded)
+		if err := s.raftHost.Propose(timeoutCtx, data); err != nil {
+			s.w.Trigger(id, err)
+		}
+	}
+
+	select {
+	case result := <-ch:
+		if result != nil {
+			return result.(error)
+		}
+		return s.responseWithStatus(ctx, protocol.StatusOK)
+	case <-timeoutCtx.Done():
+		return timeoutCtx.Err()
 	}
 }

@@ -244,7 +244,8 @@ func (n *fakeNode) Advance() {
 }
 
 type fakeStateMachine struct {
-	data map[string][]byte
+	data   map[string][]byte
+	putErr error
 }
 
 func newFakeStateMachine() *fakeStateMachine {
@@ -259,23 +260,38 @@ func (s *fakeStateMachine) Get(key string) ([]byte, bool) {
 }
 
 func (s *fakeStateMachine) Put(key string, value []byte) error {
+	if s.putErr != nil {
+		return s.putErr
+	}
 	s.data[key] = append([]byte(nil), value...)
 	return nil
 }
 
 type fakeRaftHost struct {
-	applyc chan toApply
-	errorc chan error
+	applyc     chan toApply
+	errorc     chan error
+	proposeErr error
+	proposed   []byte
+	proposec   chan []byte
 }
 
 func newFakeRaftHost() *fakeRaftHost {
 	return &fakeRaftHost{
-		applyc: make(chan toApply),
-		errorc: make(chan error),
+		applyc:   make(chan toApply),
+		errorc:   make(chan error),
+		proposec: make(chan []byte, 1),
 	}
 }
 
 func (r *fakeRaftHost) Propose(ctx context.Context, data []byte) error {
+	if r.proposeErr != nil {
+		return r.proposeErr
+	}
+	r.proposed = data
+	select {
+	case r.proposec <- data:
+	default:
+	}
 	return nil
 }
 

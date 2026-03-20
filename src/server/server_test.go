@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"kvgo/protocol"
 	"testing"
 	"time"
@@ -63,10 +64,17 @@ func TestApplyLoopExecutesPut_036p(t *testing.T) {
 
 	go s.run()
 
-	d := marshalPut(uint64(1), "test", "foo")
+	id := uint64(1)
+	ch := suite.fw.Register(id)
+	d := marshalPut(id, "test", "foo")
 	suite.fr.applyc <- toApply{data: [][]byte{d}}
 
-	assertStatePresents(t, suite.fsm, "test", "foo")
+	select {
+	case <-ch:
+		assertStatePresents(t, suite.fsm, "test", "foo")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for apply")
+	}
 }
 
 func TestApplyLoopTriggersWaiter_036p(t *testing.T) {
@@ -97,12 +105,19 @@ func TestApplyLoopBatchMultipleEntries_036p(t *testing.T) {
 
 	go s.run()
 
+	id2 := uint64(2)
+	ch := suite.fw.Register(id2)
 	r1 := marshalPut(uint64(1), "k1", "v1")
-	r2 := marshalPut(uint64(2), "k2", "v2")
+	r2 := marshalPut(id2, "k2", "v2")
 	suite.fr.applyc <- toApply{data: [][]byte{r1, r2}}
 
-	assertStatePresents(t, suite.fsm, "k1", "v1")
-	assertStatePresents(t, suite.fsm, "k2", "v2")
+	select {
+	case <-ch:
+		assertStatePresents(t, suite.fsm, "k1", "v1")
+		assertStatePresents(t, suite.fsm, "k2", "v2")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for apply")
+	}
 }
 
 func TestApplyLoopSurvivesMalformedEntry_036p(t *testing.T) {
@@ -114,10 +129,17 @@ func TestApplyLoopSurvivesMalformedEntry_036p(t *testing.T) {
 
 	suite.fr.applyc <- toApply{data: [][]byte{[]byte("malformed")}}
 
-	req := marshalPut(uint64(2), "test", "foo")
+	id := uint64(2)
+	ch := suite.fw.Register(id)
+	req := marshalPut(id, "test", "foo")
 	suite.fr.applyc <- toApply{data: [][]byte{req}}
 
-	assertStatePresents(t, suite.fsm, "test", "foo")
+	select {
+	case <-ch:
+		assertStatePresents(t, suite.fsm, "test", "foo")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for apply")
+	}
 }
 
 func TestApplyLoopTriggersWaiterWithErrorOnBadPayload_036p(t *testing.T) {
@@ -156,5 +178,125 @@ func TestApplyLoopStopsOnContextCancel_036p(t *testing.T) {
 		t.Fatal("expected send to block after context cancel")
 	case <-time.After(50 * time.Millisecond):
 		// apply loop stopped — no reader on the channel
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 036q — The Propose Path
+// ---------------------------------------------------------------------------
+
+func newRequestContext(cmd protocol.Cmd, key, value string) *RequestContext {
+	return &RequestContext{
+		StreamTransport: &fakeStreamTransport{},
+		Request: protocol.Request{
+			Cmd:   cmd,
+			Key:   []byte(key),
+			Value: []byte(value),
+		},
+	}
+}
+
+func TestRaftPutRoundTrip_036q(t *testing.T) {
+	suite := newTestServer(t)
+	s := suite.server
+	defer s.cancel()
+
+	go s.run()
+
+	ctx := newRequestContext(protocol.CmdPut, "k1", "v1")
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- s.raftPut(ctx)
+	}()
+
+	proposed := <-suite.fr.proposec
+	suite.fr.applyc <- toApply{data: [][]byte{proposed}}
+
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for raftPut")
+	}
+
+	assertStatePresents(t, suite.fsm, "k1", "v1")
+}
+
+func TestRaftPutProposeError_036q(t *testing.T) {
+	suite := newTestServer(t)
+	s := suite.server
+	defer s.cancel()
+
+	go s.run()
+
+	suite.fr.proposeErr = errors.New("not leader")
+
+	ctx := newRequestContext(protocol.CmdPut, "k1", "v1")
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- s.raftPut(ctx)
+	}()
+
+	select {
+	case err := <-errc:
+		require.ErrorContains(t, err, "not leader")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for raftPut")
+	}
+}
+
+func TestRaftPutTimeout_036q(t *testing.T) {
+	suite := newTestServer(t)
+	s := suite.server
+
+	go s.run()
+
+	ctx := newRequestContext(protocol.CmdPut, "k1", "v1")
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- s.raftPut(ctx)
+	}()
+
+	// consume the proposal but never commit it
+	<-suite.fr.proposec
+
+	// cancel server context to simulate timeout
+	s.cancel()
+
+	select {
+	case err := <-errc:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for raftPut")
+	}
+}
+
+func TestRaftPutApplyError_036q(t *testing.T) {
+	suite := newTestServer(t)
+	s := suite.server
+	defer s.cancel()
+
+	suite.fsm.putErr = errors.New("disk full")
+
+	go s.run()
+
+	ctx := newRequestContext(protocol.CmdPut, "k1", "v1")
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- s.raftPut(ctx)
+	}()
+
+	proposed := <-suite.fr.proposec
+	suite.fr.applyc <- toApply{data: [][]byte{proposed}}
+
+	select {
+	case err := <-errc:
+		require.ErrorContains(t, err, "disk full")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timeout waiting for raftPut")
 	}
 }

@@ -84,6 +84,9 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 	}
 
 	// Primary processing
+	if s.raftHost != nil {
+		return s.raftPut(ctx)
+	}
 	return s.processPrimaryPut(ctx)
 }
 
