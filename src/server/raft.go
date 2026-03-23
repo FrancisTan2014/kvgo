@@ -9,17 +9,16 @@ import (
 	"sync/atomic"
 )
 
-type Peer struct {
-	ID uint64
-}
-
 type RaftTransporter interface {
 	Send(msgs []*raftpb.Message)
+	AddPeer(id uint64, addr string)
+	Start() error
+	Stop()
 }
 
 type RaftHostConfig struct {
 	ID        uint64
-	Peers     []Peer
+	Peers     []uint64
 	Storage   raft.Storage
 	Transport RaftTransporter
 }
@@ -49,7 +48,7 @@ type raftHost struct {
 	cancel context.CancelFunc
 
 	n         raft.Node
-	peers     []Peer
+	peers     []uint64
 	storage   raft.Storage
 	transport RaftTransporter
 	applyc    chan toApply
@@ -92,7 +91,7 @@ func newRaftHost(ctx context.Context, cfg raftHostConfig) (*raftHost, error) {
 	}
 
 	rctx, cancel := context.WithCancel(ctx)
-	peers := make([]Peer, len(cfg.Peers))
+	peers := make([]uint64, len(cfg.Peers))
 	copy(peers, cfg.Peers)
 	host := &raftHost{
 		ctx:       rctx,
@@ -117,7 +116,7 @@ func NewRaftHost(ctx context.Context, cfg RaftHostConfig) (*raftHost, error) {
 	rctx, cancel := context.WithCancel(ctx)
 	pids := make([]uint64, 0)
 	for _, p := range cfg.Peers {
-		pids = append(pids, p.ID)
+		pids = append(pids, p)
 	}
 
 	n := newRaftNode(rctx, raft.Config{
@@ -126,7 +125,7 @@ func NewRaftHost(ctx context.Context, cfg RaftHostConfig) (*raftHost, error) {
 		Peers:   pids,
 	})
 
-	peers := make([]Peer, len(cfg.Peers))
+	peers := make([]uint64, len(cfg.Peers))
 	copy(peers, cfg.Peers)
 
 	return &raftHost{

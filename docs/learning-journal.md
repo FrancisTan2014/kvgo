@@ -493,3 +493,34 @@ This is the same principle again — the boundary between layers should carry on
 ### What triggered the discovery
 
 Defending discomfort each time a proposed shape felt wrong. The waiter map placement was uncomfortable because identity was invisible below. The `Applier` interface was uncomfortable because the import felt wrong. Both discomforts pointed at the same root: a layer boundary carrying more than it should. The feeling is a useful architectural signal — not perfectionism, but a smell worth investigating.
+
+---
+
+## 2026-03-23 — When Indirection Is Free
+
+### The problem
+
+Designing the raft transport, two interfaces appeared: `Raft` (so the transport can deliver messages without importing the server) and `RaftTransporter` (so the server can send without importing the transport). Both sit on module boundaries. But I hesitated — interfaces add indirection, and indirection has a cost. When is that cost acceptable?
+
+### What I found
+
+An indirect call through an interface has two concrete costs: no inlining (the compiler cannot paste the function body through the interface) and pointer chasing (two memory loads — itable pointer to function pointer, then jump). Together these are single-digit nanoseconds.
+
+The question is not "does indirection cost something?" — it always does. The question is "what does the work behind the interface cost?" If the work is a network round-trip (microseconds to milliseconds), the nanoseconds of indirection vanish — rounding error on rounding error. If the work is a comparison function called inside a tight sort loop, both the comparison and the indirection are nanoseconds — same ballpark. Now the indirection is a significant fraction of the total.
+
+Two regimes:
+
+1. **Module boundary** — the work behind the interface is heavy (I/O, serialization, consensus step). Indirection cost is invisible. Interfaces are free here, and the decoupling they buy is pure upside.
+2. **Hot inner loop** — the work behind the call is tiny (arithmetic, comparison, field access). Indirection cost is in the same order of magnitude as the work. Inline the logic or use a concrete type.
+
+### The principle
+
+Use an interface when the cost of crossing it is orders of magnitude smaller than the work it wraps. On a hot path where both are nanoseconds, prefer concrete types and let the compiler inline.
+
+### What triggered this
+
+Drawing the `Raft.Process` interface for the transport layer. A message crosses a network — microseconds minimum. The indirect call to deliver it is nanoseconds. The interface is free. Contrast with a `Less` function plugged into a sort: the comparison is nanoseconds, and the indirect call doubles the cost. Same mechanism, different regime, opposite decision.
+
+### Interview angle
+
+I used to ask candidates "how do you choose interface vs. concrete type?" and got back surface-level answers — runtime dispatch, no inlining, harder to navigate. True but cosmetic. The better question is "what do you trade away by introducing one?" That forces magnitude reasoning: the answer is "it depends on what's on the other side of the call." A person who can articulate the two regimes — boundary vs. hot path — has a cost model, not a feature list. The same filter generalises: "when would you *not* use a channel?", "when is copying cheaper than sharing a pointer?" Any question where the honest answer is "it depends on the ratio" separates trade-off thinkers from best-practice reciters.

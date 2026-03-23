@@ -129,6 +129,13 @@ Each word is shown through visible dimensions for word choice:
 - **where it breaks:** do not use it just to mean `harmless`; it specifically means repeated application does not create an additional effect beyond the first one
 - **example:** Setting the same ack flag to `true` twice is idempotent because the tracker state does not change after the first update.
 
+## intact
+- **meaning:** whole, undamaged, with nothing missing
+- **pressure:** use it when the point is that something survived a process — transfer, serialization, crash — without losing or changing any part
+- **tone:** plain, everyday, fits in both conversation and technical writing
+- **nearby alternatives:** `preserved` emphasizes the act of keeping; `unchanged` is flatter; `intact` emphasizes wholeness after potential damage
+- **where it breaks:** do not use it for things that were never at risk; "the config is intact" sounds odd if nothing threatened it
+
 ## hypothesis
 - **meaning:** a testable claim formed before examining evidence
 - **pressure:** use it when you want a statement that can be confirmed or disproved
@@ -226,6 +233,13 @@ Each word is shown through visible dimensions for word choice:
 - **tone:** neutral, structural
 - **nearby alternatives:** `split` is more forceful; `distinguish` is more conceptual; `separate` is the plain structural verb
 - **where it breaks:** too plain when the issue is not division but ownership or abstraction
+
+## spawn
+- **meaning:** create a new concurrent unit of execution (goroutine, thread, process)
+- **pressure:** use it when a design decision involves launching work that runs independently from its creator
+- **tone:** technical, active — implies the parent keeps going while the child starts
+- **nearby alternatives:** `start` is generic; `launch` is more dramatic; `fork` implies duplication; `spawn` specifically connotes creating something that lives on its own
+- **where it breaks:** too informal for describing static structure; best reserved for runtime creation of concurrent activity
 
 ## speculative
 - **meaning:** based on guessing or theorizing without evidence

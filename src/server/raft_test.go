@@ -26,7 +26,7 @@ func waitForEvent_036m(t *testing.T, events <-chan string) string {
 func newRaftHostConfig() RaftHostConfig {
 	return RaftHostConfig{
 		ID:        1,
-		Peers:     []Peer{{ID: 2}},
+		Peers:     []uint64{2},
 		Storage:   &mockStorage{},
 		Transport: &mockRaftTransport{},
 	}
@@ -121,14 +121,14 @@ func TestRaftHostConfigOwnsPeerList_036m(t *testing.T) {
 	defer cancel()
 
 	cfg := newInternalRaftHostConfig_036m()
-	cfg.Peers = []Peer{{ID: 2}, {ID: 3}}
+	cfg.Peers = []uint64{2, 3}
 
 	host, err := newRaftHost(ctx, cfg)
 	require.NoError(t, err)
 	require.Equal(t, cfg.Peers, host.peers)
 
-	cfg.Peers[0].ID = 9
-	require.Equal(t, []Peer{{ID: 2}, {ID: 3}}, host.peers)
+	cfg.Peers[0] = 9
+	require.Equal(t, []uint64{2, 3}, host.peers)
 }
 
 func TestNewRaftHostStopCancelsConstructedNodeContext_036m(t *testing.T) {

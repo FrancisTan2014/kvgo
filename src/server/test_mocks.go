@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -204,6 +205,11 @@ func (t *mockRaftTransport) Send(msgs []*raftpb.Message) {
 		}
 	}
 }
+
+func (r *mockRaftTransport) Start() error                   { return nil }
+func (r *mockRaftTransport) Stop()                          {}
+func (r *mockRaftTransport) Addr() net.Addr                 { return nil }
+func (r *mockRaftTransport) AddPeer(id uint64, addr string) {}
 
 type fakeNode struct {
 	c           chan raft.Ready
