@@ -6,16 +6,18 @@ import (
 	"path/filepath"
 	"testing"
 
+	"kvgo/raftpb"
+
 	"github.com/stretchr/testify/require"
 )
 
 func TestPersistentStateSurvivesRestart_036c(t *testing.T) {
-	expectedHard := HardState{
+	expectedHard := &raftpb.HardState{
 		Term:           1,
 		CommittedIndex: 1,
 		VotedFor:       1,
 	}
-	expectedEntries := []Entry{{
+	expectedEntries := []*raftpb.Entry{{
 		Term:  1,
 		Index: 1,
 		Data:  []byte("foo"),
@@ -44,16 +46,17 @@ func TestPersistentStateSurvivesRestart_036c(t *testing.T) {
 
 func TestEntriesUsesHalfOpenRange_036c(t *testing.T) {
 	s := &DurableStorage{
-		entries: []Entry{
+		entries: []*raftpb.Entry{
 			{Index: 1, Term: 1, Data: []byte("one")},
 			{Index: 2, Term: 1, Data: []byte("two")},
 			{Index: 3, Term: 2, Data: []byte("three")},
 		},
+		snap: &raftpb.SnapshotMeta{},
 	}
 
 	entries, err := s.Entries(2, 4)
 	require.NoError(t, err)
-	require.Equal(t, []Entry{
+	require.Equal(t, []*raftpb.Entry{
 		{Index: 2, Term: 1, Data: []byte("two")},
 		{Index: 3, Term: 2, Data: []byte("three")},
 	}, entries)
@@ -61,10 +64,11 @@ func TestEntriesUsesHalfOpenRange_036c(t *testing.T) {
 
 func TestEntriesRejectsOutOfRange_036c(t *testing.T) {
 	s := &DurableStorage{
-		entries: []Entry{
+		entries: []*raftpb.Entry{
 			{Index: 1, Term: 1, Data: []byte("one")},
 			{Index: 2, Term: 1, Data: []byte("two")},
 		},
+		snap: &raftpb.SnapshotMeta{},
 	}
 
 	_, err := s.Entries(0, 1)
@@ -75,7 +79,7 @@ func TestEntriesRejectsOutOfRange_036c(t *testing.T) {
 }
 
 func TestEntriesAllowsEmptyRange_036c(t *testing.T) {
-	s := &DurableStorage{}
+	s := &DurableStorage{snap: &raftpb.SnapshotMeta{}}
 
 	entries, err := s.Entries(0, 0)
 	require.NoError(t, err)
@@ -83,8 +87,8 @@ func TestEntriesAllowsEmptyRange_036c(t *testing.T) {
 }
 
 func TestReplayTruncatesCorruptedTail_036c(t *testing.T) {
-	expectedHard := HardState{Term: 2, VotedFor: 1, CommittedIndex: 1}
-	expectedEntries := []Entry{{Index: 1, Term: 2, Data: []byte("ok")}}
+	expectedHard := &raftpb.HardState{Term: 2, VotedFor: 1, CommittedIndex: 1}
+	expectedEntries := []*raftpb.Entry{{Index: 1, Term: 2, Data: []byte("ok")}}
 
 	dir := t.TempDir()
 	s1, err := NewDurableStorage(dir)
@@ -126,9 +130,9 @@ func TestSaveWithEmptyHardStatePreservesExistingHardState_036m(t *testing.T) {
 	s1, err := NewDurableStorage(dir)
 	require.NoError(t, err)
 
-	initial := HardState{Term: 2, VotedFor: 1, CommittedIndex: 1}
-	require.NoError(t, s1.Save([]Entry{{Index: 1, Term: 2, Data: []byte("one")}}, initial))
-	require.NoError(t, s1.Save([]Entry{{Index: 2, Term: 2, Data: []byte("two")}}, HardState{}))
+	initial := &raftpb.HardState{Term: 2, VotedFor: 1, CommittedIndex: 1}
+	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 1, Term: 2, Data: []byte("one")}}, initial))
+	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 2, Term: 2, Data: []byte("two")}}, &raftpb.HardState{}))
 	require.NoError(t, s1.Close())
 
 	s2, err := NewDurableStorage(dir)
@@ -143,7 +147,7 @@ func TestSaveWithEmptyHardStatePreservesExistingHardState_036m(t *testing.T) {
 
 	actualEntries, err := s2.Entries(1, 3)
 	require.NoError(t, err)
-	require.Equal(t, []Entry{
+	require.Equal(t, []*raftpb.Entry{
 		{Index: 1, Term: 2, Data: []byte("one")},
 		{Index: 2, Term: 2, Data: []byte("two")},
 	}, actualEntries)
@@ -157,14 +161,14 @@ func TestSaveRejectsNonContiguousEntries_036c(t *testing.T) {
 		require.NoError(t, s.Close())
 	}()
 
-	require.NoError(t, s.Save([]Entry{{Index: 1, Term: 1, Data: []byte("one")}}, HardState{Term: 1}))
+	require.NoError(t, s.Save([]*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("one")}}, &raftpb.HardState{Term: 1}))
 
-	err = s.Save([]Entry{{Index: 3, Term: 1, Data: []byte("gap")}}, HardState{Term: 1})
+	err = s.Save([]*raftpb.Entry{{Index: 3, Term: 1, Data: []byte("gap")}}, &raftpb.HardState{Term: 1})
 	require.ErrorIs(t, err, ErrNonContiguous)
 
 	entries, err := s.Entries(1, 2)
 	require.NoError(t, err)
-	require.Equal(t, []Entry{{Index: 1, Term: 1, Data: []byte("one")}}, entries)
+	require.Equal(t, []*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("one")}}, entries)
 
 	_, err = s.Entries(1, 3)
 	require.Error(t, err)
@@ -174,7 +178,7 @@ func TestReplayFailsOnMalformedFullBatch_036c(t *testing.T) {
 	dir := t.TempDir()
 	s1, err := NewDurableStorage(dir)
 	require.NoError(t, err)
-	require.NoError(t, s1.Save([]Entry{{Index: 1, Term: 1, Data: []byte("ok")}}, HardState{Term: 1}))
+	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("ok")}}, &raftpb.HardState{Term: 1}))
 	require.NoError(t, s1.Close())
 
 	path := filepath.Join(dir, logFilename)
@@ -183,8 +187,8 @@ func TestReplayFailsOnMalformedFullBatch_036c(t *testing.T) {
 
 	badBatch := make([]byte, frameHeaderSize+HardStateBytes+frameHeaderSize)
 	binary.LittleEndian.PutUint32(badBatch[0:], uint32(HardStateBytes+frameHeaderSize))
-	badHard := HardState{Term: 2, VotedFor: 1, CommittedIndex: 1}
-	badHard.EncodeTo(badBatch[frameHeaderSize:])
+	badHard := raftpb.HardState{Term: 2, VotedFor: 1, CommittedIndex: 1}
+	encodeHardState(&badHard, badBatch[frameHeaderSize:])
 	binary.LittleEndian.PutUint32(badBatch[frameHeaderSize+HardStateBytes:], 1)
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
@@ -203,7 +207,7 @@ func TestReplayFailsOnMalformedFullBatch_036c(t *testing.T) {
 }
 
 func TestComputeTotalSizeReturnsExpectedNumber_036c(t *testing.T) {
-	batch := []Entry{
+	batch := []*raftpb.Entry{
 		{Data: []byte("foo")},
 		{Data: []byte("ba")},
 	}
@@ -220,9 +224,9 @@ func TestEntriesBeforeBoundaryReturnErrCompacted_036e(t *testing.T) {
 		require.NoError(t, s.Close())
 	}()
 
-	require.NoError(t, s.Save([]Entry{{Index: 1, Term: 1, Data: []byte("one")}}, HardState{Term: 1}))
-	require.NoError(t, s.Save([]Entry{{Index: 2, Term: 1, Data: []byte("two")}}, HardState{Term: 1}))
-	require.NoError(t, s.Save([]Entry{{Index: 3, Term: 2, Data: []byte("three")}}, HardState{Term: 2}))
+	require.NoError(t, s.Save([]*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("one")}}, &raftpb.HardState{Term: 1}))
+	require.NoError(t, s.Save([]*raftpb.Entry{{Index: 2, Term: 1, Data: []byte("two")}}, &raftpb.HardState{Term: 1}))
+	require.NoError(t, s.Save([]*raftpb.Entry{{Index: 3, Term: 2, Data: []byte("three")}}, &raftpb.HardState{Term: 2}))
 
 	require.NoError(t, s.Compact(2))
 	_, err = s.Entries(1, 3)
@@ -231,7 +235,7 @@ func TestEntriesBeforeBoundaryReturnErrCompacted_036e(t *testing.T) {
 	ents, err := s.Entries(3, 4)
 	require.NoError(t, err)
 	require.Len(t, ents, 1)
-	require.Equal(t, Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
+	require.Equal(t, &raftpb.Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
 }
 
 func TestCompactionSurvivesRestart_036e(t *testing.T) {
@@ -239,9 +243,9 @@ func TestCompactionSurvivesRestart_036e(t *testing.T) {
 	s1, err := NewDurableStorage(dir)
 	require.NoError(t, err)
 
-	require.NoError(t, s1.Save([]Entry{{Index: 1, Term: 1, Data: []byte("one")}}, HardState{Term: 1}))
-	require.NoError(t, s1.Save([]Entry{{Index: 2, Term: 1, Data: []byte("two")}}, HardState{Term: 1}))
-	require.NoError(t, s1.Save([]Entry{{Index: 3, Term: 2, Data: []byte("three")}}, HardState{Term: 2}))
+	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("one")}}, &raftpb.HardState{Term: 1}))
+	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 2, Term: 1, Data: []byte("two")}}, &raftpb.HardState{Term: 1}))
+	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 3, Term: 2, Data: []byte("three")}}, &raftpb.HardState{Term: 2}))
 
 	require.NoError(t, s1.Compact(2))
 	require.NoError(t, s1.Close())
@@ -255,7 +259,7 @@ func TestCompactionSurvivesRestart_036e(t *testing.T) {
 	ents, err := s2.Entries(3, 4)
 	require.NoError(t, err)
 	require.Len(t, ents, 1)
-	require.Equal(t, Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
+	require.Equal(t, &raftpb.Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
 }
 
 func TestReplayFailsOnGapAfterSnapshotBoundary_036e(t *testing.T) {
@@ -263,15 +267,15 @@ func TestReplayFailsOnGapAfterSnapshotBoundary_036e(t *testing.T) {
 	s, err := NewDurableStorage(dir)
 	require.NoError(t, err)
 
-	snap := SnapshotMeta{LastIncludedIndex: 2, LastIncludedTerm: 1}
+	snap := raftpb.SnapshotMeta{LastIncludedIndex: 2, LastIncludedTerm: 1}
 	buf := make([]byte, SnapshotMetaBytes)
-	snap.EncodeTo(buf)
+	encodeSnapshotMeta(&snap, buf)
 	require.NoError(t, s.sw.write(buf))
 	require.NoError(t, s.sw.sync())
 
-	hard := HardState{Term: 2, VotedFor: 1, CommittedIndex: 2}
-	gapEntries := []Entry{{Index: 4, Term: 2, Data: []byte("four")}}
-	require.NoError(t, s.rw.write(encodeSaveBatch(hard, gapEntries)))
+	hard := raftpb.HardState{Term: 2, VotedFor: 1, CommittedIndex: 2}
+	gapEntries := []*raftpb.Entry{{Index: 4, Term: 2, Data: []byte("four")}}
+	require.NoError(t, s.rw.write(encodeSaveBatch(&hard, gapEntries)))
 	require.NoError(t, s.rw.sync())
 	require.NoError(t, s.Close())
 
@@ -284,15 +288,15 @@ func TestStorageApplySnapshotDropsCoveredEntries_036k(t *testing.T) {
 	s1, err := NewDurableStorage(dir)
 	require.NoError(t, err)
 
-	entries := []Entry{
+	entries := []*raftpb.Entry{
 		{Index: 1, Term: 1, Data: []byte("one")},
 		{Index: 2, Term: 1, Data: []byte("two")},
 		{Index: 3, Term: 2, Data: []byte("three")},
 		{Index: 4, Term: 2, Data: []byte("four")},
 	}
-	require.NoError(t, s1.Save(entries, HardState{Term: 2, CommittedIndex: 3}))
+	require.NoError(t, s1.Save(entries, &raftpb.HardState{Term: 2, CommittedIndex: 3}))
 
-	snap := SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 2}
+	snap := &raftpb.SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 2}
 	require.NoError(t, s1.ApplySnapshot(snap))
 
 	actualSnap, err := s1.Snapshot()
@@ -306,7 +310,7 @@ func TestStorageApplySnapshotDropsCoveredEntries_036k(t *testing.T) {
 
 	retained, err := s1.Entries(4, 5)
 	require.NoError(t, err)
-	require.Equal(t, []Entry{{Index: 4, Term: 2, Data: []byte("four")}}, retained)
+	require.Equal(t, []*raftpb.Entry{{Index: 4, Term: 2, Data: []byte("four")}}, retained)
 	require.NoError(t, s1.Close())
 
 	s2, err := NewDurableStorage(dir)
@@ -323,7 +327,7 @@ func TestStorageApplySnapshotDropsCoveredEntries_036k(t *testing.T) {
 
 	retained, err = s2.Entries(4, 5)
 	require.NoError(t, err)
-	require.Equal(t, []Entry{{Index: 4, Term: 2, Data: []byte("four")}}, retained)
+	require.Equal(t, []*raftpb.Entry{{Index: 4, Term: 2, Data: []byte("four")}}, retained)
 }
 
 func TestApplySnapshotRejectsStaleBoundary_036k(t *testing.T) {
@@ -334,11 +338,11 @@ func TestApplySnapshotRejectsStaleBoundary_036k(t *testing.T) {
 		require.NoError(t, s.Close())
 	}()
 
-	require.NoError(t, s.ApplySnapshot(SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}))
-	err = s.ApplySnapshot(SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 2})
+	require.NoError(t, s.ApplySnapshot(&raftpb.SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}))
+	err = s.ApplySnapshot(&raftpb.SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 2})
 	require.ErrorIs(t, err, ErrSnapOutOfDate)
 
 	snap, err := s.Snapshot()
 	require.NoError(t, err)
-	require.Equal(t, SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}, snap)
+	require.Equal(t, &raftpb.SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}, snap)
 }

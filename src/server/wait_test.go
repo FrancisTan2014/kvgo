@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"kvgo/raft"
+	"kvgo/raftpb"
 	"testing"
 	"time"
 
@@ -80,7 +81,7 @@ func TestProposalSignaledAfterApply_036o(t *testing.T) {
 
 	// simulate Raft committing the entry
 	fn.c <- raft.Ready{
-		CommittedEntries: []raft.Entry{{Index: 1, Term: 1, Data: data}},
+		CommittedEntries: []*raftpb.Entry{{Index: 1, Term: 1, Data: data}},
 	}
 
 	// server-side apply loop: read from channel, unmarshal, trigger
@@ -151,7 +152,7 @@ func TestHostApplyChannelCarriesDataNotEntries_036o(t *testing.T) {
 	defer host.Stop()
 
 	fn.c <- raft.Ready{
-		CommittedEntries: []raft.Entry{
+		CommittedEntries: []*raftpb.Entry{
 			{Index: 1, Term: 1, Data: []byte("a")},
 			{Index: 2, Term: 1, Data: []byte("b")},
 		},
@@ -159,7 +160,7 @@ func TestHostApplyChannelCarriesDataNotEntries_036o(t *testing.T) {
 
 	select {
 	case ap := <-host.Apply():
-		// toApply carries [][]byte, not []raft.Entry
+		// toApply carries [][]byte, not []raftpb.Entry
 		require.Len(t, ap.data, 2)
 		require.Equal(t, []byte("a"), ap.data[0])
 		require.Equal(t, []byte("b"), ap.data[1])

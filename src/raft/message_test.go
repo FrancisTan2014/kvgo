@@ -4,18 +4,20 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"kvgo/raftpb"
+
 	"github.com/stretchr/testify/require"
 )
 
 func TestEntryEncodeDecodeRoundTrip_036c(t *testing.T) {
-	original := Entry{Index: 7, Term: 3, Data: []byte("hello")}
+	original := raftpb.Entry{Index: 7, Term: 3, Data: []byte("hello")}
 
-	buf := make([]byte, original.Size())
-	original.EncodeTo(buf)
+	buf := make([]byte, entrySize(&original))
+	encodeEntry(&original, buf)
 
 	decoded, err := DecodeEntry(buf)
 	require.NoError(t, err)
-	require.Equal(t, original, decoded)
+	require.Equal(t, &original, decoded)
 }
 
 func TestDecodeEntryRejectsShortBuffer_036c(t *testing.T) {
@@ -24,14 +26,14 @@ func TestDecodeEntryRejectsShortBuffer_036c(t *testing.T) {
 }
 
 func TestHardStateEncodeDecodeRoundTrip_036c(t *testing.T) {
-	original := HardState{Term: 4, VotedFor: 2, CommittedIndex: 9}
+	original := raftpb.HardState{Term: 4, VotedFor: 2, CommittedIndex: 9}
 
 	buf := make([]byte, HardStateBytes)
-	original.EncodeTo(buf)
+	encodeHardState(&original, buf)
 
 	decoded, err := DecodeHardState(buf)
 	require.NoError(t, err)
-	require.Equal(t, original, decoded)
+	require.Equal(t, &original, decoded)
 }
 
 func TestDecodeHardStateRejectsWrongSize_036c(t *testing.T) {
@@ -40,8 +42,8 @@ func TestDecodeHardStateRejectsWrongSize_036c(t *testing.T) {
 }
 
 func TestDecodeSaveBatchRoundTrip_036c(t *testing.T) {
-	hard := HardState{Term: 2, VotedFor: 1, CommittedIndex: 3}
-	entries := []Entry{
+	hard := &raftpb.HardState{Term: 2, VotedFor: 1, CommittedIndex: 3}
+	entries := []*raftpb.Entry{
 		{Index: 2, Term: 2, Data: []byte("two")},
 		{Index: 3, Term: 2, Data: []byte("three")},
 	}
@@ -55,8 +57,8 @@ func TestDecodeSaveBatchRoundTrip_036c(t *testing.T) {
 }
 
 func TestDecodeSaveBatchRejectsMismatchedEntryLength_036c(t *testing.T) {
-	hard := HardState{Term: 1, VotedFor: 1, CommittedIndex: 1}
-	entries := []Entry{{Index: 1, Term: 1, Data: []byte("one")}}
+	hard := &raftpb.HardState{Term: 1, VotedFor: 1, CommittedIndex: 1}
+	entries := []*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("one")}}
 	batch := encodeSaveBatch(hard, entries)
 
 	binary.LittleEndian.PutUint32(batch[HardStateBytes:], uint32(len(batch)))
@@ -66,10 +68,10 @@ func TestDecodeSaveBatchRejectsMismatchedEntryLength_036c(t *testing.T) {
 }
 
 func TestDecodeEntriesRejectsTruncatedFrame_036c(t *testing.T) {
-	entry := Entry{Index: 1, Term: 1, Data: []byte("one")}
-	frame := make([]byte, frameHeaderSize+entry.Size()-1)
-	binary.LittleEndian.PutUint32(frame[:frameHeaderSize], uint32(entry.Size()))
-	entry.EncodeTo(frame[frameHeaderSize:])
+	entry := raftpb.Entry{Index: 1, Term: 1, Data: []byte("one")}
+	frame := make([]byte, frameHeaderSize+entrySize(&entry)-1)
+	binary.LittleEndian.PutUint32(frame[:frameHeaderSize], uint32(entrySize(&entry)))
+	encodeEntry(&entry, frame[frameHeaderSize:])
 
 	_, err := decodeEntries(frame)
 	require.ErrorIs(t, err, ErrCorruption)

@@ -1,6 +1,9 @@
 package raft
 
-import "context"
+import (
+	"context"
+	"kvgo/raftpb"
+)
 
 type Config struct {
 	ID      uint64
@@ -11,7 +14,7 @@ type Config struct {
 type Node interface {
 	Ready() <-chan Ready
 	Propose(ctx context.Context, data []byte) error
-	Step(ctx context.Context, m Message) error
+	Step(ctx context.Context, m *raftpb.Message) error
 	Campaign(ctx context.Context) error
 	Advance()
 }
@@ -23,7 +26,7 @@ type node struct {
 	campaignc chan campaignRequest
 	readyc    chan Ready
 	advancec  chan struct{}
-	prevHard  HardState
+	prevHard  *raftpb.HardState
 }
 
 type proposeRequest struct {
@@ -32,7 +35,7 @@ type proposeRequest struct {
 }
 
 type stepRequest struct {
-	m    Message
+	m    *raftpb.Message
 	resp chan error
 }
 
@@ -78,7 +81,7 @@ func (n *node) run(ctx context.Context) {
 		case req := <-n.campaignc:
 			req.resp <- n.r.Campaign()
 		case <-advancec:
-			if rd.HardState != (HardState{}) {
+			if !IsEmptyHardState(rd.HardState) {
 				n.prevHard = rd.HardState
 			}
 			n.r.Advance()
@@ -92,7 +95,7 @@ func (n *node) run(ctx context.Context) {
 
 func (n *node) hasReady() bool {
 	hard := n.r.HardState()
-	if hard != (HardState{}) && hard != n.prevHard {
+	if !IsEmptyHardState(hard) && !hardStatesEqual(hard, n.prevHard) {
 		return true
 	}
 
@@ -101,8 +104,8 @@ func (n *node) hasReady() bool {
 
 func (n *node) ready() Ready {
 	rd := n.r.Ready()
-	if rd.HardState == n.prevHard {
-		rd.HardState = HardState{}
+	if hardStatesEqual(rd.HardState, n.prevHard) {
+		rd.HardState = nil
 	}
 	return rd
 }
@@ -123,7 +126,7 @@ func (n *node) Propose(ctx context.Context, data []byte) error {
 	}
 }
 
-func (n *node) Step(ctx context.Context, m Message) error {
+func (n *node) Step(ctx context.Context, m *raftpb.Message) error {
 	resp := make(chan error, 1)
 	select {
 	case <-ctx.Done():
@@ -137,6 +140,16 @@ func (n *node) Step(ctx context.Context, m Message) error {
 	case err := <-resp:
 		return err
 	}
+}
+
+func hardStatesEqual(a, b *raftpb.HardState) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Term == b.Term && a.VotedFor == b.VotedFor && a.CommittedIndex == b.CommittedIndex
 }
 
 func (n *node) Campaign(ctx context.Context) error {

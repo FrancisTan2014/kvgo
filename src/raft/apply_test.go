@@ -4,15 +4,17 @@ import (
 	"errors"
 	"testing"
 
+	"kvgo/raftpb"
+
 	"github.com/stretchr/testify/require"
 )
 
 type fakeApplyTarget struct {
-	applied []Entry
+	applied []*raftpb.Entry
 	err     error
 }
 
-func (f *fakeApplyTarget) Apply(entries []Entry) error {
+func (f *fakeApplyTarget) Apply(entries []*raftpb.Entry) error {
 	if f.err != nil {
 		return f.err
 	}

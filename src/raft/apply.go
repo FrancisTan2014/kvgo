@@ -1,12 +1,14 @@
 package raft
 
+import "kvgo/raftpb"
+
 // ApplyTarget is the smallest seam needed for 036d.
 // It only needs to answer one question: can committed entries become visible?
 // Even after Raft is integrated into the real server, this boundary still
 // exists conceptually: something outside pure Raft must take committed entries
 // and make them visible to the state machine.
 type ApplyTarget interface {
-	Apply(entries []Entry) error
+	Apply(entries []*raftpb.Entry) error
 }
 
 // Applier consumes Ready from Raft and advances progress only after committed

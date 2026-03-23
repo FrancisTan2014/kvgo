@@ -4,28 +4,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"kvgo/raftpb"
 	"sync"
 )
 
 var ErrCompacted = errors.New("requested index is unavailable due to compaction")
-var ErrNonContiguous = errors.New("non-contiguous entry index")
+var ErrNonContiguous = errors.New("non-contiguous raftpb.Entry index")
 var ErrSnapOutOfDate = errors.New("requested snapshot is older than existing snapshot")
 
-type SnapshotMeta struct {
-	LastIncludedIndex uint64
-	LastIncludedTerm  uint64
-}
-
 type Storage interface {
-	InitialState() (HardState, error)
-	Save(entries []Entry, hard HardState) error
-	Entries(lo, hi uint64) ([]Entry, error)
+	InitialState() (*raftpb.HardState, error)
+	Save(entries []*raftpb.Entry, hard *raftpb.HardState) error
+	Entries(lo, hi uint64) ([]*raftpb.Entry, error)
 	FirstIndex() uint64
 	LastIndex() uint64
 	Compact(index uint64) error
 	Close() error
-	Snapshot() (SnapshotMeta, error)
-	ApplySnapshot(snap SnapshotMeta) error
+	Snapshot() (*raftpb.SnapshotMeta, error)
+	ApplySnapshot(snap *raftpb.SnapshotMeta) error
 }
 
 const logFilename = "replication.log"
@@ -35,9 +31,9 @@ type DurableStorage struct {
 	rw      *wal
 	sw      *wal
 	mu      sync.RWMutex
-	hd      HardState
-	entries []Entry
-	snap    SnapshotMeta
+	hd      *raftpb.HardState
+	entries []*raftpb.Entry
+	snap    *raftpb.SnapshotMeta
 }
 
 func NewDurableStorage(dir string) (*DurableStorage, error) {
@@ -54,7 +50,9 @@ func NewDurableStorage(dir string) (*DurableStorage, error) {
 	d := &DurableStorage{
 		rw:      rw,
 		sw:      sw,
-		entries: make([]Entry, 0),
+		hd:      &raftpb.HardState{},
+		entries: make([]*raftpb.Entry, 0),
+		snap:    &raftpb.SnapshotMeta{},
 	}
 
 	if err := d.replay(); err != nil {
@@ -69,22 +67,22 @@ func (s *DurableStorage) Close() error {
 	return errors.Join(s.rw.close(), s.sw.close())
 }
 
-func (s *DurableStorage) InitialState() (HardState, error) {
+func (s *DurableStorage) InitialState() (*raftpb.HardState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.hd, nil
 }
 
-func computeTotalSize(entries []Entry) int {
+func computeTotalSize(entries []*raftpb.Entry) int {
 	var total int
 	for _, e := range entries {
-		total += frameHeaderSize + e.Size()
+		total += frameHeaderSize + entrySize(e)
 	}
 	return total
 }
 
 // Save appends `entries` and `hard` together as a single batch at the end of the log.
-func (s *DurableStorage) Save(entries []Entry, hard HardState) error {
+func (s *DurableStorage) Save(entries []*raftpb.Entry, hard *raftpb.HardState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(entries) == 0 && IsEmptyHardState(hard) {
@@ -146,7 +144,7 @@ func (s *DurableStorage) LastIndex() uint64 {
 	return s.lastIndexWithoutLock()
 }
 
-func (s *DurableStorage) Entries(lo, hi uint64) ([]Entry, error) {
+func (s *DurableStorage) Entries(lo, hi uint64) ([]*raftpb.Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -172,12 +170,12 @@ func (s *DurableStorage) Entries(lo, hi uint64) ([]Entry, error) {
 	}
 
 	if lo == hi {
-		return []Entry{}, nil
+		return []*raftpb.Entry{}, nil
 	}
 
 	start := int(lo - firstIndex)
 	end := int(hi - firstIndex)
-	ents := make([]Entry, end-start)
+	ents := make([]*raftpb.Entry, end-start)
 	copy(ents, s.entries[start:end])
 	return ents, nil
 }
@@ -245,7 +243,7 @@ func (s *DurableStorage) replaySnapshotMeta() (err error) {
 		}
 	}()
 
-	s.snap = SnapshotMeta{}
+	s.snap = &raftpb.SnapshotMeta{}
 
 	for {
 		batch, err := s.sw.read()
@@ -267,7 +265,7 @@ func (s *DurableStorage) replaySnapshotMeta() (err error) {
 	return nil
 }
 
-func (s *DurableStorage) appendEntries(entries []Entry) error {
+func (s *DurableStorage) appendEntries(entries []*raftpb.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -278,7 +276,7 @@ func (s *DurableStorage) appendEntries(entries []Entry) error {
 	return nil
 }
 
-func (s *DurableStorage) validateAppend(entries []Entry) error {
+func (s *DurableStorage) validateAppend(entries []*raftpb.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -290,9 +288,9 @@ func (s *DurableStorage) validateAppend(entries []Entry) error {
 		expected = s.snap.LastIncludedIndex + 1
 	}
 
-	for _, entry := range entries {
-		if entry.Index != expected {
-			return fmt.Errorf("%w: got %d want %d", ErrNonContiguous, entry.Index, expected)
+	for _, e := range entries {
+		if e.Index != expected {
+			return fmt.Errorf("%w: got %d want %d", ErrNonContiguous, e.Index, expected)
 		}
 		expected++
 	}
@@ -319,7 +317,7 @@ func (s *DurableStorage) Compact(index uint64) error {
 		return err
 	}
 
-	snap := SnapshotMeta{LastIncludedIndex: index, LastIncludedTerm: term}
+	snap := &raftpb.SnapshotMeta{LastIncludedIndex: index, LastIncludedTerm: term}
 	if err := s.persistSnapshotMeta(snap); err != nil {
 		return err
 	}
@@ -328,7 +326,7 @@ func (s *DurableStorage) Compact(index uint64) error {
 	for cut < len(s.entries) && s.entries[cut].Index <= index {
 		cut++
 	}
-	retained := append([]Entry(nil), s.entries[cut:]...)
+	retained := append([]*raftpb.Entry(nil), s.entries[cut:]...)
 	s.entries = retained
 	s.snap = snap
 
@@ -347,9 +345,9 @@ func (s *DurableStorage) termWithoutLock(index uint64) (uint64, error) {
 	return s.entries[index-firstIndex].Term, nil
 }
 
-func (s *DurableStorage) persistSnapshotMeta(snap SnapshotMeta) error {
+func (s *DurableStorage) persistSnapshotMeta(snap *raftpb.SnapshotMeta) error {
 	buf := make([]byte, SnapshotMetaBytes)
-	snap.EncodeTo(buf)
+	encodeSnapshotMeta(snap, buf)
 	if err := s.sw.truncate(0); err != nil {
 		return err
 	}
@@ -361,7 +359,7 @@ func (s *DurableStorage) persistSnapshotMeta(snap SnapshotMeta) error {
 	return errors.Join(we, se)
 }
 
-func filterRetainedEntries(entries []Entry, lastIncludedIndex uint64) []Entry {
+func filterRetainedEntries(entries []*raftpb.Entry, lastIncludedIndex uint64) []*raftpb.Entry {
 	if lastIncludedIndex == 0 {
 		return entries
 	}
@@ -378,13 +376,13 @@ func filterRetainedEntries(entries []Entry, lastIncludedIndex uint64) []Entry {
 	return entries[start:]
 }
 
-func (s *DurableStorage) Snapshot() (SnapshotMeta, error) {
+func (s *DurableStorage) Snapshot() (*raftpb.SnapshotMeta, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.snap, nil
 }
 
-func (s *DurableStorage) ApplySnapshot(snap SnapshotMeta) error {
+func (s *DurableStorage) ApplySnapshot(snap *raftpb.SnapshotMeta) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

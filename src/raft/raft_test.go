@@ -3,24 +3,26 @@ package raft
 import (
 	"testing"
 
+	"kvgo/raftpb"
+
 	"github.com/stretchr/testify/require"
 )
 
 type mockStorage struct {
 	firstIndex uint64
-	snap       SnapshotMeta
-	applied    []SnapshotMeta
+	snap       *raftpb.SnapshotMeta
+	applied    []*raftpb.SnapshotMeta
 }
 
-func (m *mockStorage) InitialState() (HardState, error) {
-	return HardState{}, nil
+func (m *mockStorage) InitialState() (*raftpb.HardState, error) {
+	return &raftpb.HardState{}, nil
 }
 
-func (m *mockStorage) Save(entries []Entry, hard HardState) error {
+func (m *mockStorage) Save(entries []*raftpb.Entry, hard *raftpb.HardState) error {
 	return nil
 }
 
-func (m *mockStorage) Entries(lo, hi uint64) ([]Entry, error) {
+func (m *mockStorage) Entries(lo, hi uint64) ([]*raftpb.Entry, error) {
 	return nil, nil
 }
 
@@ -29,7 +31,7 @@ func (m *mockStorage) FirstIndex() uint64 {
 }
 
 func (m *mockStorage) LastIndex() uint64 {
-	if m.snap.LastIncludedIndex > 0 {
+	if m.snap != nil && m.snap.LastIncludedIndex > 0 {
 		return m.snap.LastIncludedIndex
 	}
 	if m.firstIndex > 0 {
@@ -46,11 +48,14 @@ func (m *mockStorage) Close() error {
 	return nil
 }
 
-func (m *mockStorage) Snapshot() (SnapshotMeta, error) {
+func (m *mockStorage) Snapshot() (*raftpb.SnapshotMeta, error) {
+	if m.snap == nil {
+		return &raftpb.SnapshotMeta{}, nil
+	}
 	return m.snap, nil
 }
 
-func (m *mockStorage) ApplySnapshot(snap SnapshotMeta) error {
+func (m *mockStorage) ApplySnapshot(snap *raftpb.SnapshotMeta) error {
 	m.snap = snap
 	m.applied = append(m.applied, snap)
 	return nil
@@ -66,6 +71,9 @@ func newLeaderRaftWithOnePeer() Raft {
 	r.term = 1
 	r.state = Leader
 	r.peers = append(r.peers, 2)
+	r.progress = map[uint64]*Progress{
+		2: {MatchIndex: 0, NextIndex: 1},
+	}
 	return r
 }
 
@@ -149,17 +157,17 @@ func TestReadyExposesHardStateAfterCampaign_036m(t *testing.T) {
 	require.NoError(t, r.Campaign())
 
 	rd := r.Ready()
-	require.Equal(t, HardState{Term: 1, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
+	require.Equal(t, &raftpb.HardState{Term: 1, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
 }
 
 func TestReadyExposesHardStateAfterGrantingVote_036m(t *testing.T) {
 	r := *newTestRaft(2)
 	r.state = Follower
 
-	require.NoError(t, r.Step(Message{Type: MsgVote, From: 1, To: 2, Term: 3}))
+	require.NoError(t, r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgVote, From: 1, To: 2, Term: 3}))
 
 	rd := r.Ready()
-	require.Equal(t, HardState{Term: 3, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
+	require.Equal(t, &raftpb.HardState{Term: 3, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
 }
 
 func TestReadyExposesHardStateAfterCommit_036m(t *testing.T) {
@@ -168,24 +176,24 @@ func TestReadyExposesHardStateAfterCommit_036m(t *testing.T) {
 	r.CommitTo(1)
 
 	rd := r.Ready()
-	require.Equal(t, HardState{Term: 1, VotedFor: 0, CommittedIndex: 1}, rd.HardState)
+	require.Equal(t, &raftpb.HardState{Term: 1, VotedFor: 0, CommittedIndex: 1}, rd.HardState)
 }
 
 func TestHardStateChangesWithoutMessagesOrEntries_036m(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 
-	require.NoError(t, r.Step(Message{Type: MsgApp, From: 2, To: 1, Term: 2}))
-	require.Equal(t, HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+	require.NoError(t, r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgApp, From: 2, To: 1, Term: 2}))
+	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
 }
 
 func TestAdvanceDoesNotChangeHardState_036m(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 
-	require.NoError(t, r.Step(Message{Type: MsgApp, From: 2, To: 1, Term: 2}))
-	require.Equal(t, HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+	require.NoError(t, r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgApp, From: 2, To: 1, Term: 2}))
+	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
 
 	r.Advance()
-	require.Equal(t, HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
 }
 
 func TestFullLifecycle_036b(t *testing.T) {
@@ -218,7 +226,7 @@ func TestAppendMessageIsReadyAfterLeaderPropose_036f(t *testing.T) {
 	require.Len(t, rd.CommittedEntries, 0)
 
 	msg := rd.Messages[0]
-	require.Equal(t, MsgApp, msg.Type)
+	require.Equal(t, raftpb.MessageType_MsgApp, msg.Type)
 	require.Len(t, msg.Entries, 1)
 	require.Equal(t, uint64(1), msg.Entries[0].Index)
 	require.Equal(t, []byte("foo"), msg.Entries[0].Data)
@@ -305,12 +313,12 @@ func TestCandidateDoesNotBecomeLeaderWithOnlySelfVote_036h(t *testing.T) {
 	require.NoError(t, n.Campaign())
 	rd := n.Ready()
 	require.Len(t, rd.Messages, 1)
-	require.Equal(t, MsgVote, rd.Messages[0].Type)
+	require.Equal(t, raftpb.MessageType_MsgVote, rd.Messages[0].Type)
 	require.Equal(t, voterId, rd.Messages[0].To)
 	require.Equal(t, Candidate, n.state)
 
-	require.NoError(t, n.Step(Message{
-		Type:   MsgVoteResp,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   voterId,
 		To:     n.id,
 		Term:   n.term,
@@ -328,8 +336,8 @@ func TestCandidateBecomesLeaderAfterMajorityVoteResponses_036h(t *testing.T) {
 	require.NoError(t, n.Campaign())
 	require.Equal(t, Candidate, n.state)
 
-	require.NoError(t, n.Step(Message{
-		Type:   MsgVoteResp,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   voterId,
 		To:     n.id,
 		Term:   1,
@@ -342,13 +350,13 @@ func TestVoteRejectedForOlderTerm_036h(t *testing.T) {
 	n := newTestRaft(1)
 	n.term = 2
 
-	require.NoError(t, n.Step(Message{
-		Type: MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgVote,
 		Term: 1,
 	}))
 	rd := n.Ready()
 	require.Len(t, rd.Messages, 1)
-	require.Equal(t, MsgVoteResp, rd.Messages[0].Type)
+	require.Equal(t, raftpb.MessageType_MsgVoteResp, rd.Messages[0].Type)
 	require.True(t, rd.Messages[0].Reject)
 }
 
@@ -357,14 +365,14 @@ func TestVoteRejectedWhenExistingVote_036h(t *testing.T) {
 	n.term = 1
 	n.votedFor = 3
 
-	require.NoError(t, n.Step(Message{
-		Type: MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgVote,
 		From: 1,
 		Term: 1,
 	}))
 	rd := n.Ready()
 	require.Len(t, rd.Messages, 1)
-	require.Equal(t, MsgVoteResp, rd.Messages[0].Type)
+	require.Equal(t, raftpb.MessageType_MsgVoteResp, rd.Messages[0].Type)
 	require.True(t, rd.Messages[0].Reject)
 }
 
@@ -372,8 +380,8 @@ func TestVoteGrantUpdatesTermAndVotedFor_036h(t *testing.T) {
 	n := newTestRaft(2)
 	n.term = 1
 
-	require.NoError(t, n.Step(Message{
-		Type: MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgVote,
 		From: 1,
 		Term: 2,
 	}))
@@ -387,8 +395,8 @@ func TestGrantingHigherTermVoteStepsDownToFollower_036h(t *testing.T) {
 	n.term = 1
 	n.state = Candidate
 
-	require.NoError(t, n.Step(Message{
-		Type: MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgVote,
 		From: 1,
 		Term: 2,
 	}))
@@ -403,8 +411,8 @@ func TestStaleVoteRespIgnored_036h(t *testing.T) {
 	n.peers = append(n.peers, voterId)
 
 	require.NoError(t, n.Campaign())
-	require.NoError(t, n.Step(Message{
-		Type:   MsgVoteResp,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   voterId,
 		To:     n.id,
 		Term:   1,
@@ -416,10 +424,10 @@ func TestStaleVoteRespIgnored_036h(t *testing.T) {
 func TestVoteRejectedWhenCandidateLastLogTermIsOlder_036i(t *testing.T) {
 	n := newTestRaft(1)
 	n.term = 2
-	n.log = append(n.log, Entry{Term: 2, Index: 1})
+	n.log = append(n.log, &raftpb.Entry{Term: 2, Index: 1})
 
-	require.NoError(t, n.Step(Message{
-		Type:    MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgVote,
 		Term:    3,
 		LogTerm: 1,
 		Index:   1,
@@ -433,10 +441,10 @@ func TestVoteRejectedWhenCandidateLastLogTermIsOlder_036i(t *testing.T) {
 func TestVoteRejectedWhenCandidateLastLogIndexIsLowerInSameLastTerm_036i(t *testing.T) {
 	n := newTestRaft(1)
 	n.term = 2
-	n.log = append(n.log, Entry{Term: 2, Index: 2})
+	n.log = append(n.log, &raftpb.Entry{Term: 2, Index: 2})
 
-	require.NoError(t, n.Step(Message{
-		Type:    MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgVote,
 		Term:    3,
 		LogTerm: 2,
 		Index:   1,
@@ -450,7 +458,7 @@ func TestVoteRejectedWhenCandidateLastLogIndexIsLowerInSameLastTerm_036i(t *test
 func TestCampaignIncludesLastLogPositionInVoteRequest_036i(t *testing.T) {
 	n := newTestRaft(1)
 	n.term = 2
-	n.log = append(n.log, Entry{Term: 2, Index: 2})
+	n.log = append(n.log, &raftpb.Entry{Term: 2, Index: 2})
 	n.peers = append(n.peers, 2)
 
 	require.NoError(t, n.Campaign())
@@ -466,10 +474,10 @@ func TestRejectingHigherTermStaleVoteUpdatesTermAndClearsOldVote_036j(t *testing
 	n.term = 1
 	n.state = Candidate
 	n.votedFor = n.id
-	n.log = append(n.log, Entry{Term: 1, Index: 2})
+	n.log = append(n.log, &raftpb.Entry{Term: 1, Index: 2})
 
-	require.NoError(t, n.Step(Message{
-		Type:    MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgVote,
 		From:    1,
 		Term:    2,
 		LogTerm: 0,
@@ -489,10 +497,10 @@ func TestHigherTermRejectionClearsVoteForLaterSameTermGrant_036j(t *testing.T) {
 	n.term = 1
 	n.state = Candidate
 	n.votedFor = n.id
-	n.log = append(n.log, Entry{Term: 1, Index: 2})
+	n.log = append(n.log, &raftpb.Entry{Term: 1, Index: 2})
 
-	require.NoError(t, n.Step(Message{
-		Type:    MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgVote,
 		From:    1,
 		Term:    2,
 		LogTerm: 0,
@@ -500,8 +508,8 @@ func TestHigherTermRejectionClearsVoteForLaterSameTermGrant_036j(t *testing.T) {
 	}))
 	n.messages = nil
 
-	require.NoError(t, n.Step(Message{
-		Type:    MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgVote,
 		From:    3,
 		Term:    2,
 		LogTerm: 1,
@@ -523,8 +531,8 @@ func TestHigherTermGrantedVoteResponseMakesCandidateYield_036j(t *testing.T) {
 	require.Equal(t, uint64(1), n.term)
 	require.Equal(t, n.id, n.votedFor)
 
-	require.NoError(t, n.Step(Message{
-		Type:   MsgVoteResp,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   2,
 		To:     n.id,
 		Term:   2,
@@ -544,8 +552,8 @@ func TestHigherTermVoteResponseClearsSelfVoteForLaterGrant_036j(t *testing.T) {
 	require.NoError(t, n.Campaign())
 	require.Equal(t, Candidate, n.state)
 
-	require.NoError(t, n.Step(Message{
-		Type:   MsgVoteResp,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   1,
 		To:     n.id,
 		Term:   2,
@@ -554,8 +562,8 @@ func TestHigherTermVoteResponseClearsSelfVoteForLaterGrant_036j(t *testing.T) {
 	require.Equal(t, Follower, n.state)
 	n.messages = nil
 
-	require.NoError(t, n.Step(Message{
-		Type:    MsgVote,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgVote,
 		From:    3,
 		Term:    2,
 		LogTerm: 0,
@@ -575,12 +583,12 @@ func TestHigherTermAppendRevokesStaleAuthorityBeforeAppendLogic_036j(t *testing.
 	n.votedFor = n.id
 	n.votes = map[uint64]bool{n.id: true, 1: false}
 
-	require.NoError(t, n.Step(Message{
-		Type:    MsgApp,
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgApp,
 		From:    1,
 		To:      n.id,
 		Term:    2,
-		Entries: []Entry{{Index: 1, Term: 2, Data: []byte("x")}},
+		Entries: []*raftpb.Entry{{Index: 1, Term: 2, Data: []byte("x")}},
 	}))
 
 	require.Equal(t, uint64(2), n.term)
@@ -590,9 +598,9 @@ func TestHigherTermAppendRevokesStaleAuthorityBeforeAppendLogic_036j(t *testing.
 
 	rd := n.Ready()
 	require.Len(t, rd.Entries, 1)
-	require.Equal(t, Entry{Index: 1, Term: 2, Data: []byte("x")}, rd.Entries[0])
+	require.Equal(t, &raftpb.Entry{Index: 1, Term: 2, Data: []byte("x")}, rd.Entries[0])
 	require.Len(t, rd.Messages, 1)
-	require.Equal(t, MsgAppResp, rd.Messages[0].Type)
+	require.Equal(t, raftpb.MessageType_MsgAppResp, rd.Messages[0].Type)
 	require.Equal(t, uint64(2), rd.Messages[0].Term)
 	require.Equal(t, uint64(2), rd.Messages[0].LogTerm)
 }
@@ -608,8 +616,8 @@ func TestHigherTermAppendRevokesStaleAuthorityBeforeAppendLogic_036j(t *testing.
 // 	id := entryID{index: 1, term: 1}
 // 	require.False(t, leader.acks[id][2])
 
-// 	require.NoError(t, leader.Step(Message{
-// 		Type:    MsgAppResp,
+// 	require.NoError(t, leader.Step(&raftpb.Message{
+// 		Type:    raftpb.MessageType_MsgAppResp,
 // 		From:    2,
 // 		To:      leader.id,
 // 		Term:    2,
@@ -628,12 +636,12 @@ func TestHigherTermAppendRevokesStaleAuthorityBeforeAppendLogic_036j(t *testing.
 func TestMsgAppIsRejectedWhenAnchorCannotBeProved_036k(t *testing.T) {
 	follower := newTestRaft(2)
 
-	require.NoError(t, follower.Step(Message{
-		Type:    MsgApp,
+	require.NoError(t, follower.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgApp,
 		Term:    2,
 		Index:   1,
 		LogTerm: 2,
-		Entries: []Entry{{Index: 2, Term: 2, Data: []byte("x")}},
+		Entries: []*raftpb.Entry{{Index: 2, Term: 2, Data: []byte("x")}},
 	}))
 
 	rd := follower.Ready()
@@ -645,14 +653,14 @@ func TestMsgSnapIsReadyWhenRepairCrossesCompactionBoundary_036k(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
 	leader.storage = &mockStorage{
 		firstIndex: 5,
-		snap: SnapshotMeta{
+		snap: &raftpb.SnapshotMeta{
 			LastIncludedIndex: 4,
 			LastIncludedTerm:  1,
 		},
 	}
 
-	require.NoError(t, leader.Step(Message{
-		Type:       MsgAppResp,
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type:       raftpb.MessageType_MsgAppResp,
 		From:       2,
 		To:         leader.id,
 		Term:       leader.term,
@@ -662,22 +670,22 @@ func TestMsgSnapIsReadyWhenRepairCrossesCompactionBoundary_036k(t *testing.T) {
 
 	rd := leader.Ready()
 	require.Len(t, rd.Messages, 1)
-	require.Equal(t, MsgSnap, rd.Messages[0].Type)
+	require.Equal(t, raftpb.MessageType_MsgSnap, rd.Messages[0].Type)
 	require.Equal(t, leader.id, rd.Messages[0].From)
 	require.Equal(t, uint64(2), rd.Messages[0].To)
-	require.Equal(t, SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 1}, rd.Messages[0].Snapshot)
+	require.Equal(t, &raftpb.SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 1}, rd.Messages[0].Snapshot)
 }
 
 func TestFollowerInstallsSnapshotBoundaryFromMsgSnap_036k(t *testing.T) {
 	storage := &mockStorage{}
 	follower := newTestRaft(2)
 	follower.storage = storage
-	follower.log = []Entry{{Index: 1, Term: 1, Data: []byte("old")}, {Index: 2, Term: 1, Data: []byte("older")}}
+	follower.log = []*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("old")}, {Index: 2, Term: 1, Data: []byte("older")}}
 	follower.lastLogIndex = 2
 
-	snap := SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}
-	require.NoError(t, follower.Step(Message{
-		Type:     MsgSnap,
+	snap := &raftpb.SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}
+	require.NoError(t, follower.Step(&raftpb.Message{
+		Type:     raftpb.MessageType_MsgSnap,
 		From:     1,
 		To:       follower.id,
 		Term:     3,
@@ -686,7 +694,7 @@ func TestFollowerInstallsSnapshotBoundaryFromMsgSnap_036k(t *testing.T) {
 
 	require.Equal(t, uint64(3), follower.term)
 	require.Equal(t, Follower, follower.state)
-	require.Equal(t, []SnapshotMeta{snap}, storage.applied)
+	require.Equal(t, []*raftpb.SnapshotMeta{snap}, storage.applied)
 	require.Equal(t, snap, storage.snap)
 	require.Empty(t, follower.log)
 	require.Equal(t, uint64(4), follower.lastLogIndex)
@@ -701,28 +709,28 @@ func TestAppendAfterInstalledSnapshotIsReady_036k(t *testing.T) {
 	follower := newTestRaft(2)
 	follower.storage = storage
 
-	snap := SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}
-	require.NoError(t, follower.Step(Message{
-		Type:     MsgSnap,
+	snap := &raftpb.SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}
+	require.NoError(t, follower.Step(&raftpb.Message{
+		Type:     raftpb.MessageType_MsgSnap,
 		From:     1,
 		To:       follower.id,
 		Term:     3,
 		Snapshot: snap,
 	}))
 
-	require.NoError(t, follower.Step(Message{
-		Type:    MsgApp,
+	require.NoError(t, follower.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgApp,
 		From:    1,
 		To:      follower.id,
 		Term:    3,
 		Index:   4,
 		LogTerm: 2,
-		Entries: []Entry{{Index: 5, Term: 3, Data: []byte("x")}},
+		Entries: []*raftpb.Entry{{Index: 5, Term: 3, Data: []byte("x")}},
 	}))
 
 	rd := follower.Ready()
 	require.Len(t, rd.Entries, 1)
-	require.Equal(t, Entry{Index: 5, Term: 3, Data: []byte("x")}, rd.Entries[0])
+	require.Equal(t, &raftpb.Entry{Index: 5, Term: 3, Data: []byte("x")}, rd.Entries[0])
 }
 
 func TestProgressInitializedOnElection_036n(t *testing.T) {
@@ -734,8 +742,8 @@ func TestProgressInitializedOnElection_036n(t *testing.T) {
 	candidate.votes[1] = true
 	candidate.votes[2] = false
 
-	require.NoError(t, candidate.Step(Message{
-		Type:   MsgVoteResp,
+	require.NoError(t, candidate.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   2,
 		Reject: false,
 	}))
@@ -746,7 +754,7 @@ func TestProgressInitializedOnElection_036n(t *testing.T) {
 
 func TestProposeSendsEntriesFromNextIndex_036n(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
-	leader.log = []Entry{
+	leader.log = []*raftpb.Entry{
 		{Index: 1, Term: 1},
 	}
 	leader.progress = make(map[uint64]*Progress)
@@ -758,7 +766,7 @@ func TestProposeSendsEntriesFromNextIndex_036n(t *testing.T) {
 	require.NoError(t, leader.Propose([]byte("foo")))
 
 	rd := leader.Ready()
-	require.Equal(t, []Entry{
+	require.Equal(t, []*raftpb.Entry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1, Data: []byte("foo")},
 	}, rd.Messages[0].Entries)
@@ -769,7 +777,7 @@ func TestCommitAdvancesOnMajorityMatch_036n(t *testing.T) {
 	leader.peers = append(leader.peers, 3)
 
 	leader.lastLogIndex = 3
-	leader.log = []Entry{
+	leader.log = []*raftpb.Entry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
 		{Index: 3, Term: 1},
@@ -779,8 +787,8 @@ func TestCommitAdvancesOnMajorityMatch_036n(t *testing.T) {
 	leader.progress[2] = &Progress{MatchIndex: 0, NextIndex: 1}
 	leader.progress[3] = &Progress{MatchIndex: 1, NextIndex: 2}
 
-	require.NoError(t, leader.Step(Message{
-		Type:  MsgAppResp,
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type:  raftpb.MessageType_MsgAppResp,
 		From:  2,
 		Index: 2,
 	}))
@@ -794,11 +802,11 @@ func TestFollowerAdvancesCommitFromMsgApp_036n(t *testing.T) {
 	follower.lastLogIndex = 1
 
 	require.Equal(t, uint64(0), follower.commitIndex)
-	require.NoError(t, follower.Step(Message{
-		Type:    MsgApp,
+	require.NoError(t, follower.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgApp,
 		Term:    1,
 		Commit:  1,
-		Entries: []Entry{{Index: 1, Term: 1, Data: []byte("foo")}},
+		Entries: []*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("foo")}},
 	}))
 
 	require.Equal(t, uint64(1), follower.commitIndex)
@@ -809,8 +817,8 @@ func TestNextIndexBacksUpOnRejection_036n(t *testing.T) {
 	leader.progress = make(map[uint64]*Progress)
 	leader.progress[2] = &Progress{MatchIndex: 2, NextIndex: 4}
 
-	require.NoError(t, leader.Step(Message{
-		Type:   MsgAppResp,
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgAppResp,
 		From:   2,
 		Reject: true,
 	}))

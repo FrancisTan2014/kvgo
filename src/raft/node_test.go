@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"kvgo/raftpb"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,6 +49,9 @@ func TestNodeStepFeedsInboundMessageIntoRaft_036l(t *testing.T) {
 
 	leader := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}})
 	leader.r.state = Leader
+	leader.r.progress = map[uint64]*Progress{
+		2: {MatchIndex: 0, NextIndex: 1},
+	}
 	go leader.run(ctx)
 	require.NoError(t, leader.Propose(ctx, []byte("foo")))
 
@@ -68,7 +73,7 @@ func TestNodeCampaignExposesVoteMessages_036l(t *testing.T) {
 
 	rd := <-n.Ready()
 	require.Len(t, rd.Messages, 1)
-	require.Equal(t, MsgVote, rd.Messages[0].Type)
+	require.Equal(t, raftpb.MessageType_MsgVote, rd.Messages[0].Type)
 	require.Equal(t, uint64(2), rd.Messages[0].To)
 }
 
@@ -85,7 +90,7 @@ func TestNodeReadyCarriesHardStateFromRaft_036m(t *testing.T) {
 	require.NoError(t, n.Campaign(ctx))
 
 	rd := <-n.Ready()
-	require.Equal(t, HardState{Term: 1, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
+	require.Equal(t, &raftpb.HardState{Term: 1, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
 }
 
 func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
@@ -97,11 +102,11 @@ func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
 	n.r.term = 1
 	go n.run(ctx)
 
-	require.NoError(t, n.Step(ctx, Message{Type: MsgApp, From: 2, To: 1, Term: 2}))
+	require.NoError(t, n.Step(ctx, &raftpb.Message{Type: raftpb.MessageType_MsgApp, From: 2, To: 1, Term: 2}))
 
 	select {
 	case rd := <-n.Ready():
-		require.Equal(t, HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, rd.HardState)
+		require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, rd.HardState)
 		require.Len(t, rd.Messages, 0)
 		require.Len(t, rd.Entries, 0)
 		require.Len(t, rd.CommittedEntries, 0)

@@ -1,0 +1,43 @@
+syntax = "proto3";
+package raftpb;
+option go_package = "kvgo/raftpb";
+
+enum MessageType {
+    MsgUnknown  = 0; // proto3 requires a zero value
+    MsgApp      = 1;
+    MsgAppResp  = 2;
+    MsgVote     = 3;
+    MsgVoteResp = 4;
+    MsgSnap     = 5;
+}
+
+message Entry {
+    uint64 Index = 1;
+    uint64 Term  = 2;
+    bytes  Data  = 3;
+}
+
+message SnapshotMeta {
+    uint64 LastIncludedIndex = 1;
+    uint64 LastIncludedTerm  = 2;
+}
+
+message HardState {
+    uint64 Term           = 1;
+    uint64 VotedFor       = 2;
+    uint64 CommittedIndex = 3;
+}
+
+message Message {
+    MessageType    Type       = 1;
+    uint64         From       = 2;
+    uint64         To         = 3;
+    uint64         Index      = 4;
+    uint64         LogTerm    = 5;
+    uint64         Term       = 6;
+    uint64         Commit     = 7;
+    repeated Entry Entries    = 8;
+    bool           Reject     = 9;
+    uint64         RejectHint = 10;
+    SnapshotMeta   Snapshot   = 11;
+}

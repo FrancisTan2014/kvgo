@@ -1,124 +1,97 @@
 package raft
 
-import "encoding/binary"
-
-const SnapshotMetaBytes = 16
-
-type MessageType int32
-
-const (
-	MsgApp      MessageType = 1
-	MsgAppResp  MessageType = 2
-	MsgVote     MessageType = 3
-	MsgVoteResp MessageType = 4
-	MsgSnap     MessageType = 5
+import (
+	"encoding/binary"
+	"kvgo/raftpb"
 )
 
-type Message struct {
-	Type  MessageType
-	From  uint64
-	To    uint64
-	Index uint64
-	// LogTerm is context-dependent.
-	// On MsgVote it carries the candidate's last log term for the election
-	// freshness check. On MsgAppResp it carries the acknowledged entry term so
-	// the leader can identify which append tracker the response belongs to.
-	LogTerm uint64
-	// Term is the sender's current term for authority comparison.
-	Term       uint64
-	Commit     uint64
-	Entries    []Entry
-	Reject     bool
-	RejectHint uint64
-	Snapshot   SnapshotMeta
-}
+const SnapshotMetaBytes = 16
+const HardStateBytes = 24
 
-func (e *Entry) Size() int {
+func entrySize(e *raftpb.Entry) int {
 	return 8 + 8 + len(e.Data)
 }
 
-func (e *Entry) EncodeTo(buf []byte) {
+func encodeEntry(e *raftpb.Entry, buf []byte) {
 	binary.LittleEndian.PutUint64(buf, e.Index)
 	binary.LittleEndian.PutUint64(buf[8:], e.Term)
 	copy(buf[16:], e.Data)
 }
 
-func DecodeEntry(data []byte) (Entry, error) {
+func DecodeEntry(data []byte) (*raftpb.Entry, error) {
 	if len(data) < 16 {
-		return Entry{}, ErrUnexpectedBytes
+		return nil, ErrUnexpectedBytes
 	}
 
-	return Entry{
+	return &raftpb.Entry{
 		Index: binary.LittleEndian.Uint64(data),
 		Term:  binary.LittleEndian.Uint64(data[8:]),
 		Data:  data[16:],
 	}, nil
 }
 
-func (e *HardState) EncodeTo(buf []byte) {
-	binary.LittleEndian.PutUint64(buf[0:], e.Term)
-	binary.LittleEndian.PutUint64(buf[8:], e.VotedFor)
-	binary.LittleEndian.PutUint64(buf[16:], e.CommittedIndex)
+func encodeHardState(h *raftpb.HardState, buf []byte) {
+	binary.LittleEndian.PutUint64(buf[0:], h.Term)
+	binary.LittleEndian.PutUint64(buf[8:], h.VotedFor)
+	binary.LittleEndian.PutUint64(buf[16:], h.CommittedIndex)
 }
 
-func DecodeHardState(data []byte) (HardState, error) {
+func DecodeHardState(data []byte) (*raftpb.HardState, error) {
 	if len(data) != HardStateBytes {
-		return HardState{}, ErrUnexpectedBytes
+		return nil, ErrUnexpectedBytes
 	}
 
-	return HardState{
+	return &raftpb.HardState{
 		Term:           binary.LittleEndian.Uint64(data[0:8]),
 		VotedFor:       binary.LittleEndian.Uint64(data[8:16]),
 		CommittedIndex: binary.LittleEndian.Uint64(data[16:]),
 	}, nil
 }
 
-func (s *SnapshotMeta) EncodeTo(buf []byte) {
+func encodeSnapshotMeta(s *raftpb.SnapshotMeta, buf []byte) {
 	binary.LittleEndian.PutUint64(buf[0:], s.LastIncludedIndex)
 	binary.LittleEndian.PutUint64(buf[8:], s.LastIncludedTerm)
 }
 
-func DecodeSnapshotMeta(data []byte) (SnapshotMeta, error) {
+func DecodeSnapshotMeta(data []byte) (*raftpb.SnapshotMeta, error) {
 	if len(data) != SnapshotMetaBytes {
-		return SnapshotMeta{}, ErrUnexpectedBytes
+		return nil, ErrUnexpectedBytes
 	}
 
-	return SnapshotMeta{
+	return &raftpb.SnapshotMeta{
 		LastIncludedIndex: binary.LittleEndian.Uint64(data[0:8]),
 		LastIncludedTerm:  binary.LittleEndian.Uint64(data[8:16]),
 	}, nil
 }
 
-func encodeSaveBatch(hard HardState, entries []Entry) []byte {
+func encodeSaveBatch(hard *raftpb.HardState, entries []*raftpb.Entry) []byte {
 	entryBytes := 0
 	for _, e := range entries {
-		entryBytes += frameHeaderSize + e.Size()
+		entryBytes += frameHeaderSize + entrySize(e)
 	}
 
 	batchSize := HardStateBytes + frameHeaderSize + entryBytes
 	buf := make([]byte, batchSize)
-	hard.EncodeTo(buf)
+	encodeHardState(hard, buf)
 	binary.LittleEndian.PutUint32(buf[HardStateBytes:], uint32(entryBytes))
 
 	idx := HardStateBytes + frameHeaderSize
 	for _, e := range entries {
-		size := e.Size()
+		size := entrySize(e)
 		binary.LittleEndian.PutUint32(buf[idx:], uint32(size))
 		idx += frameHeaderSize
-		e.EncodeTo(buf[idx:])
+		encodeEntry(e, buf[idx:])
 		idx += size
 	}
 
 	return buf
 }
 
-func decodeSaveBatch(batch []byte) (HardState, []Entry, error) {
-	var hd HardState
-
+func decodeSaveBatch(batch []byte) (*raftpb.HardState, []*raftpb.Entry, error) {
 	if len(batch) < HardStateBytes {
-		return hd, nil, ErrCorruption
+		return nil, nil, ErrCorruption
 	}
-	hd, _ = DecodeHardState(batch[0:HardStateBytes])
+	hd, _ := DecodeHardState(batch[0:HardStateBytes])
 
 	batch = batch[HardStateBytes:]
 	if len(batch) < frameHeaderSize {
@@ -139,8 +112,8 @@ func decodeSaveBatch(batch []byte) (HardState, []Entry, error) {
 	return hd, ents, nil
 }
 
-func decodeEntries(data []byte) ([]Entry, error) {
-	entries := make([]Entry, 0)
+func decodeEntries(data []byte) ([]*raftpb.Entry, error) {
+	entries := make([]*raftpb.Entry, 0)
 	idx := 0
 	for {
 		buf := data[idx:]

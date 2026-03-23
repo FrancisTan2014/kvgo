@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"kvgo/raftpb"
 	"sort"
 )
 
@@ -13,40 +14,13 @@ const (
 	Leader
 )
 
-type Entry struct {
-	Index uint64
-	Term  uint64
-	Data  []byte
-}
-
-type entryID struct {
-	index uint64
-	term  uint64
-}
-
-func (e *Entry) EntryId() entryID {
-	return entryID{index: e.Index, term: e.Term}
-}
-
 var ErrUnexpectedBytes = errors.New("unexpected bytes")
 
-const HardStateBytes = 24
-
-type HardState struct {
-	Term           uint64
-	VotedFor       uint64
-	CommittedIndex uint64
-}
-
-func IsEmptyHardState(hard HardState) bool {
-	return hard == (HardState{})
-}
-
 type Ready struct {
-	Entries          []Entry
-	CommittedEntries []Entry
-	Messages         []Message
-	HardState        HardState
+	Entries          []*raftpb.Entry
+	CommittedEntries []*raftpb.Entry
+	Messages         []*raftpb.Message
+	HardState        *raftpb.HardState
 }
 
 type Progress struct {
@@ -65,7 +39,7 @@ type Raft struct {
 	id           uint64
 	term         uint64
 	state        State
-	log          []Entry
+	log          []*raftpb.Entry
 	commitIndex  uint64
 	appliedIndex uint64
 
@@ -73,7 +47,7 @@ type Raft struct {
 	lastLogIndex uint64
 	stableIndex  uint64
 
-	messages []Message
+	messages []*raftpb.Message
 	progress map[uint64]*Progress
 	peers    []uint64
 	votes    map[uint64]bool
@@ -97,9 +71,9 @@ func newRaft(cfg Config) *Raft {
 	return &Raft{
 		id:       cfg.ID,
 		state:    Follower,
-		log:      make([]Entry, 0),
+		log:      make([]*raftpb.Entry, 0),
 		peers:    peers,
-		messages: make([]Message, 0),
+		messages: make([]*raftpb.Message, 0),
 		storage:  cfg.Storage,
 	}
 }
@@ -110,22 +84,22 @@ func (r *Raft) Propose(data []byte) error {
 	}
 
 	prev := r.lastLog()
-	e := Entry{
+	e := &raftpb.Entry{
 		Index: prev.Index + 1,
 		Term:  r.term,
 		Data:  data,
 	}
-	r.appendEntries([]Entry{e})
+	r.appendEntries([]*raftpb.Entry{e})
 
 	for _, pid := range r.peers {
 		prs, exists := r.progress[pid]
 		if !exists {
 			return errors.New("TODO: will be replace with real coordination code later")
 		}
-		r.messages = append(r.messages, Message{
+		r.messages = append(r.messages, &raftpb.Message{
 			From:    r.id,
 			To:      pid,
-			Type:    MsgApp,
+			Type:    raftpb.MessageType_MsgApp,
 			Term:    r.term,
 			Index:   prev.Index,
 			LogTerm: prev.Term,
@@ -137,12 +111,18 @@ func (r *Raft) Propose(data []byte) error {
 	return nil
 }
 
-func (r *Raft) HardState() HardState {
-	return HardState{
+func (r *Raft) HardState() *raftpb.HardState {
+	return &raftpb.HardState{
 		Term:           r.term,
 		VotedFor:       r.votedFor,
 		CommittedIndex: r.commitIndex,
 	}
+}
+
+// IsEmptyHardState reports whether a HardState is zero-valued.
+// Field-by-field comparison because proto types carry internal state.
+func IsEmptyHardState(hard *raftpb.HardState) bool {
+	return hard == nil || (hard.Term == 0 && hard.VotedFor == 0 && hard.CommittedIndex == 0)
 }
 
 func (r *Raft) Ready() Ready {
@@ -163,7 +143,7 @@ func (r *Raft) HasReady() bool {
 func (r *Raft) Advance() {
 	r.stableIndex = r.lastLogIndex
 	r.appliedIndex = r.commitIndex
-	r.messages = make([]Message, 0)
+	r.messages = make([]*raftpb.Message, 0)
 }
 
 func (r *Raft) CommitTo(index uint64) {
@@ -173,7 +153,7 @@ func (r *Raft) CommitTo(index uint64) {
 	r.commitIndex = index
 }
 
-func (r *Raft) Step(m Message) error {
+func (r *Raft) Step(m *raftpb.Message) error {
 	if m.Term > r.term {
 		r.term = m.Term
 		r.state = Follower
@@ -182,13 +162,13 @@ func (r *Raft) Step(m Message) error {
 	}
 
 	switch m.Type {
-	case MsgApp:
+	case raftpb.MessageType_MsgApp:
 		if r.state != Follower || len(m.Entries) == 0 {
 			return nil
 		}
 
-		resp := Message{
-			Type: MsgAppResp,
+		resp := &raftpb.Message{
+			Type: raftpb.MessageType_MsgAppResp,
 			From: r.id,
 			To:   m.From,
 			Term: r.term,
@@ -211,7 +191,7 @@ func (r *Raft) Step(m Message) error {
 		}
 		r.messages = append(r.messages, resp)
 
-	case MsgAppResp:
+	case raftpb.MessageType_MsgAppResp:
 		if r.state != Leader {
 			return nil
 		}
@@ -225,8 +205,8 @@ func (r *Raft) Step(m Message) error {
 			firstIndex := r.storage.FirstIndex()
 			if firstIndex > 0 && m.RejectHint < firstIndex-1 {
 				if snap, err := r.storage.Snapshot(); err == nil {
-					r.messages = append(r.messages, Message{
-						Type:     MsgSnap,
+					r.messages = append(r.messages, &raftpb.Message{
+						Type:     raftpb.MessageType_MsgSnap,
 						From:     r.id,
 						Term:     r.term,
 						To:       m.From,
@@ -246,23 +226,22 @@ func (r *Raft) Step(m Message) error {
 			r.CommitTo(median)
 		}
 
-	case MsgVote:
+	case raftpb.MessageType_MsgVote:
 		rejected := m.Term < r.term ||
 			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From) ||
 			!r.isCandidateUpToDate(m)
 		if !rejected {
 			r.votedFor = m.From
 		}
-		resp := Message{
-			Type:   MsgVoteResp,
+		r.messages = append(r.messages, &raftpb.Message{
+			Type:   raftpb.MessageType_MsgVoteResp,
 			From:   r.id,
 			To:     m.From,
 			Term:   r.term,
 			Reject: rejected,
-		}
-		r.messages = append(r.messages, resp)
+		})
 
-	case MsgVoteResp:
+	case raftpb.MessageType_MsgVoteResp:
 		if r.state != Candidate {
 			return nil
 		}
@@ -284,7 +263,7 @@ func (r *Raft) Step(m Message) error {
 			}
 		}
 
-	case MsgSnap:
+	case raftpb.MessageType_MsgSnap:
 		if r.state != Follower {
 			return nil
 		}
@@ -332,8 +311,6 @@ func (r *Raft) anchorExists(index uint64, term uint64) bool {
 
 	snap, err := r.storage.Snapshot()
 	if err == nil {
-		// followers should reject anchors before the compaction boundary
-		// because they are no longer verifiable anymore
 		if index == snap.LastIncludedIndex && term == snap.LastIncludedTerm {
 			return true
 		}
@@ -351,10 +328,10 @@ func (r *Raft) anchorExists(index uint64, term uint64) bool {
 	return false
 }
 
-func (r *Raft) lastLog() Entry {
-	lastLog := Entry{}
+func (r *Raft) lastLog() *raftpb.Entry {
+	lastLog := &raftpb.Entry{}
 	if snap, err := r.storage.Snapshot(); err == nil && snap.LastIncludedIndex > 0 {
-		lastLog = Entry{Index: snap.LastIncludedIndex, Term: snap.LastIncludedTerm}
+		lastLog = &raftpb.Entry{Index: snap.LastIncludedIndex, Term: snap.LastIncludedTerm}
 	}
 	size := len(r.log)
 	if size > 0 {
@@ -365,7 +342,7 @@ func (r *Raft) lastLog() Entry {
 	return lastLog
 }
 
-func (r *Raft) entriesBetween(lo, hi uint64) []Entry {
+func (r *Raft) entriesBetween(lo, hi uint64) []*raftpb.Entry {
 	if hi <= lo || len(r.log) == 0 {
 		return nil
 	}
@@ -381,12 +358,19 @@ func (r *Raft) entriesBetween(lo, hi uint64) []Entry {
 
 	start := int(startIndex - first)
 	end := int(hi-first) + 1
-	ents := make([]Entry, end-start)
-	copy(ents, r.log[start:end])
+	ents := make([]*raftpb.Entry, end-start)
+	for i, e := range r.log[start:end] {
+		var data []byte
+		if e.Data != nil {
+			data = make([]byte, len(e.Data))
+			copy(data, e.Data)
+		}
+		ents[i] = &raftpb.Entry{Index: e.Index, Term: e.Term, Data: data}
+	}
 	return ents
 }
 
-func (r *Raft) isCandidateUpToDate(candidate Message) bool {
+func (r *Raft) isCandidateUpToDate(candidate *raftpb.Message) bool {
 	lastLog := r.lastLog()
 	if candidate.LogTerm != lastLog.Term {
 		return candidate.LogTerm > lastLog.Term
@@ -406,7 +390,7 @@ func (r *Raft) voteQuorumReached() bool {
 	return cnt >= quorum
 }
 
-func (r *Raft) appendEntries(entries []Entry) {
+func (r *Raft) appendEntries(entries []*raftpb.Entry) {
 	if len(entries) == 0 {
 		return
 	}
@@ -430,8 +414,8 @@ func (r *Raft) Campaign() error {
 	lastLog := r.lastLog()
 	for _, pid := range r.peers {
 		r.votes[pid] = false
-		r.messages = append(r.messages, Message{
-			Type:    MsgVote,
+		r.messages = append(r.messages, &raftpb.Message{
+			Type:    raftpb.MessageType_MsgVote,
 			From:    r.id,
 			To:      pid,
 			Term:    r.term,

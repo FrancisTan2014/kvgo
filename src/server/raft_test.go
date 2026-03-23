@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"kvgo/raft"
+	"kvgo/raftpb"
 	"testing"
 	"time"
 
@@ -213,7 +214,7 @@ func TestHostSendsReadyMessagesByRaftID_036m(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	transport := &mockRaftTransport{sent: make(chan raft.Message, 1)}
+	transport := &mockRaftTransport{sent: make(chan *raftpb.Message, 1)}
 	cfg := newRaftHostConfig()
 	cfg.Transport = transport
 
@@ -228,9 +229,9 @@ func TestHostSendsReadyMessagesByRaftID_036m(t *testing.T) {
 	host.Start()
 	defer host.Stop()
 
-	msg := raft.Message{To: 2}
+	msg := &raftpb.Message{To: 2}
 	fakeNode.c <- raft.Ready{
-		Messages: []raft.Message{msg},
+		Messages: []*raftpb.Message{msg},
 	}
 
 	select {
@@ -255,10 +256,10 @@ func TestHostStepFeedsInboundRaftMessageIntoNode_036m(t *testing.T) {
 	host, err := newRaftHost(ctx, rc)
 	require.NoError(t, err)
 
-	msg := raft.Message{To: 2}
+	msg := &raftpb.Message{To: 2}
 	require.NoError(t, host.Step(ctx, msg))
 	require.NotNil(t, fakeNode.steppedMsg)
-	require.Equal(t, msg, *fakeNode.steppedMsg)
+	require.Equal(t, msg, fakeNode.steppedMsg)
 }
 
 func TestHostCampaignFeedsNodeCampaign_036m(t *testing.T) {
@@ -283,12 +284,12 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 	defer cancel()
 
 	events := make(chan string, 3)
-	transport := &mockRaftTransport{sent: make(chan raft.Message, 1), events: events}
+	transport := &mockRaftTransport{sent: make(chan *raftpb.Message, 1), events: events}
 	cfg := newRaftHostConfig()
 	cfg.Transport = transport
 
 	fakeNode := &fakeNode{c: make(chan raft.Ready, 1), advancedCh: make(chan struct{}, 1), events: events}
-	fakeStorage := &mockStorage{savedCh: make(chan []raft.Entry, 1), events: events}
+	fakeStorage := &mockStorage{savedCh: make(chan []*raftpb.Entry, 1), events: events}
 	cfg.Storage = fakeStorage
 
 	rc := raftHostConfig{
@@ -301,13 +302,13 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 	host.Start()
 	defer host.Stop()
 
-	msg := raft.Message{To: 2}
-	commitEnt := raft.Entry{Index: 1, Term: 1, Data: []byte("foo")}
-	ent := raft.Entry{Index: 2, Term: 1, Data: []byte("bar")}
+	msg := &raftpb.Message{To: 2}
+	commitEnt := &raftpb.Entry{Index: 1, Term: 1, Data: []byte("foo")}
+	ent := &raftpb.Entry{Index: 2, Term: 1, Data: []byte("bar")}
 	fakeNode.c <- raft.Ready{
-		Messages:         []raft.Message{msg},
-		Entries:          []raft.Entry{ent},
-		CommittedEntries: []raft.Entry{commitEnt},
+		Messages:         []*raftpb.Message{msg},
+		Entries:          []*raftpb.Entry{ent},
+		CommittedEntries: []*raftpb.Entry{commitEnt},
 	}
 
 	select {
@@ -319,7 +320,7 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 
 	select {
 	case saved := <-fakeStorage.savedCh:
-		require.Equal(t, []raft.Entry{ent}, saved)
+		require.Equal(t, []*raftpb.Entry{ent}, saved)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("timeout waiting for raft storage save")
 	}
@@ -352,7 +353,7 @@ func TestHostPersistsHardStateOnlyBatch_036m(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fakeStorage := &mockStorage{savedCh: make(chan []raft.Entry, 1)}
+	fakeStorage := &mockStorage{savedCh: make(chan []*raftpb.Entry, 1)}
 	fakeNode := &fakeNode{c: make(chan raft.Ready, 1), advancedCh: make(chan struct{}, 1)}
 	cfg := newRaftHostConfig()
 	cfg.Storage = fakeStorage
@@ -366,7 +367,7 @@ func TestHostPersistsHardStateOnlyBatch_036m(t *testing.T) {
 	host.Start()
 	defer host.Stop()
 
-	hard := raft.HardState{Term: 2, VotedFor: 1, CommittedIndex: 3}
+	hard := &raftpb.HardState{Term: 2, VotedFor: 1, CommittedIndex: 3}
 	fakeNode.c <- raft.Ready{HardState: hard}
 
 	select {
@@ -402,7 +403,7 @@ func TestHostReportsBatchFailureAndStops_036m(t *testing.T) {
 	require.NoError(t, err)
 	host.Start()
 
-	fakeNode.c <- raft.Ready{Entries: []raft.Entry{{Index: 1, Term: 1}}, HardState: raft.HardState{Term: 1}}
+	fakeNode.c <- raft.Ready{Entries: []*raftpb.Entry{{Index: 1, Term: 1}}, HardState: &raftpb.HardState{Term: 1}}
 
 	select {
 	case err := <-host.Errors():

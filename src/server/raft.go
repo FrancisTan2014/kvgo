@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"kvgo/raft"
+	"kvgo/raftpb"
 	"sync"
 	"sync/atomic"
 )
@@ -13,7 +14,7 @@ type Peer struct {
 }
 
 type RaftTransporter interface {
-	Send(msgs []raft.Message)
+	Send(msgs []*raftpb.Message)
 }
 
 type RaftHostConfig struct {
@@ -34,7 +35,7 @@ type toApply struct {
 
 type RaftHost interface {
 	Propose(ctx context.Context, data []byte) error
-	Step(ctx context.Context, m raft.Message) error
+	Step(ctx context.Context, m *raftpb.Message) error
 	Campaign(ctx context.Context) error
 	Apply() <-chan toApply
 
@@ -209,7 +210,7 @@ func (r *raftHost) Propose(ctx context.Context, data []byte) error {
 	return r.n.Propose(ctx, data)
 }
 
-func (r *raftHost) Step(ctx context.Context, m raft.Message) error {
+func (r *raftHost) Step(ctx context.Context, m *raftpb.Message) error {
 	return r.n.Step(ctx, m)
 }
 

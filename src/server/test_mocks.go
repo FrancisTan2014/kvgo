@@ -9,6 +9,7 @@ import (
 
 	"kvgo/protocol"
 	"kvgo/raft"
+	"kvgo/raftpb"
 )
 
 // mockStreamTransport for testing - captures writes and provides configurable behavior
@@ -120,27 +121,27 @@ func (f *fakeStreamTransport) RemoteAddr() string                             { 
 
 type mockStorage struct {
 	firstIndex uint64
-	snap       raft.SnapshotMeta
-	applied    []raft.SnapshotMeta
-	saved      []raft.Entry
-	savedHard  raft.HardState
+	snap       *raftpb.SnapshotMeta
+	applied    []*raftpb.SnapshotMeta
+	saved      []*raftpb.Entry
+	savedHard  *raftpb.HardState
 	saveErr    error
-	savedCh    chan []raft.Entry
+	savedCh    chan []*raftpb.Entry
 	events     chan string
 }
 
-func (m *mockStorage) InitialState() (raft.HardState, error) {
-	return raft.HardState{}, nil
+func (m *mockStorage) InitialState() (*raftpb.HardState, error) {
+	return &raftpb.HardState{}, nil
 }
 
-func (m *mockStorage) Save(entries []raft.Entry, hard raft.HardState) error {
+func (m *mockStorage) Save(entries []*raftpb.Entry, hard *raftpb.HardState) error {
 	if m.saveErr != nil {
 		return m.saveErr
 	}
 	m.saved = entries
 	m.savedHard = hard
 	if m.savedCh != nil {
-		saved := append([]raft.Entry(nil), entries...)
+		saved := append([]*raftpb.Entry(nil), entries...)
 		m.savedCh <- saved
 	}
 	if m.events != nil {
@@ -149,7 +150,7 @@ func (m *mockStorage) Save(entries []raft.Entry, hard raft.HardState) error {
 	return nil
 }
 
-func (m *mockStorage) Entries(lo, hi uint64) ([]raft.Entry, error) {
+func (m *mockStorage) Entries(lo, hi uint64) ([]*raftpb.Entry, error) {
 	return nil, nil
 }
 
@@ -158,7 +159,7 @@ func (m *mockStorage) FirstIndex() uint64 {
 }
 
 func (m *mockStorage) LastIndex() uint64 {
-	if m.snap.LastIncludedIndex > 0 {
+	if m.snap != nil && m.snap.LastIncludedIndex > 0 {
 		return m.snap.LastIncludedIndex
 	}
 	if m.firstIndex > 0 {
@@ -175,22 +176,25 @@ func (m *mockStorage) Close() error {
 	return nil
 }
 
-func (m *mockStorage) Snapshot() (raft.SnapshotMeta, error) {
+func (m *mockStorage) Snapshot() (*raftpb.SnapshotMeta, error) {
+	if m.snap == nil {
+		return &raftpb.SnapshotMeta{}, nil
+	}
 	return m.snap, nil
 }
 
-func (m *mockStorage) ApplySnapshot(snap raft.SnapshotMeta) error {
+func (m *mockStorage) ApplySnapshot(snap *raftpb.SnapshotMeta) error {
 	m.snap = snap
 	m.applied = append(m.applied, snap)
 	return nil
 }
 
 type mockRaftTransport struct {
-	sent   chan raft.Message
+	sent   chan *raftpb.Message
 	events chan string
 }
 
-func (t *mockRaftTransport) Send(msgs []raft.Message) {
+func (t *mockRaftTransport) Send(msgs []*raftpb.Message) {
 	for _, m := range msgs {
 		if t.sent != nil {
 			t.sent <- m
@@ -205,7 +209,7 @@ type fakeNode struct {
 	c           chan raft.Ready
 	proposed    []byte
 	proposeErr  error
-	steppedMsg  *raft.Message
+	steppedMsg  *raftpb.Message
 	stepErr     error
 	campaigned  bool
 	campaignErr error
@@ -223,8 +227,8 @@ func (n *fakeNode) Propose(ctx context.Context, data []byte) error {
 	return n.proposeErr
 }
 
-func (n *fakeNode) Step(ctx context.Context, m raft.Message) error {
-	n.steppedMsg = &m
+func (n *fakeNode) Step(ctx context.Context, m *raftpb.Message) error {
+	n.steppedMsg = m
 	return n.stepErr
 }
 
@@ -295,7 +299,7 @@ func (r *fakeRaftHost) Propose(ctx context.Context, data []byte) error {
 	return nil
 }
 
-func (r *fakeRaftHost) Step(ctx context.Context, m raft.Message) error {
+func (r *fakeRaftHost) Step(ctx context.Context, m *raftpb.Message) error {
 	return nil
 }
 
