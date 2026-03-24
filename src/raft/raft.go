@@ -1,9 +1,17 @@
 package raft
 
 import (
+	"crypto/rand"
 	"errors"
 	"kvgo/raftpb"
+	"log/slog"
+	"math/big"
 	"sort"
+	"sync"
+)
+
+const (
+	None uint64 = 0
 )
 
 type State uint8
@@ -54,61 +62,75 @@ type Raft struct {
 	votedFor uint64
 
 	storage Storage
+
+	lead                      uint64
+	heartbeatTimeout          int
+	electionTimeout           int
+	electionElapsed           int
+	heartbeatElapsed          int
+	randomizedElectionTimeout int
+	randMu                    sync.Mutex
+
+	tick func()
+	step stepFunc
+
+	logger *slog.Logger
 }
 
-func NewRaft(id uint64, storage Storage) *Raft {
-	return newRaft(Config{ID: id, Storage: storage})
+func validate(c *Config) error {
+	if c.HeartbeatTick <= 0 {
+		return errors.New("heartbeat tick must be greater than 0")
+	}
+
+	if c.ElectionTick <= c.HeartbeatTick {
+		return errors.New("election tick must be greater than heartbeat tick")
+	}
+
+	if c.Storage == nil {
+		return errors.New("storage cannot be nil")
+	}
+
+	return nil
 }
 
 func newRaft(cfg Config) *Raft {
-	if cfg.Storage == nil {
-		panic("raft: nil storage")
+	if err := validate(&cfg); err != nil {
+		panic(err.Error())
 	}
 
 	peers := make([]uint64, len(cfg.Peers))
 	copy(peers, cfg.Peers)
 
-	return &Raft{
-		id:       cfg.ID,
-		state:    Follower,
-		log:      make([]*raftpb.Entry, 0),
-		peers:    peers,
-		messages: make([]*raftpb.Message, 0),
-		storage:  cfg.Storage,
+	r := &Raft{
+		id:               cfg.ID,
+		log:              make([]*raftpb.Entry, 0),
+		peers:            peers,
+		messages:         make([]*raftpb.Message, 0),
+		storage:          cfg.Storage,
+		heartbeatTimeout: cfg.HeartbeatTick,
+		electionTimeout:  cfg.ElectionTick,
+		logger:           cfg.Logger,
 	}
+
+	hs, err := cfg.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+	if !IsEmptyHardState(hs) {
+		r.term = hs.Term
+		r.votedFor = hs.VotedFor
+		r.commitIndex = hs.CommittedIndex
+	}
+
+	r.becomeFollower(r.term, None)
+	return r
 }
 
 func (r *Raft) Propose(data []byte) error {
-	if r.state != Leader {
-		return nil
-	}
-
-	prev := r.lastLog()
-	e := &raftpb.Entry{
-		Index: prev.Index + 1,
-		Term:  r.term,
-		Data:  data,
-	}
-	r.appendEntries([]*raftpb.Entry{e})
-
-	for _, pid := range r.peers {
-		prs, exists := r.progress[pid]
-		if !exists {
-			return errors.New("TODO: will be replace with real coordination code later")
-		}
-		r.messages = append(r.messages, &raftpb.Message{
-			From:    r.id,
-			To:      pid,
-			Type:    raftpb.MessageType_MsgApp,
-			Term:    r.term,
-			Index:   prev.Index,
-			LogTerm: prev.Term,
-			Commit:  r.commitIndex,
-			Entries: r.entriesBetween(prs.NextIndex-1, r.lastLogIndex),
-		})
-	}
-
-	return nil
+	return r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgProp,
+		Entries: []*raftpb.Entry{{Data: data}},
+	})
 }
 
 func (r *Raft) HardState() *raftpb.HardState {
@@ -146,6 +168,10 @@ func (r *Raft) Advance() {
 	r.messages = make([]*raftpb.Message, 0)
 }
 
+func (r *Raft) Tick() {
+	r.tick()
+}
+
 func (r *Raft) CommitTo(index uint64) {
 	if index < r.commitIndex || index > r.lastLogIndex {
 		return
@@ -155,47 +181,58 @@ func (r *Raft) CommitTo(index uint64) {
 
 func (r *Raft) Step(m *raftpb.Message) error {
 	if m.Term > r.term {
-		r.term = m.Term
-		r.state = Follower
-		r.votedFor = 0
-		r.votes = nil
+		// TODO: branch on m.Term vs r.term like etcd (greater, equal, lesser)
+		r.becomeFollower(m.Term, m.From)
 	}
 
 	switch m.Type {
-	case raftpb.MessageType_MsgApp:
-		if r.state != Follower || len(m.Entries) == 0 {
+	case raftpb.MessageType_MsgVote:
+		rejected := m.Term < r.term ||
+			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From) ||
+			!r.isCandidateUpToDate(m)
+		if !rejected {
+			r.votedFor = m.From
+		}
+		r.messages = append(r.messages, &raftpb.Message{
+			Type:   raftpb.MessageType_MsgVoteResp,
+			From:   r.id,
+			To:     m.From,
+			Term:   r.term,
+			Reject: rejected,
+		})
+
+	case raftpb.MessageType_MsgHup:
+		if r.state == Leader {
+			r.logger.Debug("ignoring MsgHup because already leader", "ID", r.id)
 			return nil
 		}
 
-		resp := &raftpb.Message{
-			Type: raftpb.MessageType_MsgAppResp,
-			From: r.id,
-			To:   m.From,
-			Term: r.term,
-		}
-		if r.anchorExists(m.Index, m.LogTerm) {
-			r.appendEntries(m.Entries)
-			last := m.Entries[len(m.Entries)-1]
-			resp.Index = last.Index
-			resp.LogTerm = last.Term
+		r.becomeCandidate()
 
-			if m.Commit > r.commitIndex {
-				r.CommitTo(m.Commit)
-			}
-		} else {
-			resp.Reject = true
-			resp.Index = m.Index
-			if snap, err := r.storage.Snapshot(); err == nil {
-				resp.RejectHint = snap.LastIncludedIndex
-			}
+		lastLog := r.lastLog()
+		for _, pid := range r.peers {
+			r.messages = append(r.messages, &raftpb.Message{
+				Type:    raftpb.MessageType_MsgVote,
+				From:    r.id,
+				To:      pid,
+				Term:    r.term,
+				Index:   lastLog.Index,
+				LogTerm: lastLog.Term,
+			})
 		}
-		r.messages = append(r.messages, resp)
 
+	default:
+		return r.step(r, m)
+	}
+
+	return nil
+}
+
+type stepFunc func(r *Raft, m *raftpb.Message) error
+
+func stepLeader(r *Raft, m *raftpb.Message) error {
+	switch m.Type {
 	case raftpb.MessageType_MsgAppResp:
-		if r.state != Leader {
-			return nil
-		}
-
 		prs, exists := r.progress[m.From]
 		if !exists {
 			return errors.New("TODO: will be replace with real coordination code later")
@@ -226,25 +263,53 @@ func (r *Raft) Step(m *raftpb.Message) error {
 			r.CommitTo(median)
 		}
 
-	case raftpb.MessageType_MsgVote:
-		rejected := m.Term < r.term ||
-			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From) ||
-			!r.isCandidateUpToDate(m)
-		if !rejected {
-			r.votedFor = m.From
+	case raftpb.MessageType_MsgProp:
+		prev := r.lastLog()
+		e := &raftpb.Entry{
+			Index: prev.Index + 1,
+			Term:  r.term,
+			Data:  m.Entries[0].Data,
 		}
-		r.messages = append(r.messages, &raftpb.Message{
-			Type:   raftpb.MessageType_MsgVoteResp,
-			From:   r.id,
-			To:     m.From,
-			Term:   r.term,
-			Reject: rejected,
-		})
+		r.appendEntries([]*raftpb.Entry{e})
 
-	case raftpb.MessageType_MsgVoteResp:
-		if r.state != Candidate {
-			return nil
+		for _, pid := range r.peers {
+			prs, exists := r.progress[pid]
+			if !exists {
+				return errors.New("TODO: will be replace with real coordination code later")
+			}
+			r.messages = append(r.messages, &raftpb.Message{
+				From:    r.id,
+				To:      pid,
+				Type:    raftpb.MessageType_MsgApp,
+				Term:    r.term,
+				Index:   prev.Index,
+				LogTerm: prev.Term,
+				Commit:  r.commitIndex,
+				Entries: r.entriesBetween(prs.NextIndex-1, r.lastLogIndex),
+			})
 		}
+
+	case raftpb.MessageType_MsgBeat:
+		for _, pid := range r.peers {
+			r.messages = append(r.messages, &raftpb.Message{
+				From:   r.id,
+				To:     pid,
+				Type:   raftpb.MessageType_MsgApp,
+				Term:   r.term,
+				Commit: r.commitIndex,
+			})
+		}
+
+	default:
+		// TODO: deal with the remaining message types
+	}
+
+	return nil
+}
+
+func stepCandidate(r *Raft, m *raftpb.Message) error {
+	switch m.Type {
+	case raftpb.MessageType_MsgVoteResp:
 		if m.Term < r.term {
 			return nil
 		}
@@ -253,21 +318,51 @@ func (r *Raft) Step(m *raftpb.Message) error {
 		}
 		r.votes[m.From] = !m.Reject
 		if r.voteQuorumReached() {
-			r.state = Leader
-			r.progress = make(map[uint64]*Progress, len(r.peers))
-			for _, pid := range r.peers {
-				r.progress[pid] = &Progress{
-					MatchIndex: 0,
-					NextIndex:  r.lastLogIndex + 1,
-				}
-			}
+			r.becomeLeader()
 		}
 
-	case raftpb.MessageType_MsgSnap:
-		if r.state != Follower {
+	default:
+		// TODO: deal with the remaining message types
+	}
+
+	return nil
+}
+
+func stepFollower(r *Raft, m *raftpb.Message) error {
+	switch m.Type {
+	case raftpb.MessageType_MsgApp:
+		r.electionElapsed = 0
+		r.lead = m.From
+
+		if len(m.Entries) == 0 {
 			return nil
 		}
 
+		resp := &raftpb.Message{
+			Type: raftpb.MessageType_MsgAppResp,
+			From: r.id,
+			To:   m.From,
+			Term: r.term,
+		}
+		if r.anchorExists(m.Index, m.LogTerm) {
+			r.appendEntries(m.Entries)
+			last := m.Entries[len(m.Entries)-1]
+			resp.Index = last.Index
+			resp.LogTerm = last.Term
+
+			if m.Commit > r.commitIndex {
+				r.CommitTo(m.Commit)
+			}
+		} else {
+			resp.Reject = true
+			resp.Index = m.Index
+			if snap, err := r.storage.Snapshot(); err == nil {
+				resp.RejectHint = snap.LastIncludedIndex
+			}
+		}
+		r.messages = append(r.messages, resp)
+
+	case raftpb.MessageType_MsgSnap:
 		if err := r.storage.ApplySnapshot(m.Snapshot); err != nil {
 			// TODO: log the failure
 			return nil
@@ -288,9 +383,102 @@ func (r *Raft) Step(m *raftpb.Message) error {
 		if r.appliedIndex < m.Snapshot.LastIncludedIndex {
 			r.appliedIndex = m.Snapshot.LastIncludedIndex
 		}
+
+	default:
+		// TODO: deal with the remaining message types
 	}
 
 	return nil
+}
+
+func (r *Raft) intN(n int) int {
+	r.randMu.Lock()
+	v, _ := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	r.randMu.Unlock()
+	return int(v.Int64())
+}
+
+func (r *Raft) resetRandomizedElectionTimeout() {
+	r.randomizedElectionTimeout = r.electionTimeout + r.intN(r.electionTimeout)
+}
+
+// pastElectionTimeout returns true if r.electionElapsed is greater
+// than or equal to the randomized election timeout in
+// [electiontimeout, 2 * electiontimeout - 1].
+func (r *Raft) pastElectionTimeout() bool {
+	return r.electionElapsed >= r.randomizedElectionTimeout
+}
+
+func (r *Raft) tickElection() {
+	r.electionElapsed++
+
+	if r.pastElectionTimeout() {
+		r.electionElapsed = 0
+		if err := r.Step(&raftpb.Message{From: r.id, Type: raftpb.MessageType_MsgHup}); err != nil {
+			r.logger.Debug("error occurred during election", "error", err)
+		}
+	}
+}
+
+func (r *Raft) tickHeartbeat() {
+	r.heartbeatElapsed++
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+		if err := r.Step(&raftpb.Message{From: r.id, Type: raftpb.MessageType_MsgBeat}); err != nil {
+			r.logger.Debug("error occurred during checking sending heartbeat", "error", err)
+		}
+	}
+}
+
+func (r *Raft) becomeLeader() {
+	r.state = Leader
+	r.step = stepLeader
+	r.tick = r.tickHeartbeat
+	r.reset(r.term)
+	r.lead = r.id
+
+	r.progress = make(map[uint64]*Progress, len(r.peers))
+	for _, pid := range r.peers {
+		r.progress[pid] = &Progress{
+			MatchIndex: 0,
+			NextIndex:  r.lastLogIndex + 1,
+		}
+	}
+}
+
+func (r *Raft) becomeCandidate() {
+	r.state = Candidate
+	r.step = stepCandidate
+	r.tick = r.tickElection
+	r.reset(r.term + 1)
+	r.votedFor = r.id
+	r.votes[r.id] = true
+	for _, pid := range r.peers {
+		r.votes[pid] = false
+	}
+}
+
+func (r *Raft) becomeFollower(term uint64, lead uint64) {
+	r.state = Follower
+	r.reset(term)
+	r.lead = lead
+	r.step = stepFollower
+	r.tick = r.tickElection
+}
+
+func (r *Raft) reset(term uint64) {
+	if r.term != term {
+		r.term = term
+		r.votedFor = None
+	}
+	r.lead = None
+
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomizedElectionTimeout()
+
+	r.votes = make(map[uint64]bool)
+	r.progress = nil
 }
 
 func (r *Raft) getMedian() uint64 {
@@ -400,29 +588,7 @@ func (r *Raft) appendEntries(entries []*raftpb.Entry) {
 }
 
 func (r *Raft) Campaign() error {
-	if r.state == Leader {
-		return nil
-	}
-
-	r.term++
-	r.state = Candidate
-	r.votedFor = r.id
-
-	r.votes = make(map[uint64]bool)
-	r.votes[r.id] = true
-
-	lastLog := r.lastLog()
-	for _, pid := range r.peers {
-		r.votes[pid] = false
-		r.messages = append(r.messages, &raftpb.Message{
-			Type:    raftpb.MessageType_MsgVote,
-			From:    r.id,
-			To:      pid,
-			Term:    r.term,
-			Index:   lastLog.Index,
-			LogTerm: lastLog.Term,
-		})
-	}
-
-	return nil
+	return r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgHup,
+	})
 }

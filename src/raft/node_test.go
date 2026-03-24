@@ -11,13 +11,13 @@ import (
 )
 
 func newStartedNode(ctx context.Context, id uint64, peers ...uint64) Node {
-	return NewNode(ctx, Config{ID: id, Peers: peers, Storage: &mockStorage{}})
+	return NewNode(ctx, Config{ID: id, Peers: peers, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
 }
 
 func TestConsumeEntryAfterPropose_036b(t *testing.T) {
 	ctx := context.Background()
-	n := setupNode(Config{ID: 1, Storage: &mockStorage{}})
-	n.r.state = Leader
+	n := setupNode(Config{ID: 1, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	n.r.becomeLeader()
 	go n.run(ctx)
 
 	require.NoError(t, n.Propose(ctx, []byte("foo")))
@@ -27,8 +27,8 @@ func TestConsumeEntryAfterPropose_036b(t *testing.T) {
 
 func TestAdvanceMovesForward_036b(t *testing.T) {
 	ctx := context.Background()
-	n := setupNode(Config{ID: 1, Storage: &mockStorage{}})
-	n.r.state = Leader
+	n := setupNode(Config{ID: 1, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	n.r.becomeLeader()
 	go n.run(ctx)
 
 	require.NoError(t, n.Propose(ctx, []byte("foo")))
@@ -47,11 +47,8 @@ func TestNodeStepFeedsInboundMessageIntoRaft_036l(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	leader := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}})
-	leader.r.state = Leader
-	leader.r.progress = map[uint64]*Progress{
-		2: {MatchIndex: 0, NextIndex: 1},
-	}
+	leader := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	leader.r.becomeLeader()
 	go leader.run(ctx)
 	require.NoError(t, leader.Propose(ctx, []byte("foo")))
 
@@ -78,7 +75,7 @@ func TestNodeCampaignExposesVoteMessages_036l(t *testing.T) {
 }
 
 func TestNodeConfigOwnsInitialMembership_036l(t *testing.T) {
-	n := setupNode(Config{ID: 1, Peers: []uint64{2, 3}, Storage: &mockStorage{}})
+	n := setupNode(Config{ID: 1, Peers: []uint64{2, 3}, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
 	require.Equal(t, []uint64{2, 3}, n.r.peers)
 }
 
@@ -97,8 +94,8 @@ func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	n := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}})
-	n.r.state = Leader
+	n := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	n.r.becomeLeader()
 	n.r.term = 1
 	go n.run(ctx)
 

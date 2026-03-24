@@ -129,6 +129,13 @@ Each word is shown through visible dimensions for word choice:
 - **where it breaks:** do not use it just to mean `harmless`; it specifically means repeated application does not create an additional effect beyond the first one
 - **example:** Setting the same ack flag to `true` twice is idempotent because the tracker state does not change after the first update.
 
+## inert
+- **meaning:** present but producing no action or effect on its own
+- **pressure:** use it when something exists structurally but does nothing until an external force activates it
+- **tone:** precise, slightly clinical, borrowed from chemistry
+- **nearby alternatives:** `passive` implies waiting by choice; `dormant` implies it will wake; `dead` implies it cannot work; `inert` says the thing itself lacks the mechanism to act
+- **where it breaks:** do not use it for things that are merely idle or paused; an inert thing has no internal drive, not just no current task
+
 ## intact
 - **meaning:** whole, undamaged, with nothing missing
 - **pressure:** use it when the point is that something survived a process — transfer, serialization, crash — without losing or changing any part

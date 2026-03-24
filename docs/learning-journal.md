@@ -524,3 +524,78 @@ Drawing the `Raft.Process` interface for the transport layer. A message crosses 
 ### Interview angle
 
 I used to ask candidates "how do you choose interface vs. concrete type?" and got back surface-level answers — runtime dispatch, no inlining, harder to navigate. True but cosmetic. The better question is "what do you trade away by introducing one?" That forces magnitude reasoning: the answer is "it depends on what's on the other side of the call." A person who can articulate the two regimes — boundary vs. hot path — has a cost model, not a feature list. The same filter generalises: "when would you *not* use a channel?", "when is copying cheaper than sharing a pointer?" Any question where the honest answer is "it depends on the ratio" separates trade-off thinkers from best-practice reciters.
+
+## 2026-03-24 — Wall Clocks vs. Logical Clocks
+
+### The problem
+
+036t hit a blocker: the Raft algorithm has no clock. `Campaign()` exists but nothing calls it. Followers wait forever. The paper says "start an election if no heartbeat within the election timeout" (§5.2). But it specifies *real-time durations* — it doesn't say how to track them.
+
+The naive implementation uses wall-clock timers: `time.After(150 * time.Millisecond)`. The timer fires when the OS says enough real time passed. This works but contaminates the algorithm — now the state machine has goroutines, real clocks, and non-deterministic timing baked into its core. Testing an election means actually waiting, or mocking `time`. Flaky tests follow.
+
+### The insight
+
+etcd replaces wall clocks with a **logical clock**: a counter that advances only when the application explicitly increments it. `Tick()` is the increment. The algorithm doesn't know or care whether 1ms or 1 hour passed between ticks. It just sees "10 ticks happened, time to campaign."
+
+This is the same idea behind Lamport clocks and vector clocks — decouple *causality* from *real time*. In Lamport's formulation, the clock increments on events (sends, receives). In etcd's Raft, the clock increments on ticks (a periodic event the application provides). The principle is identical: the system reasons about *how many things happened*, not *how much time passed*.
+
+### Two regimes
+
+- **Wall clock**: `time.After`, `time.NewTicker`. The timer fires based on real elapsed time. Non-deterministic. Hard to test. Depends on OS scheduling.
+- **Logical clock**: a counter, incremented by the caller. Deterministic. Testable — call `Tick()` 10 times in a loop, the test runs in microseconds. No goroutines, no sleeps, no race conditions.
+
+### Why it matters
+
+The Raft paper specifies safety properties. The tick is an *implementation* choice that preserves those properties while making the algorithm a pure state machine. The paper says *what* must happen; the logical clock decides *how* to track when.
+
+### Interview angle
+
+"Your consensus algorithm needs an election timeout. How do you implement it?" The surface answer is `time.After`. The deeper answer recognizes the tradeoff: a wall-clock timer couples the algorithm to real time and makes it non-deterministic. A logical clock keeps the algorithm pure and testable, at the cost of requiring the application to drive the clock from outside. The person who sees this is thinking about *testability as a design constraint*, not just correctness.
+
+---
+
+## 2026-03-24 — Why the Event Loop Is Not a Style Choice
+
+### The observation
+
+Through the entire 036 series, the `run()` goroutine has been the center of the Raft Node. 036b built it, 036f routed `Step` through it, 036t routes `Tick` through it. But the *reason* it's there was never stated as a principle. It felt like an etcd pattern we adopted. It's not. It's a consequence.
+
+### The deciding question: shared state or independent state?
+
+A single event loop fits when the core state is **shared** — every event can read and write any part of it. Raft state is like this: one `Step()` can read the log, update the term, change the role, and emit messages in a single pass. The browser DOM is the same: a layout change can cascade through the entire tree. Redis is the same: any command can touch any key.
+
+When every event potentially touches everything, a mutex collapses to one big lock held for the entire operation — which is just a single thread with extra overhead and extra risk (deadlocks, lock ordering). The event loop skips that overhead entirely.
+
+The pattern does **not** fit when events touch **independent** state. A web server handling requests for different users. A sharded database with per-range ownership. Here, a single loop would be artificial serialization — throwing away parallelism for no benefit. Use concurrent workers, each owning its partition.
+
+### The practical signal
+
+Two things to check. First: is the work inside the loop CPU-bound? If yes, can you extract it? Raft's `Step()` does field updates and appends — microseconds. The heavy work (disk fsync, network send) happens outside via `Ready`. If you can't extract the CPU-bound part, a single loop becomes a bottleneck and the pattern breaks. Second: when you reach for a mutex and it starts feeling heavy — lock ordering across boundaries, defer chains getting fragile, tests needing careful sequencing — that's the smell. The mutex is telling you it wants to be a goroutine with a channel. Listen to it.
+
+### The chain
+
+1. **The raft struct is a pure state machine.** No goroutines, no timers, no locks, no I/O. Fields and functions. That purity is what makes consensus logic testable as deterministic transitions — the claim from 036b.
+
+2. **A pure state machine with shared state can't protect itself from concurrent access.** Two goroutines calling `Step()` at the same time corrupt state. A mutex would work but contaminates the purity — tests must reason about lock ordering, and deadlocks become possible across the Ready/Advance/Step boundary.
+
+3. **So exactly one goroutine must own the struct.** That's `run()`. It's not a design preference; it's the only option that preserves the purity claim from step 1.
+
+4. **External callers use channels to serialize into that goroutine.** `propc`, `stepc`, `campaignc`, and now `tickc`. The channel *is* the mutex — but without lock ordering, without deadlocks, and with the bonus that `select` gives you fair multiplexing across all event sources for free.
+
+### The tradeoff
+
+If the loop is busy, everything waits. Ticks queue up. Proposals block. That's real cost — but only when the work *inside* the loop is heavy. The event loop is fast precisely because the core is pure: `Step()` is microseconds of field updates and pointer chasing. Heavy work (disk fsync, network send) happens *outside* the loop via `Ready`. The loop processes events faster than they arrive — that's the steady state.
+
+Raft tolerates the remaining latency by design: randomized timeouts absorb timing jitter, retransmission handles lost messages, idempotent operations handle duplicates. A slow loop shifts timing; it doesn't break correctness.
+
+### Why it took this long to see
+
+036b built the event loop and stated the fact: "single-thread event loop, all mutations inside it." But it didn't state the derivation — *why* a single thread, *why* channels, *why* no mutex. The principle lived in the code without a name. 036t's tick channel pressure forced the question ("why can't we just call `Tick()` directly?"), and the answer traced all the way back to 036b's purity claim. The derivation now lives in 036b's "What I learned" section, where the decision was made. 036t references it and adds only what's new: the tick-specific backpressure problem.
+
+### Why Go
+
+The event loop pattern is language-portable in theory. In practice, Go's `select` is a **runtime primitive**, not a library. `selectgo` in the Go runtime inspects channel queues directly, does a single lock pass across all channels, picks a ready one (or parks the goroutine with no thread), and resumes with zero heap allocation. That's why etcd's `run()` loop reads like pseudocode — five event sources, fair multiplexing, zero boilerplate.
+
+You could build `Channel.Select(ch1, ch2, ch3)` in C#. The API would look the same. But the CLR doesn't know what you're doing — it sees N independent async operations, allocates continuations, registers callbacks, and routes through the thread pool scheduler. `ValueTask` and `IValueTaskSource` reduce allocation pressure but you're still going through the compiler-generated async state machine. The performance gap is structural: a language primitive is a contract with the runtime ("I will multiplex N channels" → "I will do that in O(N) with no allocation"), while a library is a contract with the programmer that the runtime fulfills generically.
+
+This is why etcd's design feels effortless in Go and would feel forced in C# or Java. The architecture and the language primitive co-evolved. Choosing Go for a Raft implementation isn't about preference — it's about using a language where the central pattern is free.

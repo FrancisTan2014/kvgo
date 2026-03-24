@@ -9,6 +9,9 @@ enum MessageType {
     MsgVote     = 3;
     MsgVoteResp = 4;
     MsgSnap     = 5;
+    MsgHup      = 6;
+    MsgBeat     = 7;
+    MsgProp     = 8;
 }
 
 message Entry {

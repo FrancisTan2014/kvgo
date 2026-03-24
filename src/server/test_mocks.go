@@ -253,6 +253,8 @@ func (n *fakeNode) Advance() {
 	}
 }
 
+func (n *fakeNode) Tick() {}
+
 type fakeStateMachine struct {
 	data   map[string][]byte
 	putErr error

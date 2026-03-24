@@ -2,13 +2,20 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"kvgo/raftpb"
+	"log/slog"
 )
 
 type Config struct {
 	ID      uint64
 	Peers   []uint64
 	Storage Storage
+
+	ElectionTick  int
+	HeartbeatTick int
+
+	Logger *slog.Logger
 }
 
 type Node interface {
@@ -17,6 +24,7 @@ type Node interface {
 	Step(ctx context.Context, m *raftpb.Message) error
 	Campaign(ctx context.Context) error
 	Advance()
+	Tick()
 }
 
 type node struct {
@@ -26,7 +34,11 @@ type node struct {
 	campaignc chan campaignRequest
 	readyc    chan Ready
 	advancec  chan struct{}
+	tickc     chan struct{}
 	prevHard  *raftpb.HardState
+
+	// TODO: define a logger interface instead of relying on a concrete logger
+	lg *slog.Logger
 }
 
 type proposeRequest struct {
@@ -57,6 +69,8 @@ func setupNode(cfg Config) *node {
 		campaignc: make(chan campaignRequest),
 		readyc:    make(chan Ready),
 		advancec:  make(chan struct{}),
+		tickc:     make(chan struct{}, 128),
+		lg:        cfg.Logger,
 	}
 }
 
@@ -87,6 +101,8 @@ func (n *node) run(ctx context.Context) {
 			n.r.Advance()
 			rd = Ready{}
 			advancec = nil
+		case <-n.tickc:
+			n.r.Tick()
 		case <-ctx.Done():
 			return
 		}
@@ -127,6 +143,10 @@ func (n *node) Propose(ctx context.Context, data []byte) error {
 }
 
 func (n *node) Step(ctx context.Context, m *raftpb.Message) error {
+	if IsLocalMsg(m.Type) {
+		return fmt.Errorf("cannot step local message type %v through Node.Step", m.Type)
+	}
+
 	resp := make(chan error, 1)
 	select {
 	case <-ctx.Done():
@@ -172,4 +192,12 @@ func (n *node) Ready() <-chan Ready { return n.readyc }
 
 func (n *node) Advance() {
 	n.advancec <- struct{}{}
+}
+
+func (n *node) Tick() {
+	select {
+	case n.tickc <- struct{}{}:
+	default:
+		n.lg.Warn("tick channel full, dropping tick")
+	}
 }

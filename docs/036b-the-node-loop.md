@@ -86,7 +86,9 @@ At this point, the subject is alive.
 
 ## What I learned
 
-The `run()` goroutine is a single-thread event loop. All mutations to Raft state happen inside it; external callers communicate only through channels. A nil channel never fires in `select`, so the Ready→Advance protocol is enforced structurally — the wrong call order is unrepresentable, not just undocumented.
+The `run()` goroutine is a single-thread event loop. All mutations to Raft state happen inside it; external callers communicate only through channels. This is not a style choice — it's a consequence of keeping the raft struct pure. The struct has no goroutines, no locks, no I/O. That purity makes consensus logic testable as deterministic transitions. But a pure struct can't protect itself from concurrent access — two goroutines calling `Step()` at the same time corrupt state. So exactly one goroutine must own it. That's `run()`. External callers serialize through channels (`propc`, `stepc`, `campaignc`). The channel *is* the mutex — without lock ordering, without deadlocks, and with fair multiplexing via `select`. Purity forces single ownership; single ownership forces channels; channels force the event loop.
+
+A nil channel never fires in `select`, so the Ready→Advance protocol is enforced structurally — the wrong call order is unrepresentable, not just undocumented.
 
 I kept trying to make 036b bigger than it needed to be. The final implementation is ~80 lines of code and ~80 lines of tests. That felt too small, but every line is proven and every boundary is respected. CommitTo exists at the `Raft` level as a test shortcut; it does not appear in the `Node` channel loop because in real Raft, commit index advances as a side effect of `Step` processing messages — not as a separate external event.
 

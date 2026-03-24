@@ -36,6 +36,10 @@ After reading the Raft paper and walking through etcd's implementation, I find m
 
 That's the perfectionism trap. I know what it feels like by now. The way out is to start with something concrete, even if it's wrong.
 
+## Boundary
+
+036 is done when a PUT enters through the replicated log, gets majority agreement over a real network transport, and only then reaches the state machine. The old local-write-first path must be unreachable for writes. Reads, state machine ownership, and Phase 1 cleanup are separate episodes.
+
 ## Starting: what is the subject?
 
 A Raft cluster is a set of nodes that maintain a replicated log. Each node runs the same algorithm. The subject — the central object — is a single node.

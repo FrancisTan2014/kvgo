@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"context"
+	"log/slog"
 	"testing"
 
 	"kvgo/raftpb"
@@ -12,9 +14,13 @@ type mockStorage struct {
 	firstIndex uint64
 	snap       *raftpb.SnapshotMeta
 	applied    []*raftpb.SnapshotMeta
+	hardState  *raftpb.HardState
 }
 
 func (m *mockStorage) InitialState() (*raftpb.HardState, error) {
+	if m.hardState != nil {
+		return m.hardState, nil
+	}
 	return &raftpb.HardState{}, nil
 }
 
@@ -62,18 +68,20 @@ func (m *mockStorage) ApplySnapshot(snap *raftpb.SnapshotMeta) error {
 }
 
 func newTestRaft(id uint64) *Raft {
-	return NewRaft(id, &mockStorage{})
+	return newRaft(Config{
+		ID:            id,
+		Storage:       &mockStorage{},
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
 }
 
-func newLeaderRaftWithOnePeer() Raft {
-	r := *newTestRaft(0)
-	r.id = 1
+func newLeaderRaftWithOnePeer() *Raft {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
 	r.term = 1
-	r.state = Leader
-	r.peers = append(r.peers, 2)
-	r.progress = map[uint64]*Progress{
-		2: {MatchIndex: 0, NextIndex: 1},
-	}
+	r.becomeLeader()
 	return r
 }
 
@@ -151,7 +159,7 @@ func TestReadyExposesCommittedEntsOnlyAfterCommitTo_036b(t *testing.T) {
 }
 
 func TestReadyExposesHardStateAfterCampaign_036m(t *testing.T) {
-	r := *newTestRaft(1)
+	r := newTestRaft(1)
 	r.peers = []uint64{2}
 
 	require.NoError(t, r.Campaign())
@@ -161,8 +169,7 @@ func TestReadyExposesHardStateAfterCampaign_036m(t *testing.T) {
 }
 
 func TestReadyExposesHardStateAfterGrantingVote_036m(t *testing.T) {
-	r := *newTestRaft(2)
-	r.state = Follower
+	r := newTestRaft(2)
 
 	require.NoError(t, r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgVote, From: 1, To: 2, Term: 3}))
 
@@ -237,20 +244,18 @@ func TestNewEntryIsReadyAfterFollowerStepMsgApp_036f(t *testing.T) {
 	require.NoError(t, leader.Propose([]byte("foo")))
 
 	msg := leader.Ready().Messages[0]
-	r := *newTestRaft(2)
-	r.state = Follower
-	require.NoError(t, r.Step(msg))
+	follower := newTestRaft(2)
+	require.NoError(t, follower.Step(msg))
 
-	rd := r.Ready()
+	rd := follower.Ready()
 	require.Len(t, rd.Entries, 1)
 	require.Equal(t, msg.Entries[0], rd.Entries[0])
 
 	// follower doesn't get entry through Propose()
-	r2 := *newTestRaft(3)
-	r2.state = Follower
-	require.NoError(t, r2.Propose([]byte("foo")))
+	follower2 := newTestRaft(3)
+	require.NoError(t, follower2.Propose([]byte("foo")))
 
-	rd = r2.Ready()
+	rd = follower2.Ready()
 	require.Len(t, rd.Messages, 0)
 	require.Len(t, rd.Entries, 0)
 }
@@ -542,7 +547,7 @@ func TestHigherTermGrantedVoteResponseMakesCandidateYield_036j(t *testing.T) {
 	require.Equal(t, Follower, n.state)
 	require.Equal(t, uint64(2), n.term)
 	require.Zero(t, n.votedFor)
-	require.Nil(t, n.votes)
+	require.Empty(t, n.votes)
 }
 
 func TestHigherTermVoteResponseClearsSelfVoteForLaterGrant_036j(t *testing.T) {
@@ -594,7 +599,7 @@ func TestHigherTermAppendRevokesStaleAuthorityBeforeAppendLogic_036j(t *testing.
 	require.Equal(t, uint64(2), n.term)
 	require.Equal(t, Follower, n.state)
 	require.Zero(t, n.votedFor)
-	require.Nil(t, n.votes)
+	require.Empty(t, n.votes)
 
 	rd := n.Ready()
 	require.Len(t, rd.Entries, 1)
@@ -735,16 +740,14 @@ func TestAppendAfterInstalledSnapshotIsReady_036k(t *testing.T) {
 
 func TestProgressInitializedOnElection_036n(t *testing.T) {
 	candidate := newTestRaft(1)
-	candidate.state = Candidate
 	candidate.peers = []uint64{2}
-
-	candidate.votes = make(map[uint64]bool)
-	candidate.votes[1] = true
+	candidate.becomeCandidate()
 	candidate.votes[2] = false
 
 	require.NoError(t, candidate.Step(&raftpb.Message{
 		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   2,
+		Term:   candidate.term,
 		Reject: false,
 	}))
 
@@ -826,4 +829,220 @@ func TestNextIndexBacksUpOnRejection_036n(t *testing.T) {
 	// conservative backup: decrement by 1. Update this assertion
 	// when the RejectHint fast path is introduced.
 	require.Equal(t, uint64(3), leader.progress[2].NextIndex)
+}
+
+// --- 036t: The Tick ---
+
+func TestTickElectionProducesMsgHup_036t(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+
+	// Tick past the randomized election timeout.
+	// randomizedElectionTimeout ∈ [electionTimeout, 2*electionTimeout).
+	for i := 0; i < 2*r.electionTimeout; i++ {
+		r.tick()
+	}
+
+	// The follower should have become a candidate via MsgHup → Step → becomeCandidate.
+	require.Equal(t, Candidate, r.state)
+
+	// MsgVote should be ready for the peer.
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, raftpb.MessageType_MsgVote, rd.Messages[0].Type)
+	require.Equal(t, uint64(2), rd.Messages[0].To)
+}
+
+func TestTickHeartbeatProducesMsgApp_036t(t *testing.T) {
+	leader := newLeaderRaftWithOnePeer()
+	leader.Advance()
+
+	// Tick past heartbeatTimeout.
+	for i := 0; i < leader.heartbeatTimeout; i++ {
+		leader.tick()
+	}
+
+	rd := leader.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, raftpb.MessageType_MsgApp, rd.Messages[0].Type)
+	require.Equal(t, uint64(2), rd.Messages[0].To)
+	require.Equal(t, leader.term, rd.Messages[0].Term)
+	// Heartbeat carries no entries, just commit index.
+	require.Empty(t, rd.Messages[0].Entries)
+}
+
+func TestCandidateReElectsAtHigherTermOnTimeout_036t(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3}
+
+	// First campaign — becomes candidate at term 1.
+	require.NoError(t, r.Campaign())
+	require.Equal(t, Candidate, r.state)
+	require.Equal(t, uint64(1), r.term)
+	r.Advance()
+
+	// Election times out — tick past randomizedElectionTimeout.
+	for i := 0; i < 2*r.electionTimeout; i++ {
+		r.tick()
+	}
+
+	// Must re-campaign at a higher term.
+	require.Equal(t, Candidate, r.state)
+	require.Equal(t, uint64(2), r.term)
+	require.Equal(t, r.id, r.votedFor)
+
+	rd := r.Ready()
+	// MsgVote sent to both peers at the new term.
+	require.Len(t, rd.Messages, 2)
+	for _, msg := range rd.Messages {
+		require.Equal(t, raftpb.MessageType_MsgVote, msg.Type)
+		require.Equal(t, uint64(2), msg.Term)
+	}
+}
+
+func TestNodeStepRejectsLocalMessages_036t(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n := newStartedNode(ctx, 1, 2)
+
+	localTypes := []raftpb.MessageType{
+		raftpb.MessageType_MsgHup,
+		raftpb.MessageType_MsgBeat,
+		raftpb.MessageType_MsgProp,
+	}
+	for _, mt := range localTypes {
+		err := n.Step(ctx, &raftpb.Message{Type: mt, From: 99})
+		require.Error(t, err, "Node.Step should reject local message type %v", mt)
+	}
+}
+
+func TestFollowerResetsTimerOnLeaderContact_036t(t *testing.T) {
+	r := newTestRaft(2)
+	r.peers = []uint64{1}
+	r.becomeFollower(1, 1)
+
+	// Tick close to election timeout, but send MsgApp from leader each time
+	// to reset the counter.
+	for round := 0; round < 5; round++ {
+		for i := 0; i < r.electionTimeout-1; i++ {
+			r.tick()
+		}
+		// Leader heartbeat resets electionElapsed.
+		require.NoError(t, r.Step(&raftpb.Message{
+			Type: raftpb.MessageType_MsgApp,
+			From: 1,
+			To:   2,
+			Term: 1,
+		}))
+	}
+
+	// Despite many ticks, still a follower because heartbeats kept arriving.
+	require.Equal(t, Follower, r.state)
+}
+
+func TestThreeNodeClusterSelfElects_036t(t *testing.T) {
+	nodes := make([]*Raft, 3)
+	for i := range nodes {
+		id := uint64(i + 1)
+		peers := make([]uint64, 0, 2)
+		for j := range nodes {
+			if uint64(j+1) != id {
+				peers = append(peers, uint64(j+1))
+			}
+		}
+		nodes[i] = newTestRaft(id)
+		nodes[i].peers = peers
+	}
+
+	// Deliver messages between nodes for up to 100 ticks.
+	for tick := 0; tick < 100; tick++ {
+		for _, n := range nodes {
+			n.tick()
+		}
+		// Collect and deliver all messages.
+		for _, src := range nodes {
+			rd := src.Ready()
+			for _, msg := range rd.Messages {
+				for _, dst := range nodes {
+					if dst.id == msg.To {
+						_ = dst.Step(msg)
+					}
+				}
+			}
+			src.Advance()
+		}
+
+		// Check if any node became leader.
+		for _, n := range nodes {
+			if n.state == Leader {
+				return // success
+			}
+		}
+	}
+	t.Fatal("no leader elected within 100 ticks")
+}
+
+func TestSplitVoteRecovery_036t(t *testing.T) {
+	// 3-node cluster: if two of three campaign simultaneously,
+	// randomized timeouts must break the tie within bounded rounds.
+	nodes := make([]*Raft, 3)
+	for i := range nodes {
+		id := uint64(i + 1)
+		peers := make([]uint64, 0, 2)
+		for j := range nodes {
+			if uint64(j+1) != id {
+				peers = append(peers, uint64(j+1))
+			}
+		}
+		nodes[i] = newTestRaft(id)
+		nodes[i].peers = peers
+	}
+
+	// Force two candidates simultaneously by calling Campaign.
+	require.NoError(t, nodes[0].Campaign())
+	require.NoError(t, nodes[1].Campaign())
+
+	// Deliver messages and tick for up to 200 ticks.
+	for tick := 0; tick < 200; tick++ {
+		for _, n := range nodes {
+			n.tick()
+		}
+		for _, src := range nodes {
+			rd := src.Ready()
+			for _, msg := range rd.Messages {
+				for _, dst := range nodes {
+					if dst.id == msg.To {
+						_ = dst.Step(msg)
+					}
+				}
+			}
+			src.Advance()
+		}
+
+		for _, n := range nodes {
+			if n.state == Leader {
+				return // success — split vote resolved
+			}
+		}
+	}
+	t.Fatal("split vote not resolved within 200 ticks")
+}
+
+func TestNewRaftRestoresPersistedState_036t(t *testing.T) {
+	storage := &mockStorage{}
+	storage.hardState = &raftpb.HardState{Term: 5, VotedFor: 2, CommittedIndex: 3}
+
+	r := newRaft(Config{
+		ID:            1,
+		Storage:       storage,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	require.Equal(t, uint64(5), r.term)
+	require.Equal(t, uint64(2), r.votedFor)
+	require.Equal(t, uint64(3), r.commitIndex)
+	require.Equal(t, Follower, r.state)
 }
