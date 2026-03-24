@@ -66,7 +66,7 @@ func newTestSuite(t *testing.T) testSuite {
 	}
 }
 
-func TestMessageSentAndArrivedIntact_038(t *testing.T) {
+func TestMessageSentAndArrivedIntact_036s(t *testing.T) {
 	suite := newTestSuite(t)
 	defer suite.t1.Stop()
 	defer suite.t2.Stop()
@@ -88,7 +88,7 @@ func TestMessageSentAndArrivedIntact_038(t *testing.T) {
 	}
 }
 
-func TestTransportIsBidirectional_038(t *testing.T) {
+func TestTransportIsBidirectional_036s(t *testing.T) {
 	suite := newTestSuite(t)
 	defer suite.t1.Stop()
 	defer suite.t2.Stop()
@@ -126,7 +126,7 @@ func TestTransportIsBidirectional_038(t *testing.T) {
 	}
 }
 
-func TestUnknownPeerDropped_038(t *testing.T) {
+func TestUnknownPeerDropped_036s(t *testing.T) {
 	suite := newTestSuite(t)
 	defer suite.t1.Stop()
 	defer suite.t2.Stop()
@@ -153,7 +153,7 @@ func TestUnknownPeerDropped_038(t *testing.T) {
 	}
 }
 
-func TestStopDisposesResources_038(t *testing.T) {
+func TestStopDisposesResources_036s(t *testing.T) {
 	suite := newTestSuite(t)
 	defer suite.t2.Stop()
 

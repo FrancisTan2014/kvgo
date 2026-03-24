@@ -1,4 +1,4 @@
-# 038 — The Raft Transport
+# 036s — The Raft Transport
 
 The Raft algorithm works. A leader proposes, followers step, entries commit, state applies. Every episode since 036b proved this — through unit tests that pass messages by calling `Step` directly in the same process.
 
@@ -10,7 +10,7 @@ The sabotage is simple: start two nodes, propose a write on node A, and node B n
 
 ## Boundary
 
-038 builds the Raft transport — the layer that moves `raftpb.Message` between processes over TCP.
+036s builds the Raft transport — the layer that moves `raftpb.Message` between processes over TCP.
 
 In scope:
 - `transport/raft` package implementing `RaftTransporter`
