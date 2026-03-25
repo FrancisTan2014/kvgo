@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"kvgo/raftpb"
 	"log/slog"
+	"sync"
 )
 
 type Config struct {
@@ -25,6 +26,7 @@ type Node interface {
 	Campaign(ctx context.Context) error
 	Advance()
 	Tick()
+	Stop()
 }
 
 type node struct {
@@ -35,6 +37,8 @@ type node struct {
 	readyc    chan Ready
 	advancec  chan struct{}
 	tickc     chan struct{}
+	stopc     chan struct{}
+	stopOnce  sync.Once
 	prevHard  *raftpb.HardState
 
 	// TODO: define a logger interface instead of relying on a concrete logger
@@ -55,9 +59,9 @@ type campaignRequest struct {
 	resp chan error
 }
 
-func NewNode(ctx context.Context, cfg Config) Node {
+func NewNode(cfg Config) Node {
 	n := setupNode(cfg)
-	go n.run(ctx)
+	go n.run()
 	return n
 }
 
@@ -70,11 +74,12 @@ func setupNode(cfg Config) *node {
 		readyc:    make(chan Ready),
 		advancec:  make(chan struct{}),
 		tickc:     make(chan struct{}, 128),
+		stopc:     make(chan struct{}),
 		lg:        cfg.Logger,
 	}
 }
 
-func (n *node) run(ctx context.Context) {
+func (n *node) run() {
 	var rd Ready
 	var readyc chan Ready
 	var advancec chan struct{}
@@ -103,7 +108,7 @@ func (n *node) run(ctx context.Context) {
 			advancec = nil
 		case <-n.tickc:
 			n.r.Tick()
-		case <-ctx.Done():
+		case <-n.stopc:
 			return
 		}
 	}
@@ -200,4 +205,10 @@ func (n *node) Tick() {
 	default:
 		n.lg.Warn("tick channel full, dropping tick")
 	}
+}
+
+func (n *node) Stop() {
+	n.stopOnce.Do(func() {
+		close(n.stopc)
+	})
 }

@@ -25,6 +25,7 @@ const (
 var ErrUnexpectedBytes = errors.New("unexpected bytes")
 
 type Ready struct {
+	Lead             uint64
 	Entries          []*raftpb.Entry
 	CommittedEntries []*raftpb.Entry
 	Messages         []*raftpb.Message
@@ -149,6 +150,7 @@ func IsEmptyHardState(hard *raftpb.HardState) bool {
 
 func (r *Raft) Ready() Ready {
 	return Ready{
+		Lead:             r.lead,
 		Entries:          r.entriesBetween(r.stableIndex, r.lastLogIndex),
 		CommittedEntries: r.entriesBetween(r.appliedIndex, r.commitIndex),
 		Messages:         r.messages,
@@ -334,6 +336,10 @@ func stepFollower(r *Raft, m *raftpb.Message) error {
 		r.electionElapsed = 0
 		r.lead = m.From
 
+		if m.Commit > r.commitIndex {
+			r.CommitTo(m.Commit)
+		}
+
 		if len(m.Entries) == 0 {
 			return nil
 		}
@@ -349,10 +355,6 @@ func stepFollower(r *Raft, m *raftpb.Message) error {
 			last := m.Entries[len(m.Entries)-1]
 			resp.Index = last.Index
 			resp.LogTerm = last.Term
-
-			if m.Commit > r.commitIndex {
-				r.CommitTo(m.Commit)
-			}
 		} else {
 			resp.Reject = true
 			resp.Index = m.Index

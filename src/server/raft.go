@@ -7,6 +7,7 @@ import (
 	"kvgo/raftpb"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type RaftTransporter interface {
@@ -17,10 +18,13 @@ type RaftTransporter interface {
 }
 
 type RaftHostConfig struct {
-	ID        uint64
-	Peers     []uint64
-	Storage   raft.Storage
-	Transport RaftTransporter
+	ID            uint64
+	Peers         []uint64
+	Storage       raft.Storage
+	Transport     RaftTransporter
+	HeartbeatTick int           // raft logical ticks between heartbeats (default 1)
+	ElectionTick  int           // raft logical ticks for election timeout (default 10)
+	TickInterval  time.Duration // wall-clock interval per logical tick (default 100ms)
 }
 
 type raftHostConfig struct {
@@ -37,6 +41,7 @@ type RaftHost interface {
 	Step(ctx context.Context, m *raftpb.Message) error
 	Campaign(ctx context.Context) error
 	Apply() <-chan toApply
+	LeaderID() uint64
 
 	Start()
 	Stop()
@@ -44,20 +49,19 @@ type RaftHost interface {
 }
 
 type raftHost struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	n         raft.Node
-	peers     []uint64
-	storage   raft.Storage
-	transport RaftTransporter
-	applyc    chan toApply
+	n            raft.Node
+	peers        []uint64
+	storage      raft.Storage
+	transport    RaftTransporter
+	tickInterval time.Duration
+	applyc       chan toApply
+	lead         atomic.Uint64
 
 	started  atomic.Bool
-	stopped  atomic.Bool
+	stopc    chan struct{}
+	stopOnce sync.Once
 	errc     chan error
 	done     chan struct{}
-	stopOnce sync.Once
 }
 
 var newRaftNode = raft.NewNode
@@ -73,11 +77,8 @@ func validatePublicRaftHostConfig(cfg RaftHostConfig) error {
 }
 
 func validateRaftHostConfig(cfg raftHostConfig) error {
-	if cfg.Storage == nil {
-		return errors.New("storage is not presented")
-	}
-	if cfg.Transport == nil {
-		return errors.New("transport is not presented")
+	if err := validatePublicRaftHostConfig(cfg.RaftHostConfig); err != nil {
+		return err
 	}
 	if cfg.n == nil {
 		return errors.New("node is not presented")
@@ -85,83 +86,102 @@ func validateRaftHostConfig(cfg raftHostConfig) error {
 	return nil
 }
 
-func newRaftHost(ctx context.Context, cfg raftHostConfig) (*raftHost, error) {
+func newRaftHost(cfg raftHostConfig) (*raftHost, error) {
 	if err := validateRaftHostConfig(cfg); err != nil {
 		return nil, err
 	}
 
-	rctx, cancel := context.WithCancel(ctx)
+	tickInterval := cfg.TickInterval
+	if tickInterval == 0 {
+		tickInterval = 100 * time.Millisecond
+	}
+
 	peers := make([]uint64, len(cfg.Peers))
 	copy(peers, cfg.Peers)
 	host := &raftHost{
-		ctx:       rctx,
-		cancel:    cancel,
-		n:         cfg.n,
-		peers:     peers,
-		storage:   cfg.Storage,
-		transport: cfg.Transport,
-		applyc:    make(chan toApply),
-		errc:      make(chan error, 1),
-		done:      make(chan struct{}),
+		n:            cfg.n,
+		peers:        peers,
+		storage:      cfg.Storage,
+		transport:    cfg.Transport,
+		tickInterval: tickInterval,
+		applyc:       make(chan toApply),
+		errc:         make(chan error, 1),
+		stopc:        make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 
 	return host, nil
 }
 
-func NewRaftHost(ctx context.Context, cfg RaftHostConfig) (*raftHost, error) {
+func NewRaftHost(cfg RaftHostConfig) (*raftHost, error) {
 	if err := validatePublicRaftHostConfig(cfg); err != nil {
 		return nil, err
 	}
 
-	rctx, cancel := context.WithCancel(ctx)
 	pids := make([]uint64, 0)
 	for _, p := range cfg.Peers {
 		pids = append(pids, p)
 	}
 
-	n := newRaftNode(rctx, raft.Config{
-		ID:      cfg.ID,
-		Storage: cfg.Storage,
-		Peers:   pids,
+	heartbeat := cfg.HeartbeatTick
+	if heartbeat == 0 {
+		heartbeat = 1
+	}
+	election := cfg.ElectionTick
+	if election == 0 {
+		election = 10
+	}
+	tickInterval := cfg.TickInterval
+	if tickInterval == 0 {
+		tickInterval = 100 * time.Millisecond
+	}
+
+	n := newRaftNode(raft.Config{
+		ID:            cfg.ID,
+		Storage:       cfg.Storage,
+		Peers:         pids,
+		HeartbeatTick: heartbeat,
+		ElectionTick:  election,
 	})
 
 	peers := make([]uint64, len(cfg.Peers))
 	copy(peers, cfg.Peers)
 
 	return &raftHost{
-		ctx:       rctx,
-		cancel:    cancel,
-		n:         n,
-		peers:     peers,
-		storage:   cfg.Storage,
-		transport: cfg.Transport,
-		applyc:    make(chan toApply),
-		errc:      make(chan error, 1),
-		done:      make(chan struct{}),
+		n:            n,
+		peers:        peers,
+		storage:      cfg.Storage,
+		transport:    cfg.Transport,
+		tickInterval: tickInterval,
+		applyc:       make(chan toApply),
+		errc:         make(chan error, 1),
+		stopc:        make(chan struct{}),
+		done:         make(chan struct{}),
 	}, nil
 }
 
 func (r *raftHost) Start() {
-	if r.stopped.Load() {
-		return
-	}
 	if r.started.CompareAndSwap(false, true) {
 		go r.start()
 	}
 }
 
 func (r *raftHost) start() {
+	defer close(r.done)
+	ticker := time.NewTicker(r.tickInterval)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-r.ctx.Done():
-			r.Stop()
+		case <-r.stopc:
 			return
+		case <-ticker.C:
+			r.n.Tick()
 		case rd := <-r.n.Ready():
+			r.lead.Store(rd.Lead)
 			if err := r.handleBatch(rd); err == nil {
 				r.n.Advance()
 			} else {
 				r.errc <- err
-				r.Stop()
 				return
 			}
 		}
@@ -169,12 +189,11 @@ func (r *raftHost) start() {
 }
 
 func (r *raftHost) Stop() {
-	r.stopped.Store(true)
-	r.started.Store(false)
-	r.cancel()
 	r.stopOnce.Do(func() {
-		close(r.done)
+		close(r.stopc)
 	})
+	<-r.done
+	r.n.Stop()
 }
 
 func (r *raftHost) handleBatch(rd raft.Ready) error {
@@ -199,8 +218,11 @@ func (r *raftHost) handleBatch(rd raft.Ready) error {
 			data[i] = buf[:n]
 			buf = buf[n:]
 		}
-		// unbuffered — blocks until the server consumes the batch
-		r.applyc <- toApply{data: data}
+		select {
+		case r.applyc <- toApply{data: data}:
+		case <-r.stopc:
+			return nil
+		}
 	}
 	return nil
 }
@@ -223,4 +245,8 @@ func (r *raftHost) Apply() <-chan toApply {
 
 func (r *raftHost) Errors() <-chan error {
 	return r.errc
+}
+
+func (r *raftHost) LeaderID() uint64 {
+	return r.lead.Load()
 }

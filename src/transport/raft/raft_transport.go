@@ -34,6 +34,7 @@ type Raft interface {
 
 type RaftTransportConfig struct {
 	ListenAddr   string
+	Listener     net.Listener // optional: pre-bound listener, skips net.Listen if set
 	WriteTimeout time.Duration
 }
 
@@ -63,8 +64,8 @@ func NewRaftTransport(cfg RaftTransportConfig, raft Raft, lg *slog.Logger) (*Raf
 	if raft == nil {
 		return nil, errors.New("raft is required")
 	}
-	if cfg.ListenAddr == "" {
-		return nil, errors.New("listen address is required")
+	if cfg.ListenAddr == "" && cfg.Listener == nil {
+		return nil, errors.New("listen address or listener is required")
 	}
 	if lg == nil {
 		return nil, errors.New("logger is required")
@@ -109,13 +110,17 @@ func (r *RaftTransport) Start() error {
 		return ErrTransportStarted
 	}
 
-	ln, err := net.Listen("tcp", r.cfg.ListenAddr)
-	if err != nil {
-		r.started.Store(false)
-		return err
+	// TODO: revisit listener ownership — consider letting the caller own accept (etcd pattern)
+	if r.cfg.Listener != nil {
+		r.ln = r.cfg.Listener
+	} else {
+		ln, err := net.Listen("tcp", r.cfg.ListenAddr)
+		if err != nil {
+			r.started.Store(false)
+			return err
+		}
+		r.ln = ln
 	}
-
-	r.ln = ln
 	r.wg.Go(r.acceptLoop)
 
 	return nil

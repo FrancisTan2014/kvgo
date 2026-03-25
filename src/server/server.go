@@ -8,7 +8,10 @@ import (
 	"io"
 	"kvgo/engine"
 	"kvgo/protocol"
+	"kvgo/raft"
+	"kvgo/raftpb"
 	"kvgo/transport"
+	rafttransport "kvgo/transport/raft"
 	"kvgo/utils"
 	"log/slog"
 	"net"
@@ -38,12 +41,17 @@ var (
 )
 
 type Options struct {
-	Protocol  string // ProtocolTCP (default); future: QUIC, gRPC, etc.
-	Network   string // NetworkTCP, NetworkTCP4, NetworkTCP6, or NetworkUnix
-	Host      string // address, or socket path when Network is NetworkUnix
-	Port      uint16 // ignored when Network is NetworkUnix
-	ReplicaOf string // non-empty value indicates that it is a follower
-	DataDir   string
+	ID    uint64 // unique node ID
+	Peers []*rafttransport.Peer
+
+	Protocol     string       // ProtocolTCP (default); future: QUIC, gRPC, etc.
+	Network      string       // NetworkTCP, NetworkTCP4, NetworkTCP6, or NetworkUnix
+	Host         string       // address, or socket path when Network is NetworkUnix
+	Port         uint16       // ignored when Network is NetworkUnix
+	RaftPort     uint16       // Raft channel
+	RaftListener net.Listener // optional: pre-bound raft listener (for tests with :0 ports)
+	ReplicaOf    string       // non-empty value indicates that it is a follower
+	DataDir      string
 
 	ReadTimeout         time.Duration
 	WriteTimeout        time.Duration
@@ -119,6 +127,7 @@ type Server struct {
 	replCtx    context.Context
 	replCancel context.CancelFunc
 	replDone   chan struct{} // closed when replicationLoop goroutine exits
+	wg         sync.WaitGroup
 
 	// Quorum control
 	quorumMu     sync.RWMutex
@@ -157,21 +166,33 @@ type Server struct {
 	//==================================================
 	// The Raft era
 	//==================================================
-	raftHost RaftHost
-	sm       StateMachine
-	w        Wait
-	reqIDGen atomic.Uint64
+	raftHost      RaftHost
+	raftTransport RaftTransporter
+	raftStorage   *raft.DurableStorage
+	sm            StateMachine
+	w             Wait
+	reqIDGen      atomic.Uint64
+}
+
+func validate(opts *Options) error {
+	if opts.DataDir == "" {
+		return fmt.Errorf("server: DataDir is required")
+	}
+	if opts.Network != "" && !supportedNetworks[opts.Network] {
+		return fmt.Errorf("server: unsupported Network %q", opts.Network)
+	}
+	if opts.Network == NetworkUnix && opts.Host == "" {
+		return fmt.Errorf("server: Host (socket path) is required for %s network", NetworkUnix)
+	}
+	if opts.ID == 0 {
+		return errors.New("server: ID cannot be zero")
+	}
+	return nil
 }
 
 func NewServer(opts Options) (*Server, error) {
-	if opts.DataDir == "" {
-		return nil, fmt.Errorf("server: DataDir is required")
-	}
-	if opts.Network != "" && !supportedNetworks[opts.Network] {
-		return nil, fmt.Errorf("server: unsupported Network %q", opts.Network)
-	}
-	if opts.Network == NetworkUnix && opts.Host == "" {
-		return nil, fmt.Errorf("server: Host (socket path) is required for %s network", NetworkUnix)
+	if err := validate(&opts); err != nil {
+		return nil, err
 	}
 	opts.applyDefaults()
 
@@ -184,6 +205,7 @@ func NewServer(opts Options) (*Server, error) {
 		quorumAckCh:     make(chan string),
 		quorumWrites:    make(map[string]*quorumWriteState),
 		roleChanged:     make(chan struct{}),
+		w:               newWait(),
 	}
 
 	s.peerManager = NewPeerManager(
@@ -192,6 +214,11 @@ func NewServer(opts Options) (*Server, error) {
 	)
 
 	s.registerRequestHandlers()
+
+	if err := s.initializeRaftHost(); err != nil {
+		return nil, err
+	}
+
 	return s, nil
 }
 
@@ -285,7 +312,8 @@ func (s *Server) Start() (err error) {
 	if err != nil {
 		return err
 	}
-	s.db = db // Assign now so startReplicationLoop can use it
+	s.db = db   // Assign now so startReplicationLoop can use it
+	s.sm = s.db // TODO: consolidate them
 
 	// Start replication loop only for replicas
 	if !s.isLeader() {
@@ -308,7 +336,58 @@ func (s *Server) Start() (err error) {
 	go s.reconcileLoop()
 	go s.peerManager.Run(s.ctx, peerHealthInterval, s.probePeerHealth)
 
+	if s.raftTransport == nil || s.raftHost == nil {
+		return errors.New("server: raft subsystem not initialized")
+	}
+	if err = s.raftTransport.Start(); err != nil {
+		return err
+	}
+	s.raftHost.Start()
+
+	// TODO: consider register goroutines in a WaitGroup
+	s.wg.Go(func() { s.run() })
+
 	return nil
+}
+
+func (s *Server) initializeRaftHost() error {
+	rtc := rafttransport.RaftTransportConfig{
+		ListenAddr: fmt.Sprintf("%s:%d", s.opts.Host, s.opts.RaftPort),
+		Listener:   s.opts.RaftListener,
+	}
+	rt, err := rafttransport.NewRaftTransport(rtc, s, s.log().WithGroup("rafttransport"))
+	if err != nil {
+		return err
+	}
+
+	pids := make([]uint64, len(s.opts.Peers))
+	for i, p := range s.opts.Peers {
+		pids[i] = p.ID
+		rt.AddPeer(p.ID, p.Addr)
+	}
+
+	rs, err := raft.NewDurableStorage(s.opts.DataDir)
+	if err != nil {
+		return err
+	}
+	s.raftStorage = rs
+
+	s.raftHost, err = NewRaftHost(RaftHostConfig{
+		ID:        s.opts.ID,
+		Peers:     pids,
+		Storage:   rs,
+		Transport: rt,
+	})
+	if err != nil {
+		return err
+	}
+
+	s.raftTransport = rt
+	return nil
+}
+
+func (s *Server) Process(ctx context.Context, m *raftpb.Message) error {
+	return s.raftHost.Step(ctx, m)
 }
 
 // pingTimeout returns the timeout for heartbeat pings.
@@ -396,6 +475,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.log().Warn("context canceled, forcing close")
 		s.closeConnections()
 		<-done // wait for handlers to exit after force close
+		s.wg.Wait()
 	}
 
 	s.peerManager.Close()
@@ -417,6 +497,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	if s.metaFile != nil {
 		_ = s.metaFile.Close()
+	}
+
+	if s.raftHost != nil {
+		s.raftHost.Stop()
+	}
+	if s.raftTransport != nil {
+		s.raftTransport.Stop()
+	}
+	if s.raftStorage != nil {
+		_ = s.raftStorage.Close()
 	}
 
 	s.started.Store(false)

@@ -57,16 +57,13 @@ func TestEnvelopeUnmarshalTooShort_036o(t *testing.T) {
 // --- integration: propose → apply → trigger ---
 
 func TestProposalSignaledAfterApply_036o(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	fn := &fakeNode{c: make(chan raft.Ready, 1)}
 	cfg := newRaftHostConfig()
 	rc := raftHostConfig{
 		RaftHostConfig: cfg,
 		n:              fn,
 	}
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
 	host.Start()
 	defer host.Stop()
@@ -77,7 +74,7 @@ func TestProposalSignaledAfterApply_036o(t *testing.T) {
 	payload := []byte("set x 1")
 	ch := w.Register(id)
 	data := marshalEnvelope(id, payload)
-	require.NoError(t, host.Propose(ctx, data))
+	require.NoError(t, host.Propose(context.Background(), data))
 
 	// simulate Raft committing the entry
 	fn.c <- raft.Ready{
@@ -137,16 +134,13 @@ func TestProposalTimesOutWithoutCommit_036o(t *testing.T) {
 }
 
 func TestHostApplyChannelCarriesDataNotEntries_036o(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	fn := &fakeNode{c: make(chan raft.Ready, 1)}
 	cfg := newRaftHostConfig()
 	rc := raftHostConfig{
 		RaftHostConfig: cfg,
 		n:              fn,
 	}
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
 	host.Start()
 	defer host.Stop()

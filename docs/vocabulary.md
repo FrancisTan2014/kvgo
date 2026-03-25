@@ -23,6 +23,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `scholarly` is more formal and positive; `theoretical` focuses on ideas; `academic` can imply classroom-style distance from practice
 - **where it breaks:** do not use it as a general synonym for `smart` or `formal`; avoid `acadamical`
 
+## altitude
+- **meaning:** the level of abstraction at which you are designing or reasoning
+- **pressure:** use it when contrasting zoomed-in work (one invariant, one boundary) with zoomed-out work (whole system, all subsystems and interfaces)
+- **tone:** metaphorical but precise; visual — implies looking down from different heights
+- **nearby alternatives:** `granularity` focuses on detail size; `scale` is broader and vaguer; `scope` describes what is included; `altitude` describes where you stand while looking
+- **where it breaks:** do not use it for simple big-vs-small comparisons; it works best when the same skill applies at both levels and the difference is zoom, not kind
+
 ## amortize
 - **meaning:** spread one cost across many operations
 - **pressure:** use it when repeated work becomes cheaper because multiple actions share one expensive step

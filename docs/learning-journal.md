@@ -598,4 +598,41 @@ The event loop pattern is language-portable in theory. In practice, Go's `select
 
 You could build `Channel.Select(ch1, ch2, ch3)` in C#. The API would look the same. But the CLR doesn't know what you're doing — it sees N independent async operations, allocates continuations, registers callbacks, and routes through the thread pool scheduler. `ValueTask` and `IValueTaskSource` reduce allocation pressure but you're still going through the compiler-generated async state machine. The performance gap is structural: a language primitive is a contract with the runtime ("I will multiplex N channels" → "I will do that in O(N) with no allocation"), while a library is a contract with the programmer that the runtime fulfills generically.
 
+---
+
+## 2026-03-25 — Design Docs at Two Altitudes
+
+### The observation
+
+036u has no design lesson. Every decision was made in prior episodes. The episode is pure wiring — plug known pieces together. Forcing a full design doc produced nothing but frustration.
+
+This revealed a gap: I can scope a small design tightly (one invariant, one boundary, one test list), but I have never composed small designs into a large one.
+
+### What the 036 series actually is
+
+036a through 036u is a large design, discovered bottom-up. Each sub-episode tried to close the series. If it could, it did. If not, the blocker became the next episode. The pattern is convergent — driven by implementation pressure, not upfront planning. After 20 sub-episodes, the full architecture exists: tick mechanism, transport, apply loop, propose path, storage, step dispatch. But it was never written as one document.
+
+### How a top-level design doc works
+
+A senior IC writing a design doc for a 3-month project does not know every answer upfront. The doc is a bet, not a blueprint:
+
+1. **Name the subsystems.** "This requires a tick mechanism, a transport layer, an apply loop, and a propose path."
+2. **Identify the interfaces between them.** "The apply loop reads committed entries from storage and writes to the engine."
+3. **Flag what you don't know.** "Open question: should the server own the ticker or RaftHost?" Saying "I'm not sure" is a strong statement, not a weakness.
+4. **State the exit criteria.** "Done when: PUT on leader, committed on follower, verified by log inspection."
+
+The first draft is ~60% correct. Review surfaces gaps. Implementation amends the doc. The doc becomes a record of what changed and why, not a frozen contract.
+
+### The skill gap
+
+The gap is not "can I produce a large design." It is "can I identify the subsystems and flag the unknowns before I have solved them." Small-boundary discipline (036 episodes) builds the muscle for recognizing invariants and seams. Composing those into a top-level document is a different altitude of the same skill.
+
+### Spikes are not cheating
+
+In a team with strict "design → review → approve → code" flow, integration work may need a spike: throwaway code to discover what does not fit. The spike is not coding before approval — it is how the design doc gets informed. The artifact is the updated doc, not the commit history.
+
+### What to do with this
+
+Write a retrospective design doc for the entire 036 series — after it closes. Tell the story bottom-up (how 036 converged), then flip it: what would the top-down doc have looked like on day one? That contrast is the article.
+
 This is why etcd's design feels effortless in Go and would feel forced in C# or Java. The architecture and the language primitive co-evolved. Choosing Go for a Raft implementation isn't about preference — it's about using a language where the central pattern is free.

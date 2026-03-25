@@ -904,7 +904,7 @@ func TestNodeStepRejectsLocalMessages_036t(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	n := newStartedNode(ctx, 1, 2)
+	n := newStartedNode(1, 2)
 
 	localTypes := []raftpb.MessageType{
 		raftpb.MessageType_MsgHup,

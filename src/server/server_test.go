@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"kvgo/protocol"
+	rafttransport "kvgo/transport/raft"
+	"net"
 	"testing"
 	"time"
 
@@ -20,17 +22,23 @@ type testServeSuite struct {
 func newTestServer(t *testing.T) *testServeSuite {
 	t.Helper()
 
-	s, err := NewServer(Options{
-		DataDir: t.TempDir(),
-	})
-	require.NoError(t, err)
-
 	fsm := newFakeStateMachine()
 	fr := newFakeRaftHost()
 	fw := newFakeWait()
 
-	s.sm, s.raftHost, s.w = fsm, fr, fw
-	s.ctx, s.cancel = context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := &Server{
+		opts: Options{
+			ID:           1,
+			WriteTimeout: 5 * time.Second,
+		},
+		sm:       fsm,
+		raftHost: fr,
+		w:        fw,
+		ctx:      ctx,
+		cancel:   cancel,
+	}
 
 	return &testServeSuite{
 		server: s,
@@ -298,5 +306,199 @@ func TestRaftPutApplyError_036q(t *testing.T) {
 		require.ErrorContains(t, err, "disk full")
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("timeout waiting for raftPut")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 036u — The Wiring
+// ---------------------------------------------------------------------------
+
+func newListenerPair(t *testing.T) (net.Listener, net.Listener) {
+	t.Helper()
+
+	addr := "127.0.0.1:0"
+	ln, err := net.Listen("tcp", addr)
+	require.NoError(t, err)
+
+	rln, err := net.Listen("tcp", addr)
+	require.NoError(t, err)
+
+	return ln, rln
+}
+
+func newTestCluster(t *testing.T) (*Server, *Server, *Server) {
+	t.Helper()
+
+	s1ln, s1rln := newListenerPair(t)
+	s2ln, s2rln := newListenerPair(t)
+	s3ln, s3rln := newListenerPair(t)
+
+	s1, err := NewServer(Options{
+		ID:           1,
+		DataDir:      t.TempDir(),
+		RaftListener: s1rln,
+		Peers: []*rafttransport.Peer{
+			{ID: 2, Addr: s2rln.Addr().String()},
+			{ID: 3, Addr: s3rln.Addr().String()},
+		},
+	})
+	require.NoError(t, err)
+	s1.ln = s1ln
+	require.NoError(t, s1.Start())
+
+	s2, err := NewServer(Options{
+		ID:           2,
+		DataDir:      t.TempDir(),
+		RaftListener: s2rln,
+		Peers: []*rafttransport.Peer{
+			{ID: 1, Addr: s1rln.Addr().String()},
+			{ID: 3, Addr: s3rln.Addr().String()},
+		},
+	})
+	require.NoError(t, err)
+	s2.ln = s2ln
+	require.NoError(t, s2.Start())
+
+	s3, err := NewServer(Options{
+		ID:           3,
+		DataDir:      t.TempDir(),
+		RaftListener: s3rln,
+		Peers: []*rafttransport.Peer{
+			{ID: 1, Addr: s1rln.Addr().String()},
+			{ID: 2, Addr: s2rln.Addr().String()},
+		},
+	})
+	require.NoError(t, err)
+	s3.ln = s3ln
+	require.NoError(t, s3.Start())
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s1.Shutdown(ctx)
+		_ = s2.Shutdown(ctx)
+		_ = s3.Shutdown(ctx)
+	})
+
+	return s1, s2, s3
+}
+
+func clusterLeader(servers ...*Server) *Server {
+	for _, s := range servers {
+		if s.raftHost.LeaderID() == s.opts.ID {
+			return s
+		}
+	}
+	return nil
+}
+
+func waitForLeader(t *testing.T, timeout time.Duration, servers ...*Server) *Server {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		if leader := clusterLeader(servers...); leader != nil {
+			return leader
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for leader election")
+			return nil
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func TestZeroIDReturnsError_036u(t *testing.T) {
+	_, err := NewServer(Options{
+		DataDir: t.TempDir(),
+		ID:      0,
+	})
+	require.ErrorContains(t, err, "ID cannot be zero")
+}
+
+func TestLeaderElectedWithoutManualCampaign_036u(t *testing.T) {
+	s1, s2, s3 := newTestCluster(t)
+	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
+	require.NotNil(t, leader)
+}
+
+func TestPutAppearsInServerDB_036u(t *testing.T) {
+	s1, s2, s3 := newTestCluster(t)
+	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
+
+	ctx := newRequestContext(protocol.CmdPut, "hello", "world")
+	err := leader.raftPut(ctx)
+	require.NoError(t, err)
+
+	val, ok := leader.sm.Get("hello")
+	require.True(t, ok, "key not found in leader state machine")
+	require.Equal(t, []byte("world"), val)
+}
+
+func TestClusterShutdownCompletes_036u(t *testing.T) {
+	// Proves the full lifecycle: start → elect → shutdown with no
+	// deadlock, goroutine leak, or unclosed resource.
+	s1, s2, s3 := newTestCluster(t)
+	_ = waitForLeader(t, 5*time.Second, s1, s2, s3)
+
+	// Shutdown is called by t.Cleanup in newTestCluster. If it hangs,
+	// the test times out — which is the failure signal.
+	// Explicitly shut down here to verify return values.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	require.NoError(t, s1.Shutdown(ctx))
+	require.NoError(t, s2.Shutdown(ctx))
+	require.NoError(t, s3.Shutdown(ctx))
+}
+
+func TestPutThenShutdownDoesNotDeadlock_036u(t *testing.T) {
+	// The shutdown-drain fix: handleBatch selects on stopc when applyc
+	// has no reader. This test verifies the full path: propose, commit,
+	// then shut down immediately — the server must not hang.
+	s1, s2, s3 := newTestCluster(t)
+	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
+
+	ctx := newRequestContext(protocol.CmdPut, "k", "v")
+	require.NoError(t, leader.raftPut(ctx))
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	require.NoError(t, s1.Shutdown(shutCtx))
+	require.NoError(t, s2.Shutdown(shutCtx))
+	require.NoError(t, s3.Shutdown(shutCtx))
+}
+
+func TestPutAppearsInFollowerSM_036u(t *testing.T) {
+	s1, s2, s3 := newTestCluster(t)
+	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
+
+	ctx := newRequestContext(protocol.CmdPut, "hello", "world")
+	require.NoError(t, leader.raftPut(ctx))
+
+	// Collect followers
+	followers := make([]*Server, 0, 2)
+	for _, s := range []*Server{s1, s2, s3} {
+		if s != leader {
+			followers = append(followers, s)
+		}
+	}
+
+	// Poll until both followers have applied the entry
+	deadline := time.After(5 * time.Second)
+	for _, f := range followers {
+		for {
+			val, ok := f.sm.Get("hello")
+			if ok {
+				require.Equal(t, []byte("world"), val)
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("follower %d did not apply entry", f.opts.ID)
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
 	}
 }

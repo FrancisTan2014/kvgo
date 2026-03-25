@@ -10,15 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newStartedNode(ctx context.Context, id uint64, peers ...uint64) Node {
-	return NewNode(ctx, Config{ID: id, Peers: peers, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+func newStartedNode(id uint64, peers ...uint64) Node {
+	return NewNode(Config{ID: id, Peers: peers, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
 }
 
 func TestConsumeEntryAfterPropose_036b(t *testing.T) {
 	ctx := context.Background()
 	n := setupNode(Config{ID: 1, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	defer n.Stop()
+
 	n.r.becomeLeader()
-	go n.run(ctx)
+	go n.run()
 
 	require.NoError(t, n.Propose(ctx, []byte("foo")))
 	r := <-n.Ready()
@@ -28,8 +30,10 @@ func TestConsumeEntryAfterPropose_036b(t *testing.T) {
 func TestAdvanceMovesForward_036b(t *testing.T) {
 	ctx := context.Background()
 	n := setupNode(Config{ID: 1, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	defer n.Stop()
+
 	n.r.becomeLeader()
-	go n.run(ctx)
+	go n.run()
 
 	require.NoError(t, n.Propose(ctx, []byte("foo")))
 	r1 := <-n.Ready()
@@ -48,12 +52,16 @@ func TestNodeStepFeedsInboundMessageIntoRaft_036l(t *testing.T) {
 	defer cancel()
 
 	leader := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	defer leader.Stop()
+
 	leader.r.becomeLeader()
-	go leader.run(ctx)
+	go leader.run()
 	require.NoError(t, leader.Propose(ctx, []byte("foo")))
 
 	msg := (<-leader.Ready()).Messages[0]
-	follower := newStartedNode(ctx, 2)
+	follower := newStartedNode(2)
+	defer follower.Stop()
+
 	require.NoError(t, follower.Step(ctx, msg))
 
 	rd := <-follower.Ready()
@@ -65,7 +73,9 @@ func TestNodeCampaignExposesVoteMessages_036l(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	n := newStartedNode(ctx, 1, 2)
+	n := newStartedNode(1, 2)
+	defer n.Stop()
+
 	require.NoError(t, n.Campaign(ctx))
 
 	rd := <-n.Ready()
@@ -76,6 +86,7 @@ func TestNodeCampaignExposesVoteMessages_036l(t *testing.T) {
 
 func TestNodeConfigOwnsInitialMembership_036l(t *testing.T) {
 	n := setupNode(Config{ID: 1, Peers: []uint64{2, 3}, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	defer n.Stop()
 	require.Equal(t, []uint64{2, 3}, n.r.peers)
 }
 
@@ -83,7 +94,9 @@ func TestNodeReadyCarriesHardStateFromRaft_036m(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	n := newStartedNode(ctx, 1, 2)
+	n := newStartedNode(1, 2)
+	defer n.Stop()
+
 	require.NoError(t, n.Campaign(ctx))
 
 	rd := <-n.Ready()
@@ -97,7 +110,8 @@ func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
 	n := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
 	n.r.becomeLeader()
 	n.r.term = 1
-	go n.run(ctx)
+	go n.run()
+	defer n.Stop()
 
 	require.NoError(t, n.Step(ctx, &raftpb.Message{Type: raftpb.MessageType_MsgApp, From: 2, To: 1, Term: 2}))
 

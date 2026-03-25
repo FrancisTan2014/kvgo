@@ -222,6 +222,7 @@ type fakeNode struct {
 	advanced    bool
 	advancedCh  chan struct{}
 	events      chan string
+	stopped     bool
 }
 
 func (n *fakeNode) Ready() <-chan raft.Ready {
@@ -254,6 +255,8 @@ func (n *fakeNode) Advance() {
 }
 
 func (n *fakeNode) Tick() {}
+
+func (n *fakeNode) Stop() { n.stopped = true }
 
 type fakeStateMachine struct {
 	data   map[string][]byte
@@ -325,6 +328,10 @@ func (r *fakeRaftHost) Stop() {}
 
 func (r *fakeRaftHost) Errors() <-chan error {
 	return r.errorc
+}
+
+func (r *fakeRaftHost) LeaderID() uint64 {
+	return 0
 }
 
 type fakeWait struct {

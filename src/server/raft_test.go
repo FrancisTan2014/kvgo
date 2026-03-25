@@ -71,13 +71,10 @@ func TestInternalRaftHostRequiresDependencies_036m(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
 			cfg := newInternalRaftHostConfig_036m()
 			tt.mutate(&cfg)
 
-			_, err := newRaftHost(ctx, cfg)
+			_, err := newRaftHost(cfg)
 			require.EqualError(t, err, tt.wantErr)
 		})
 	}
@@ -110,20 +107,17 @@ func TestNewRaftHostRequiresDependencies_036m(t *testing.T) {
 			cfg := newRaftHostConfig()
 			tt.mutate(&cfg)
 
-			_, err := NewRaftHost(context.Background(), cfg)
+			_, err := NewRaftHost(cfg)
 			require.EqualError(t, err, tt.wantErr)
 		})
 	}
 }
 
 func TestRaftHostConfigOwnsPeerList_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	cfg := newInternalRaftHostConfig_036m()
 	cfg.Peers = []uint64{2, 3}
 
-	host, err := newRaftHost(ctx, cfg)
+	host, err := newRaftHost(cfg)
 	require.NoError(t, err)
 	require.Equal(t, cfg.Peers, host.peers)
 
@@ -131,47 +125,9 @@ func TestRaftHostConfigOwnsPeerList_036m(t *testing.T) {
 	require.Equal(t, []uint64{2, 3}, host.peers)
 }
 
-func TestNewRaftHostStopCancelsConstructedNodeContext_036m(t *testing.T) {
-	prevFactory := newRaftNode
-	defer func() { newRaftNode = prevFactory }()
-
-	ctxObserved := make(chan context.Context, 1)
-	newRaftNode = func(ctx context.Context, cfg raft.Config) raft.Node {
-		ctxObserved <- ctx
-		return &fakeNode{c: make(chan raft.Ready)}
-	}
-
-	host, err := NewRaftHost(context.Background(), newRaftHostConfig())
-	require.NoError(t, err)
-
-	var nodeCtx context.Context
-	select {
-	case nodeCtx = <-ctxObserved:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timeout waiting for node construction context")
-	}
-
-	select {
-	case <-nodeCtx.Done():
-		t.Fatal("node context canceled before host stop")
-	default:
-	}
-
-	host.Stop()
-
-	select {
-	case <-nodeCtx.Done():
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timeout waiting for host stop to cancel node context")
-	}
-}
-
 func TestStoppedRaftHostDoesNotRestart_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	fakeNode := &fakeNode{c: make(chan raft.Ready, 1)}
-	host, err := newRaftHost(ctx, raftHostConfig{
+	host, err := newRaftHost(raftHostConfig{
 		RaftHostConfig: newRaftHostConfig(),
 		n:              fakeNode,
 	})
@@ -181,9 +137,6 @@ func TestStoppedRaftHostDoesNotRestart_036m(t *testing.T) {
 	host.Stop()
 	host.Start()
 
-	require.False(t, host.started.Load())
-	require.True(t, host.stopped.Load())
-
 	select {
 	case <-host.done:
 	default:
@@ -192,9 +145,6 @@ func TestStoppedRaftHostDoesNotRestart_036m(t *testing.T) {
 }
 
 func TestHostProposeFeedsProposalIntoNode_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	cfg := newRaftHostConfig()
 	fakeNode := &fakeNode{}
 	rc := raftHostConfig{
@@ -202,18 +152,15 @@ func TestHostProposeFeedsProposalIntoNode_036m(t *testing.T) {
 		n:              fakeNode,
 	}
 
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
 
 	data := []byte("set x 1")
-	require.NoError(t, host.Propose(ctx, data))
+	require.NoError(t, host.Propose(context.Background(), data))
 	require.Equal(t, data, fakeNode.proposed)
 }
 
 func TestHostSendsReadyMessagesByRaftID_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	transport := &mockRaftTransport{sent: make(chan *raftpb.Message, 1)}
 	cfg := newRaftHostConfig()
 	cfg.Transport = transport
@@ -224,7 +171,7 @@ func TestHostSendsReadyMessagesByRaftID_036m(t *testing.T) {
 		n:              fakeNode,
 	}
 
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
 	host.Start()
 	defer host.Stop()
@@ -243,9 +190,6 @@ func TestHostSendsReadyMessagesByRaftID_036m(t *testing.T) {
 }
 
 func TestHostStepFeedsInboundRaftMessageIntoNode_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	cfg := newRaftHostConfig()
 	fakeNode := &fakeNode{}
 	rc := raftHostConfig{
@@ -253,19 +197,16 @@ func TestHostStepFeedsInboundRaftMessageIntoNode_036m(t *testing.T) {
 		n:              fakeNode,
 	}
 
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
 
 	msg := &raftpb.Message{To: 2}
-	require.NoError(t, host.Step(ctx, msg))
+	require.NoError(t, host.Step(context.Background(), msg))
 	require.NotNil(t, fakeNode.steppedMsg)
 	require.Equal(t, msg, fakeNode.steppedMsg)
 }
 
 func TestHostCampaignFeedsNodeCampaign_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	cfg := newRaftHostConfig()
 	fakeNode := &fakeNode{}
 	rc := raftHostConfig{
@@ -273,16 +214,13 @@ func TestHostCampaignFeedsNodeCampaign_036m(t *testing.T) {
 		n:              fakeNode,
 	}
 
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
-	require.NoError(t, host.Campaign(ctx))
+	require.NoError(t, host.Campaign(context.Background()))
 	require.True(t, fakeNode.campaigned)
 }
 
 func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	events := make(chan string, 3)
 	transport := &mockRaftTransport{sent: make(chan *raftpb.Message, 1), events: events}
 	cfg := newRaftHostConfig()
@@ -297,7 +235,7 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 		n:              fakeNode,
 	}
 
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
 	host.Start()
 	defer host.Stop()
@@ -350,9 +288,6 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 }
 
 func TestHostPersistsHardStateOnlyBatch_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	fakeStorage := &mockStorage{savedCh: make(chan []*raftpb.Entry, 1)}
 	fakeNode := &fakeNode{c: make(chan raft.Ready, 1), advancedCh: make(chan struct{}, 1)}
 	cfg := newRaftHostConfig()
@@ -362,7 +297,7 @@ func TestHostPersistsHardStateOnlyBatch_036m(t *testing.T) {
 		n:              fakeNode,
 	}
 
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
 	host.Start()
 	defer host.Stop()
@@ -387,9 +322,6 @@ func TestHostPersistsHardStateOnlyBatch_036m(t *testing.T) {
 }
 
 func TestHostReportsBatchFailureAndStops_036m(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	cfg := newRaftHostConfig()
 	fakeNode := &fakeNode{c: make(chan raft.Ready, 1)}
 	fakeStorage := &mockStorage{saveErr: errors.New("save failed")}
@@ -399,7 +331,7 @@ func TestHostReportsBatchFailureAndStops_036m(t *testing.T) {
 		n:              fakeNode,
 	}
 
-	host, err := newRaftHost(ctx, rc)
+	host, err := newRaftHost(rc)
 	require.NoError(t, err)
 	host.Start()
 
@@ -418,6 +350,81 @@ func TestHostReportsBatchFailureAndStops_036m(t *testing.T) {
 		t.Fatal("timeout waiting for raft host stop")
 	}
 
-	require.False(t, host.started.Load())
 	require.False(t, fakeNode.advanced)
+}
+
+// ---------------------------------------------------------------------------
+// 036u — The Wiring (raftHost-level)
+// ---------------------------------------------------------------------------
+
+func TestHandleBatchUnblocksOnStopcWhenApplycHasNoReader_036u(t *testing.T) {
+	// handleBatch sends committed entries on the unbuffered applyc.
+	// If nothing reads applyc (e.g. apply loop already exited), the send
+	// must unblock when stopc is closed instead of hanging forever.
+	fn := &fakeNode{c: make(chan raft.Ready, 1)}
+	host, err := newRaftHost(raftHostConfig{
+		RaftHostConfig: newRaftHostConfig(),
+		n:              fn,
+	})
+	require.NoError(t, err)
+
+	host.Start()
+
+	// Send a Ready with committed entries — nobody reads applyc.
+	fn.c <- raft.Ready{
+		CommittedEntries: []*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("x")}},
+	}
+
+	// Give the goroutine time to reach the applyc send.
+	time.Sleep(20 * time.Millisecond)
+
+	// Stop must return (not deadlock) because handleBatch selects on stopc.
+	done := make(chan struct{})
+	go func() {
+		host.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// success — Stop returned
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop deadlocked — handleBatch did not unblock on stopc")
+	}
+}
+
+func TestStopCallsInnerNodeStop_036u(t *testing.T) {
+	fn := &fakeNode{c: make(chan raft.Ready, 1)}
+	host, err := newRaftHost(raftHostConfig{
+		RaftHostConfig: newRaftHostConfig(),
+		n:              fn,
+	})
+	require.NoError(t, err)
+
+	host.Start()
+	host.Stop()
+
+	require.True(t, fn.stopped, "raftHost.Stop must call node.Stop")
+}
+
+func TestDoubleStartIsNoop_036u(t *testing.T) {
+	fn := &fakeNode{c: make(chan raft.Ready, 1)}
+	host, err := newRaftHost(raftHostConfig{
+		RaftHostConfig: newRaftHostConfig(),
+		n:              fn,
+	})
+	require.NoError(t, err)
+
+	host.Start()
+	host.Start() // must not launch a second goroutine
+	host.Stop()
+
+	// If two goroutines were running, the second would panic on
+	// close(done) — or done would never close. A clean exit proves
+	// idempotency.
+	select {
+	case <-host.done:
+	default:
+		t.Fatal("expected host.done to be closed after Stop")
+	}
 }
