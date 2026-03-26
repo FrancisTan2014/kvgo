@@ -227,6 +227,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `writing` is broader; `text` is flatter; `prose` highlights explanatory language as a form
 - **where it breaks:** do not use it when plain `writing` is enough and no contrast in form is needed
 
+## purge
+- **meaning:** remove completely and deliberately, leaving nothing behind
+- **pressure:** use it when the removal is total and intentional — not trimming, not deprecating, but eliminating
+- **tone:** forceful, decisive, slightly dramatic
+- **nearby alternatives:** `remove` is neutral; `delete` is technical; `clean up` is gentler; `purge` stresses that nothing survives and the act is deliberate
+- **where it breaks:** too strong for partial removal or gradual deprecation; if something is kept or migrated, it is not a purge
+
 ## rationale
 - **meaning:** the underlying reason or justification for a choice
 - **pressure:** use it when the why matters more than the what
