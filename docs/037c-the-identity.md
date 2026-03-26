@@ -73,6 +73,18 @@ The follower's `handlePut` blocks on `w.Register(id)` until the entry with that 
 
 Each entry provides the remote node's ID and Raft address. The local node is not included in `--peers` — its identity comes from `--node-id` and `--raft-port`.
 
+### Failure modes
+
+Forwarding moves routing into the Raft layer, but it doesn't eliminate proposal loss. Three cases drop a proposal before it reaches the leader:
+
+1. **No leader known.** A follower that has never received a `MsgApp` has `lead == None`. `stepFollower` returns `ErrProposalDropped`. The client's `handlePut` propagates the error immediately — no silent loss.
+
+2. **Candidate state.** During an election, the node is a candidate. There is no leader to forward to, and a candidate shouldn't append to its own log (it might lose the election). `stepCandidate` returns `ErrProposalDropped`. etcd does the same — candidates are a transient black hole for proposals.
+
+3. **In-flight leader change.** A follower forwards `MsgProp` to node X, but by the time it arrives, X has stepped down. If X is now a follower with a known new leader, it re-forwards — the proposal bounces once and lands. If X is a candidate or a follower with no leader, the proposal is dropped. The originating follower's `handlePut` blocks on `w.Register(id)` until `WriteTimeout` fires. The client gets a timeout, not a success — safe but not ideal.
+
+In all three cases the safety property holds: no proposal is falsely acknowledged. The liveness gap — a proposal can be silently lost during transitions — is inherent in leader-based forwarding. etcd addresses this at the client layer: `clientv3` retries proposals on timeout. We defer client retry to a future episode.
+
 ## Minimum tests
 
 **Invariant:** a proposal on any node reaches the leader and commits across the cluster; the proposing node's waiter fires.
