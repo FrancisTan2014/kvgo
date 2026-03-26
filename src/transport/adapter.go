@@ -16,7 +16,6 @@ type streamAsRequest struct {
 }
 
 // WrapStreamAsRequest converts a StreamTransport to RequestTransport.
-// Useful for quorum reads on primary connection (which is a replication stream).
 func WrapStreamAsRequest(stream StreamTransport) RequestTransport {
 	return &streamAsRequest{stream: stream}
 }

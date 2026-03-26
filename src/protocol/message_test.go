@@ -28,18 +28,6 @@ func TestRequestRoundTrip(t *testing.T) {
 			name: "GET with empty key",
 			req:  Request{Cmd: CmdGet, Key: []byte{}},
 		},
-		{
-			name: "REPLICATE with seq",
-			req:  Request{Cmd: CmdReplicate, Seq: 456, Value: []byte("replid-123")},
-		},
-		{
-			name: "PING with seq (for heartbeat)",
-			req:  Request{Cmd: CmdPing, Seq: 789}, // Seq indicates primary's position
-		},
-		{
-			name: "REPLICAOF with primary address",
-			req:  Request{Cmd: CmdReplicaOf, Value: []byte("localhost:6379")},
-		},
 	}
 
 	for _, tt := range tests {
@@ -92,22 +80,6 @@ func TestResponseRoundTrip(t *testing.T) {
 			name: "StatusError",
 			resp: Response{Status: StatusError, Seq: 200},
 		},
-		{
-			name: "StatusReadOnly with primary address",
-			resp: Response{Status: StatusReadOnly, Value: []byte("primary:6379"), Seq: 5},
-		},
-		{
-			name: "StatusReplicaTooStale with primary address",
-			resp: Response{Status: StatusReplicaTooStale, Value: []byte("primary:6379"), Seq: 10},
-		},
-		{
-			name: "StatusPong",
-			resp: Response{Status: StatusPong, Seq: 0},
-		},
-		{
-			name: "StatusFullResync with snapshot",
-			resp: Response{Status: StatusFullResync, Value: []byte("snapshot-data"), Seq: 0},
-		},
 	}
 
 	for _, tt := range tests {
@@ -150,16 +122,6 @@ func TestResponseEncodeValidation(t *testing.T) {
 		{
 			name:    "StatusError with value (invalid)",
 			resp:    Response{Status: StatusError, Value: []byte("boom")},
-			wantErr: ErrInvalidMessage,
-		},
-		{
-			name:    "StatusPong with value (valid — carries term)",
-			resp:    Response{Status: StatusPong, Value: []byte("x")},
-			wantErr: nil,
-		},
-		{
-			name:    "StatusCleaning with value (invalid)",
-			resp:    Response{Status: StatusCleaning, Value: []byte("x")},
 			wantErr: ErrInvalidMessage,
 		},
 		{

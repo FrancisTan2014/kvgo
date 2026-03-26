@@ -215,7 +215,7 @@ func TestRaftPutRoundTrip_036q(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() {
-		errc <- s.raftPut(ctx)
+		errc <- s.handlePut(ctx)
 	}()
 
 	proposed := <-suite.fr.proposec
@@ -244,7 +244,7 @@ func TestRaftPutProposeError_036q(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() {
-		errc <- s.raftPut(ctx)
+		errc <- s.handlePut(ctx)
 	}()
 
 	select {
@@ -265,7 +265,7 @@ func TestRaftPutTimeout_036q(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() {
-		errc <- s.raftPut(ctx)
+		errc <- s.handlePut(ctx)
 	}()
 
 	// consume the proposal but never commit it
@@ -295,7 +295,7 @@ func TestRaftPutApplyError_036q(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() {
-		errc <- s.raftPut(ctx)
+		errc <- s.handlePut(ctx)
 	}()
 
 	proposed := <-suite.fr.proposec
@@ -427,7 +427,7 @@ func TestPutAppearsInServerDB_036u(t *testing.T) {
 	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
 
 	ctx := newRequestContext(protocol.CmdPut, "hello", "world")
-	err := leader.raftPut(ctx)
+	err := leader.handlePut(ctx)
 	require.NoError(t, err)
 
 	val, ok := leader.sm.Get("hello")
@@ -460,7 +460,7 @@ func TestPutThenShutdownDoesNotDeadlock_036u(t *testing.T) {
 	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
 
 	ctx := newRequestContext(protocol.CmdPut, "k", "v")
-	require.NoError(t, leader.raftPut(ctx))
+	require.NoError(t, leader.handlePut(ctx))
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -475,7 +475,7 @@ func TestPutAppearsInFollowerSM_036u(t *testing.T) {
 	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
 
 	ctx := newRequestContext(protocol.CmdPut, "hello", "world")
-	require.NoError(t, leader.raftPut(ctx))
+	require.NoError(t, leader.handlePut(ctx))
 
 	// Collect followers
 	followers := make([]*Server, 0, 2)

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"kvgo/raftpb"
 	"kvgo/transport"
 	rafttransport "kvgo/transport/raft"
-	"kvgo/utils"
 	"log/slog"
 	"net"
 	"os"
@@ -20,17 +18,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-// Consistency Model
-//
-// Replication is async, fire-and-forget with no delivery guarantees.
-// The primary forwards writes to replicas but does not wait for acknowledgment.
-// If a replica disconnects and reconnects, it will miss all writes during the gap.
-//
-// This is eventual consistency at best — replicas may lag or diverge permanently.
-// We accept this trade-off to keep the system simple and fast (following Redis).
-//
-// Sequence numbers provide visibility into replication lag but do not fix it.
 
 var (
 	ErrAlreadyStarted = errors.New("server: already started")
@@ -50,40 +37,18 @@ type Options struct {
 	Port         uint16       // ignored when Network is NetworkUnix
 	RaftPort     uint16       // Raft channel
 	RaftListener net.Listener // optional: pre-bound raft listener (for tests with :0 ports)
-	ReplicaOf    string       // non-empty value indicates that it is a follower
 	DataDir      string
 
-	ReadTimeout         time.Duration
-	WriteTimeout        time.Duration
-	MaxFrameSize        int
-	BacklogSizeLimit    int64         // default 16MB
-	BacklogTrimDuration time.Duration // default 100ms
-
-	QuorumWriteTimeout time.Duration // default 500ms, how long to wait for quorum ACKs before timeout (Episode 026)
-	QuorumReadTimeout  time.Duration // default 500ms
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	MaxFrameSize int
 
 	// SyncInterval controls how often the WAL is fsynced (latency vs throughput tradeoff).
 	// Lower values reduce latency but increase fsync overhead.
 	// Zero means use engine.DefaultSyncInterval (100ms).
 	SyncInterval time.Duration
 
-	// Staleness bounds (Episode 025): replica rejects reads when exceeding thresholds
-	ReplicaStaleHeartbeat time.Duration // time-based: reject if no heartbeat for this duration (partition detection), default 1s
-	ReplicaStaleLag       int           // sequence-based: reject if > N operations behind (backlog limit), default 1000
-
-	DiscoveryTimeout time.Duration // default 1s
-
 	Logger *slog.Logger // optional debug logger; nil disables logging
-}
-
-type quorumWriteState struct {
-	mu            sync.Mutex // Per-request lock
-	needed        int
-	ackCount      int32 // Protected by mu
-	ackCh         chan struct{}
-	closeOnce     sync.Once
-	failed        atomic.Bool         // true if NACK received
-	ackedReplicas map[string]struct{} // Track which replicas ACK'd by address (protected by mu)
 }
 
 type StateMachine interface {
@@ -110,62 +75,9 @@ type Server struct {
 	// Request dispatch
 	requestHandlers map[protocol.Cmd]HandlerFunc
 
-	// Replication state (primary role)
-	seq      atomic.Uint64 // monotonic sequence number for writes
-	replicas map[string]*replicaConn
-	replid   string
+	wg sync.WaitGroup
 
-	// Replication state (replica role)
-	primary       transport.StreamTransport
-	primaryNodeID string        // primary's nodeID (set from TOPOLOGY, used for ACK via peer channel)
-	lastSeq       atomic.Uint64 // last applied sequence number
-	lastHeartbeat time.Time     // updated from heartbeat messages
-	primarySeq    uint64        // primary's position from heartbeat; compared with lastSeq for staleness detection
-
-	// Replication loop control
-	relocateMu sync.Mutex // serializes relocate() calls — prevents concurrent teardown+restart
-	replCtx    context.Context
-	replCancel context.CancelFunc
-	replDone   chan struct{} // closed when replicationLoop goroutine exits
-	wg         sync.WaitGroup
-
-	// Quorum control
-	quorumMu     sync.RWMutex
-	quorumWrites map[string]*quorumWriteState
-	quorumAckCh  chan string // Quorum ack channel
-
-	// Cluster management
-	peerManager *PeerManager
-	nodeID      string
-	term        atomic.Uint64
-	votedFor    string
-	role        atomic.Uint32
-	roleChanged chan struct{}
-	roleMu      sync.Mutex
-	fenced      atomic.Bool // set on quorum-loss step-down; cleared when connected to a real leader
-
-	// Leader transferring
-	transferMu         sync.RWMutex
-	seqReachedCh       chan struct{}
-	transferring       atomic.Bool // set on leader transfer; rejects writes until transfer completes or times out
-	pendingTransferSeq atomic.Int64
-
-	// Partial resync backlog
-	backlog       list.List
-	backlogSize   atomic.Int64 // Int64 for direct subtraction; always non-negative
-	backlogMu     sync.RWMutex
-	backlogCtx    context.Context
-	backlogCancel context.CancelFunc
-
-	// Cleanup
-	cleanupInProgress atomic.Bool
-
-	// Persistence
-	metaFile *os.File
-
-	//==================================================
-	// The Raft era
-	//==================================================
+	// Raft subsystem
 	raftHost      RaftHost
 	raftTransport RaftTransporter
 	raftStorage   *raft.DurableStorage
@@ -200,18 +112,8 @@ func NewServer(opts Options) (*Server, error) {
 		opts:            opts,
 		conns:           make(map[transport.StreamTransport]struct{}),
 		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
-		replicas:        make(map[string]*replicaConn),
-		lastHeartbeat:   time.Now(), // Initialize heartbeat timer (updated by PING messages)
-		quorumAckCh:     make(chan string),
-		quorumWrites:    make(map[string]*quorumWriteState),
-		roleChanged:     make(chan struct{}),
 		w:               newWait(),
 	}
-
-	s.peerManager = NewPeerManager(
-		DialPeer(opts.Protocol, s.network(), opts.ReadTimeout),
-		s.log(),
-	)
 
 	s.registerRequestHandlers()
 
@@ -242,9 +144,8 @@ func (s *Server) Start() (err error) {
 
 	defer func() {
 		if err != nil {
-			// Cancel replication loop if started
-			if s.replCancel != nil {
-				s.replCancel()
+			if s.cancel != nil {
+				s.cancel()
 			}
 			if ln != nil {
 				_ = ln.Close()
@@ -258,43 +159,6 @@ func (s *Server) Start() (err error) {
 			s.started.Store(false)
 		}
 	}()
-
-	if err = s.restoreState(); err != nil {
-		return err
-	}
-
-	if s.nodeID == "" {
-		s.nodeID = utils.GenerateUniqueID()
-	}
-
-	// Role determination
-	if s.opts.ReplicaOf == "" {
-		if len(s.peerManager.NodeIDs()) > 0 {
-			s.role.Store(uint32(RoleFollower))
-			leader, term, found := s.discoverCluster()
-			if found {
-				s.term.Store(term)
-				s.primaryNodeID = leader.NodeID
-				s.opts.ReplicaOf = leader.Addr
-				s.peerManager.MergePeers([]PeerInfo{leader})
-			}
-			s.lastHeartbeat = time.Now() // reset election timer after discovery
-		} else {
-			s.role.Store(uint32(RoleLeader))
-		}
-	} else {
-		s.role.Store(uint32(RoleFollower))
-	}
-
-	if s.replid == "" && s.isLeader() {
-		// First boot as primary — reuse nodeID as the initial replication lineage ID.
-		// A separate replid is only needed after failover (new primary, new lineage).
-		s.replid = s.nodeID
-	}
-
-	if s.term.Load() == 0 && s.isLeader() {
-		s.term.Store(1)
-	}
 
 	lock, err = acquireDataDirLock(s.opts.DataDir)
 	if err != nil {
@@ -312,15 +176,8 @@ func (s *Server) Start() (err error) {
 	if err != nil {
 		return err
 	}
-	s.db = db   // Assign now so startReplicationLoop can use it
-	s.sm = s.db // TODO: consolidate them
-
-	// Start replication loop only for replicas
-	if !s.isLeader() {
-		s.startReplicationLoop()
-	} else {
-		s.startBacklogTrimmer()
-	}
+	s.db = db
+	s.sm = s.db
 
 	ln, err = net.Listen(s.network(), s.listenAddr())
 	if err != nil {
@@ -331,10 +188,6 @@ func (s *Server) Start() (err error) {
 
 	go s.acceptLoop()
 	go s.monitorDBHealth()
-	go s.heartbeatLoop()
-	go s.fenceLoop()
-	go s.reconcileLoop()
-	go s.peerManager.Run(s.ctx, peerHealthInterval, s.probePeerHealth)
 
 	if s.raftTransport == nil || s.raftHost == nil {
 		return errors.New("server: raft subsystem not initialized")
@@ -344,7 +197,6 @@ func (s *Server) Start() (err error) {
 	}
 	s.raftHost.Start()
 
-	// TODO: consider register goroutines in a WaitGroup
 	s.wg.Go(func() { s.run() })
 
 	return nil
@@ -388,11 +240,6 @@ func (s *Server) initializeRaftHost() error {
 
 func (s *Server) Process(ctx context.Context, m *raftpb.Message) error {
 	return s.raftHost.Step(ctx, m)
-}
-
-// pingTimeout returns the timeout for heartbeat pings.
-func (s *Server) pingTimeout() time.Duration {
-	return s.opts.ReadTimeout
 }
 
 func (s *Server) network() string {
@@ -453,12 +300,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		_ = s.ln.Close()
 	}
 
-	// Cancel all subsystem contexts (replication loop, backlog trimmer, etc.)
+	// Cancel all subsystem contexts.
 	if s.cancel != nil {
 		s.cancel()
-	}
-	if s.primary != nil {
-		_ = s.primary.Close()
 	}
 
 	// Wait for in-flight requests to finish, or context to cancel.
@@ -478,8 +322,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.wg.Wait()
 	}
 
-	s.peerManager.Close()
-
 	var err error
 	if s.db != nil {
 		s.log().Info("closing database")
@@ -493,10 +335,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 				err = errors.Join(err, lockErr)
 			}
 		}
-	}
-
-	if s.metaFile != nil {
-		_ = s.metaFile.Close()
 	}
 
 	if s.raftHost != nil {
@@ -515,15 +353,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) closeConnections() {
-	// Force close active connections to unblock handlers.
 	s.connMu.Lock()
 	for c := range s.conns {
 		_ = c.Close()
-	}
-	for _, rc := range s.replicas {
-		rc.connected.Store(false) // gate off senders before closing channel
-		close(rc.sendCh)          // signal writer goroutine to exit
-		_ = rc.transport.Close()
 	}
 	s.connMu.Unlock()
 }
@@ -543,27 +375,13 @@ func (s *Server) acceptLoop() {
 		s.connMu.Unlock()
 
 		s.connWg.Go(func() {
-			takenOver := s.handleRequest(t, s.opts.ReadTimeout)
+			s.handleRequest(t, s.opts.ReadTimeout)
 			s.connMu.Lock()
 			delete(s.conns, t)
 			s.connMu.Unlock()
-			if !takenOver {
-				_ = t.Close()
-			}
-			// If takenOver=true, connection ownership transferred to handler (e.g., replication)
+			_ = t.Close()
 		})
 	}
-}
-
-func (s *Server) getReplicaSnapshot() map[string]*replicaConn {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-
-	snapshot := make(map[string]*replicaConn, len(s.replicas))
-	for id, rc := range s.replicas {
-		snapshot[id] = rc
-	}
-	return snapshot
 }
 
 func (s *Server) log() *slog.Logger {
@@ -621,32 +439,4 @@ func (s *Server) applyEntry(raw []byte) {
 
 func (s *Server) nextRequestID() uint64 {
 	return s.reqIDGen.Add(1)
-}
-
-func (s *Server) raftPut(ctx *RequestContext) error {
-	id := s.nextRequestID()
-	ch := s.w.Register(id)
-
-	timeoutCtx, cancel := context.WithTimeout(s.ctx, s.opts.WriteTimeout)
-	defer cancel()
-
-	encoded, err := protocol.EncodeRequest(ctx.Request)
-	if err != nil {
-		s.w.Trigger(id, err)
-	} else {
-		data := marshalEnvelope(id, encoded)
-		if err := s.raftHost.Propose(timeoutCtx, data); err != nil {
-			s.w.Trigger(id, err)
-		}
-	}
-
-	select {
-	case result := <-ch:
-		if result != nil {
-			return result.(error)
-		}
-		return s.responseWithStatus(ctx, protocol.StatusOK)
-	case <-timeoutCtx.Done():
-		return timeoutCtx.Err()
-	}
 }

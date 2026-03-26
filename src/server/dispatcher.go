@@ -10,33 +10,16 @@ import (
 type HandlerFunc func(*Server, *RequestContext) error
 
 type RequestContext struct {
-	StreamTransport  transport.StreamTransport
-	RequestTransport transport.RequestTransport // Same object as StreamTransport (MultiplexedTransport)
-	Request          protocol.Request           // Decoded request (replaces raw Payload)
-	takenOver        bool                       // If true, connection ownership transferred to handler; caller should not close connection
+	StreamTransport transport.StreamTransport
+	Request         protocol.Request // Decoded request (replaces raw Payload)
 }
 
 func (s *Server) registerRequestHandlers() {
 	s.requestHandlers[protocol.CmdGet] = (*Server).handleGet
 	s.requestHandlers[protocol.CmdPut] = (*Server).handlePut
-	s.requestHandlers[protocol.CmdReplicate] = (*Server).handleReplicate
-	s.requestHandlers[protocol.CmdPing] = (*Server).handlePing
-	s.requestHandlers[protocol.CmdPromote] = (*Server).handlePromote
-	s.requestHandlers[protocol.CmdReplicaOf] = (*Server).handleReplicaOf
-	s.requestHandlers[protocol.CmdCleanup] = (*Server).handleCleanup
-	s.requestHandlers[protocol.CmdAck] = (*Server).handleAck
-	s.requestHandlers[protocol.CmdNack] = (*Server).handleNack
-	s.requestHandlers[protocol.CmdTopology] = (*Server).handleTopology
-	s.requestHandlers[protocol.CmdPeerHandshake] = (*Server).handlePeerHandshake
-	s.requestHandlers[protocol.CmdVoteRequest] = (*Server).handleVoteRequest
-	s.requestHandlers[protocol.CmdPreVoteRequest] = (*Server).handlePreVoteRequest
-	s.requestHandlers[protocol.CmdDiscovery] = (*Server).handleDiscovery
-	s.requestHandlers[protocol.CmdTransferLeader] = (*Server).handleTransferLeader
-	s.requestHandlers[protocol.CmdTimeoutNow] = (*Server).handleTimeoutNow
-	s.requestHandlers[protocol.CmdHealth] = (*Server).handleHealth
 }
 
-func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duration) (takenOver bool) {
+func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duration) {
 	for {
 		readCtx := context.Background()
 		if timeout > 0 {
@@ -46,34 +29,29 @@ func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duratio
 		}
 		payload, err := t.Receive(readCtx)
 		if err != nil {
-			return false
+			return
 		}
 
 		req, err := protocol.DecodeRequest(payload)
 		if err != nil {
 			s.log().Error("failed to decode request", "error", err)
-			return false
+			return
 		}
 
 		handler := s.requestHandlers[req.Cmd]
 		if handler == nil {
 			s.log().Error("unsupported request detected", "cmd", req.Cmd)
-			return false
+			return
 		}
 
 		ctx := &RequestContext{
-			StreamTransport:  t,
-			RequestTransport: transport.AsRequestTransport(t),
-			Request:          req,
+			StreamTransport: t,
+			Request:         req,
 		}
 
 		if err := handler(s, ctx); err != nil {
 			s.log().Error("failed to process the request", "cmd", req.Cmd, "error", err)
-			return false
-		}
-
-		if ctx.takenOver {
-			return true // Handler owns connection now, exit loop
+			return
 		}
 	}
 }

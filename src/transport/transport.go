@@ -9,8 +9,8 @@ import "context"
 // StreamTransport abstracts bidirectional byte streaming.
 //
 // Use cases:
-//   - Replication (replica→primary stream)
 //   - Client connections (request-response over persistent connection)
+//   - Raft message streaming between peers
 //
 // Thread safety: Implementations must be safe for concurrent Send and Receive.
 //
@@ -33,8 +33,7 @@ type StreamTransport interface {
 // RequestTransport abstracts request-response communication.
 //
 // Use cases:
-//   - Quorum reads (query peer replicas)
-//   - Service discovery (health checks, peer queries)
+//   - Peer queries (health checks, service discovery)
 //
 // Thread safety: Implementations must support concurrent requests.
 //

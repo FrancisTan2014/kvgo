@@ -31,7 +31,7 @@ func main() {
 	defer conn.Close()
 
 	fmt.Printf("connected to %s\n", *addr)
-	fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, transfer <nodeID>, cleanup, quit")
+	fmt.Println("commands: get <key>, put <key> <value>, quit")
 	fmt.Println()
 
 	t := transport.NewMultiplexedTransport(conn)
@@ -59,27 +59,10 @@ func main() {
 
 		case "get":
 			if len(parts) < 2 {
-				fmt.Println("usage: get [--quorum] <key>")
+				fmt.Println("usage: get <key>")
 				continue
 			}
-			// Parse flags: get --quorum key OR get key --quorum
-			var quorum bool
-			var key string
-			if parts[1] == "--quorum" {
-				if len(parts) < 3 {
-					fmt.Println("usage: get [--quorum] <key>")
-					continue
-				}
-				quorum = true
-				key = parts[2]
-			} else {
-				key = parts[1]
-				if len(parts) > 2 && parts[2] == "--quorum" {
-					quorum = true
-				}
-			}
-
-			if err := doGet(t, key, quorum, *timeout); err != nil {
+			if err := doGet(t, parts[1], *timeout); err != nil {
 				fmt.Printf("error: %v\n", err)
 				if isConnectionError(err) {
 					fmt.Println("connection lost, exiting")
@@ -89,83 +72,10 @@ func main() {
 
 		case "put":
 			if len(parts) < 3 {
-				fmt.Println("usage: put [--quorum] <key> <value>")
+				fmt.Println("usage: put <key> <value>")
 				continue
 			}
-			// Parse flags: put --quorum key value OR put key value --quorum
-			var quorum bool
-			var key, value string
-			if parts[1] == "--quorum" {
-				if len(parts) < 3 {
-					fmt.Println("usage: put [--quorum] <key> <value>")
-					continue
-				}
-				quorum = true
-				// Reparse with 4 parts to get key and value
-				restParts := strings.SplitN(line, " ", 4)
-				if len(restParts) < 4 {
-					fmt.Println("usage: put [--quorum] <key> <value>")
-					continue
-				}
-				key = restParts[2]
-				value = restParts[3]
-			} else {
-				key = parts[1]
-				value = parts[2]
-				// Check for trailing --quorum flag
-				restParts := strings.SplitN(line, " ", 4)
-				if len(restParts) > 3 && restParts[3] == "--quorum" {
-					quorum = true
-				}
-			}
-			_, err := doPut(t, key, value, quorum, *timeout)
-			if err != nil {
-				fmt.Printf("error: %v\n", err)
-				if isConnectionError(err) {
-					fmt.Println("connection lost, exiting")
-					os.Exit(1)
-				}
-			}
-
-		case "promote":
-			if err := doPromote(t, *timeout); err != nil {
-				fmt.Printf("error: %v\n", err)
-				if isConnectionError(err) {
-					fmt.Println("connection lost, exiting")
-					os.Exit(1)
-				}
-			}
-
-		case "replicaof":
-			if len(parts) < 2 {
-				fmt.Println("usage: replicaof <host:port>")
-				continue
-			}
-			primaryAddr := parts[1]
-			if err := doReplicaOf(t, primaryAddr, *timeout); err != nil {
-				fmt.Printf("error: %v\n", err)
-				if isConnectionError(err) {
-					fmt.Println("connection lost, exiting")
-					os.Exit(1)
-				}
-			}
-
-		case "cleanup":
-			if err := doCleanup(t, *timeout); err != nil {
-				fmt.Printf("error: %v\n", err)
-				if isConnectionError(err) {
-					fmt.Println("connection lost, exiting")
-					os.Exit(1)
-				}
-			}
-
-		case "transfer":
-			if len(parts) < 2 {
-				fmt.Println("usage: transfer <nodeID>")
-				continue
-			}
-			target := parts[1]
-			if err := doTransfer(t, target, *timeout); err != nil {
+			if err := doPut(t, parts[1], parts[2], *timeout); err != nil {
 				fmt.Printf("error: %v\n", err)
 				if isConnectionError(err) {
 					fmt.Println("connection lost, exiting")
@@ -175,7 +85,7 @@ func main() {
 
 		default:
 			fmt.Printf("unknown command: %s\n", cmd)
-			fmt.Println("commands: get [--quorum] <key>, put [--quorum] <key> <value>, promote, replicaof <host:port>, transfer <nodeID>, cleanup, quit")
+			fmt.Println("commands: get <key>, put <key> <value>, quit")
 		}
 	}
 
@@ -184,43 +94,8 @@ func main() {
 	}
 }
 
-func doPromote(t transport.StreamTransport, timeout time.Duration) error {
-	req := protocol.Request{Cmd: protocol.CmdPromote}
-	payload, err := protocol.EncodeRequest(req)
-	if err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := t.Send(ctx, payload); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-
-	respPayload, err := t.Receive(ctx)
-	if err != nil {
-		return fmt.Errorf("read: %w", err)
-	}
-
-	resp, err := protocol.DecodeResponse(respPayload)
-	if err != nil {
-		return fmt.Errorf("decode: %w", err)
-	}
-
-	switch resp.Status {
-	case protocol.StatusOK:
-		fmt.Println("OK (promoted)")
-	case protocol.StatusError:
-		fmt.Println("(server error)")
-	default:
-		fmt.Printf("(unexpected status: %d)\n", resp.Status)
-	}
-	return nil
-}
-
-func doGet(t transport.StreamTransport, key string, quorum bool, timeout time.Duration) error {
-	req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key), RequireQuorum: quorum}
+func doGet(t transport.StreamTransport, key string, timeout time.Duration) error {
+	req := protocol.Request{Cmd: protocol.CmdGet, Key: []byte(key)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -246,24 +121,8 @@ func doGet(t transport.StreamTransport, key string, quorum bool, timeout time.Du
 	switch resp.Status {
 	case protocol.StatusOK:
 		fmt.Printf("%s\n", resp.Value)
-		if quorum {
-			fmt.Printf("(quorum read: verified across majority, seq=%d)\n", resp.Seq)
-		}
 	case protocol.StatusNotFound:
 		fmt.Println("(not found)")
-		if quorum {
-			fmt.Printf("(verified not found across majority)\n")
-		}
-	case protocol.StatusReplicaTooStale:
-		// Replica too stale, server suggests redirect to primary
-		primaryAddr := string(resp.Value)
-		fmt.Printf("(replica too stale, try primary: %s)\n", primaryAddr)
-	case protocol.StatusQuorumFailed:
-		fmt.Println("(quorum read failed: insufficient replica responses)")
-	case protocol.StatusReadOnly:
-		// Quorum read timed out or failed, server suggests redirect to primary
-		primaryAddr := string(resp.Value)
-		fmt.Printf("(replica lagging, try primary: %s)\n", primaryAddr)
 	case protocol.StatusError:
 		fmt.Println("(server error)")
 	default:
@@ -272,102 +131,8 @@ func doGet(t transport.StreamTransport, key string, quorum bool, timeout time.Du
 	return nil
 }
 
-func doPut(t transport.StreamTransport, key, value string, quorum bool, timeout time.Duration) (uint64, error) {
-	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value), RequireQuorum: quorum}
-	payload, err := protocol.EncodeRequest(req)
-	if err != nil {
-		return 0, fmt.Errorf("encode: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := t.Send(ctx, payload); err != nil {
-		return 0, fmt.Errorf("write: %w", err)
-	}
-
-	respPayload, err := t.Receive(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("read: %w", err)
-	}
-
-	resp, err := protocol.DecodeResponse(respPayload)
-	if err != nil {
-		return 0, fmt.Errorf("decode: %w", err)
-	}
-
-	switch resp.Status {
-	case protocol.StatusOK:
-		if quorum {
-			fmt.Println("OK (quorum write succeeded)")
-		} else {
-			fmt.Println("OK")
-		}
-		return resp.Seq, nil // Return seq for read-your-writes tracking
-	case protocol.StatusReadOnly:
-		// Server is a replica, redirect to primary
-		primaryAddr := string(resp.Value)
-		fmt.Printf("(replica, redirecting to primary: %s)\n", primaryAddr)
-		return doPutToPrimary(key, value, quorum, primaryAddr, timeout)
-	case protocol.StatusError:
-		fmt.Println("(server error)")
-	default:
-		fmt.Printf("(unexpected status: %d)\n", resp.Status)
-	}
-	return 0, nil
-}
-
-func doPutToPrimary(key, value string, quorum bool, primaryAddr string, timeout time.Duration) (uint64, error) {
-	// Connect to primary and retry
-	conn, err := net.DialTimeout("tcp", primaryAddr, timeout)
-	if err != nil {
-		return 0, fmt.Errorf("connect to primary: %w", err)
-	}
-	defer conn.Close()
-
-	t := transport.NewMultiplexedTransport(conn)
-	defer t.Close()
-	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value), RequireQuorum: quorum}
-	payload, err := protocol.EncodeRequest(req)
-	if err != nil {
-		return 0, fmt.Errorf("encode: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := t.Send(ctx, payload); err != nil {
-		return 0, fmt.Errorf("write to primary: %w", err)
-	}
-
-	respPayload, err := t.Receive(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("read from primary: %w", err)
-	}
-
-	resp, err := protocol.DecodeResponse(respPayload)
-	if err != nil {
-		return 0, fmt.Errorf("decode: %w", err)
-	}
-
-	switch resp.Status {
-	case protocol.StatusOK:
-		if quorum {
-			fmt.Println("OK (quorum write succeeded)")
-		} else {
-			fmt.Println("OK")
-		}
-		return resp.Seq, nil // Return seq from primary
-	case protocol.StatusError:
-		fmt.Println("(server error)")
-	default:
-		fmt.Printf("(unexpected status: %d)\n", resp.Status)
-	}
-	return 0, nil
-}
-
-func doReplicaOf(t transport.StreamTransport, primaryAddr string, timeout time.Duration) error {
-	req := protocol.Request{Cmd: protocol.CmdReplicaOf, Value: []byte(primaryAddr)}
+func doPut(t transport.StreamTransport, key, value string, timeout time.Duration) error {
+	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: []byte(value)}
 	payload, err := protocol.EncodeRequest(req)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -401,91 +166,18 @@ func doReplicaOf(t transport.StreamTransport, primaryAddr string, timeout time.D
 	return nil
 }
 
-func doCleanup(t transport.StreamTransport, timeout time.Duration) error {
-	req := protocol.Request{Cmd: protocol.CmdCleanup}
-	payload, err := protocol.EncodeRequest(req)
-	if err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := t.Send(ctx, payload); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-
-	respPayload, err := t.Receive(ctx)
-	if err != nil {
-		return fmt.Errorf("read: %w", err)
-	}
-
-	resp, err := protocol.DecodeResponse(respPayload)
-	if err != nil {
-		return fmt.Errorf("decode: %w", err)
-	}
-
-	switch resp.Status {
-	case protocol.StatusOK:
-		fmt.Println("OK (cleanup started)")
-	case protocol.StatusError:
-		fmt.Println("(server error)")
-	default:
-		fmt.Printf("(unexpected status: %d)\n", resp.Status)
-	}
-	return nil
-}
-
-func doTransfer(t transport.StreamTransport, target string, timeout time.Duration) error {
-	req := protocol.NewTransferLeaderRequest(target)
-	payload, err := protocol.EncodeRequest(req)
-	if err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := t.Send(ctx, payload); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-
-	respPayload, err := t.Receive(ctx)
-	if err != nil {
-		return fmt.Errorf("read: %w", err)
-	}
-
-	resp, err := protocol.DecodeResponse(respPayload)
-	if err != nil {
-		return fmt.Errorf("decode: %w", err)
-	}
-
-	switch resp.Status {
-	case protocol.StatusOK:
-		fmt.Println("OK (transfer initiated)")
-	case protocol.StatusError:
-		fmt.Println("(server error — target may not be connected or reachable)")
-	default:
-		fmt.Printf("(unexpected status: %d)\n", resp.Status)
-	}
-	return nil
-}
-
 // isConnectionError returns true if the error indicates the connection is dead.
 func isConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// EOF means server closed the connection.
 	if errors.Is(err, io.EOF) {
 		return true
 	}
-	// Check for network errors (connection reset, broken pipe, etc.).
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return true
 	}
-	// Also check for common wrapped errors.
 	errStr := err.Error()
 	return strings.Contains(errStr, "connection reset") ||
 		strings.Contains(errStr, "broken pipe") ||

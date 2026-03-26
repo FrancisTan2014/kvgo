@@ -220,7 +220,7 @@ func (t *MultiplexedTransport) startReadLoop() {
 		payloadData := payload[4:]
 
 		if requestID == 0 {
-			// Streaming message (replication) - no response expected
+			// Streaming message - no response expected
 			// These are handled by direct Receive() calls
 			// Skip in readLoop (or queue if implementing full multiplexing)
 			continue

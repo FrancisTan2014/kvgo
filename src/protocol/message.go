@@ -13,15 +13,14 @@ var (
 	ErrUnknownStatus  = errors.New("protocol: unknown status")
 )
 
-const Delimiter = "\n"
-
 const (
 	u8Size  = 1
 	u32Size = 4
 	u64Size = 8
 
 	// Uniform request header (all commands):
-	// [cmd u8][flags u8][seq u64][ridLen u32][klen u32][vlen u32][requestId][key][value]
+	// [cmd u8][flags u8][seq u64][ridLen u32][klen u32][vlen u32][key][value]
+	// ridLen is reserved (always 0 post-purge) for wire compatibility.
 	requestHeaderSize = u8Size + u8Size + u64Size + u32Size + u32Size + u32Size // 22 bytes
 	requestCmdOff     = 0
 	requestFlagsOff   = requestCmdOff + u8Size     // 1
@@ -41,92 +40,37 @@ const (
 
 // Request flags indicate which optional fields are meaningful
 const (
-	FlagHasSeq        = 1 << 0 // seq field is meaningful (CmdPut, CmdReplicate)
-	FlagRequireQuorum = 1 << 1 // RequireQuorum field is meaningful (CmdPut with quorum write)
-	FlagHasRequestId  = 1 << 2 // requestId field is present (quorum write tracking)
+	FlagHasSeq = 1 << 0 // seq field is meaningful (CmdPut)
 )
 
 type Cmd uint8
 
 const (
-	CmdGet            Cmd = 1  // Retrieve value by key
-	CmdPut            Cmd = 2  // Store key-value pair
-	CmdReplicate      Cmd = 3  // Establish replication connection
-	CmdPing           Cmd = 4  // Health check
-	CmdPromote        Cmd = 5  // Promote replica to primary
-	CmdReplicaOf      Cmd = 6  // Configure as replica of primary
-	CmdCleanup        Cmd = 7  // Trigger value file compaction
-	CmdAck            Cmd = 8  // Replica ACKs
-	CmdNack           Cmd = 9  // Replica negative ACK (write failed)
-	CmdTopology       Cmd = 10 // Topology broadcast
-	CmdPeerHandshake  Cmd = 11 // Peer handshake
-	CmdPreVoteRequest Cmd = 12 // PreVote probe (no term increment)
-	CmdVoteRequest    Cmd = 13 // Election request
-	CmdDiscovery      Cmd = 14 // Discovery request
-	CmdTransferLeader Cmd = 15 // Leader transfer start
-	CmdTimeoutNow     Cmd = 16 // Tell the target follower to start an election right now
-	CmdHealth         Cmd = 17 // General liveness check (no heartbeat/term semantics)
+	CmdGet Cmd = 1 // Retrieve value by key
+	CmdPut Cmd = 2 // Store key-value pair
 )
 
 type Status uint8
 
 const (
-	StatusOK                Status = iota // Success
-	StatusNotFound                        // Key not found (GET)
-	StatusError                           // Generic server error
-	StatusReadOnly                        // Replica cannot accept writes; Value contains primary address
-	StatusPong                            // Response to PING
-	StatusFullResync                      // Primary requires full resync; Value contains snapshot
-	StatusCleaning                        // Cleanup in progress, writes temporarily rejected
-	StatusReplicaTooStale                 // Replica exceeds staleness bounds; client should retry another replica or primary
-	StatusQuorumFailed                    // Quorum read failed; insufficient replica responses
-	StatusPreVoteResponse                 // PreVote response; Value contains term and granted (same format as VoteResponse)
-	StatusVoteResponse                    // Vote response; Value contains vote granted/denied
-	StatusDiscoveryResponse               // Discovery response; Value contains current term and leader address
-	StatusNotLeader                       // Server cannot accept writes (leader transfer, quorum-loss step-down); describes the effect, not the mechanism
+	StatusOK       Status = iota // Success
+	StatusNotFound               // Key not found (GET)
+	StatusError                  // Generic server error
 
 	statusMaxKnown // Sentinel: update when adding new status codes
 )
 
 type Request struct {
-	Cmd Cmd
-	// Key is the lookup key for KV commands.
-	//   CmdGet, CmdPut: the database key
-	//   All others: unused (empty)
-	Key []byte
-	// Value carries command-specific payload.
-	// Use the typed constructors/parsers in builders.go instead of
-	// encoding/decoding this field directly.
-	//   CmdPut:          DB value
-	//   CmdReplicate:    see NewReplicateRequest / ParseReplicateValue
-	//   CmdPing:         see NewPingRequest / ParsePingTerm
-	//   CmdReplicaOf:    primary address (host:port)
-	//   CmdAck, CmdNack: sender's nodeID (for recentActive tracking)
-	//   CmdTopology:     see NewTopologyRequest / ParseTopologyValue
-	//   CmdVoteRequest:  see NewVoteRequest / ParseVoteRequestValue
-	//   CmdDiscovery:    see NewDiscoveryRequest / ParseDiscoveryRequestValue
-	//   Others: unused (empty)
-	Value         []byte
-	Seq           uint64 // Sequence number (meaningful if FlagHasSeq set: CmdPut, CmdReplicate)
-	RequireQuorum bool   // Quorum write/read (meaningful if FlagRequireQuorum set: CmdPut/CmdGet with quorum)
-	RequestId     string // Unique ID for request tracing (meaningful if FlagHasRequestId set: quorum writes, ACKs)
+	Cmd   Cmd
+	Key   []byte // CmdGet, CmdPut: the database key
+	Value []byte // CmdPut: the database value
+	Seq   uint64 // Sequence number (meaningful if FlagHasSeq set)
 }
 
 type Response struct {
 	Status Status
-	// Value carries status-specific payload.
-	// Use the typed constructors/parsers in builders.go instead of
-	// encoding/decoding this field directly.
-	//   StatusOK (GET):          retrieved DB value
-	//   StatusReadOnly:          primary address for redirect
-	//   StatusReplicaTooStale:   primary address for redirect
-	//   StatusFullResync:        replid for timeline identification
-	//   StatusPong:              see NewPongResponse / ParsePongTerm
-	//   StatusVoteResponse:      see NewVoteResponse / ParseVoteResponseValue
-	//   StatusDiscoveryResponse: see NewDiscoveryResponse / ParseDiscoveryResponseValue
-	//   Others: unused (empty)
-	Value []byte
-	Seq   uint64 // Sequence number at time of response (for tracking replication lag)
+	Value  []byte // StatusOK (GET): retrieved DB value
+	Seq    uint64
 }
 
 func lenFromU32(u uint32) (int, bool) {
@@ -155,31 +99,18 @@ func putU64LE(buf []byte, off int, v uint64) {
 
 // statusCanCarryValue returns true if the status code is allowed to have a non-empty value field.
 func statusCanCarryValue(st Status) bool {
-	return st == StatusOK ||
-		st == StatusFullResync ||
-		st == StatusReadOnly ||
-		st == StatusReplicaTooStale ||
-		st == StatusPreVoteResponse ||
-		st == StatusVoteResponse ||
-		st == StatusPong ||
-		st == StatusDiscoveryResponse
+	return st == StatusOK
 }
 
 // EncodeRequest encodes a Request into a payload (without the outer frameLen).
 //
 // Uniform request format (all commands):
 //
-//	[cmd uint8][flags uint8][seq uint64 LE][ridLen uint32 LE][klen uint32 LE][vlen uint32 LE][requestId bytes][key bytes][value bytes]
+//	[cmd uint8][flags uint8][seq uint64 LE][klen uint32 LE][vlen uint32 LE][key bytes][value bytes]
 //
 // Flags indicate which fields are meaningful:
-//   - FlagHasSeq: seq field is used (CmdPut, CmdReplicate)
-//   - FlagRequireQuorum: quorum consistency is required (CmdPut/CmdGet)
-//   - FlagHasRequestId: requestId field is present (quorum writes, ACKs)
+//   - FlagHasSeq: seq field is used (CmdPut)
 func EncodeRequest(req Request) ([]byte, error) {
-	ridlen := len(req.RequestId)
-	if err := ensureU32Len(ridlen); err != nil {
-		return nil, err
-	}
 	klen := len(req.Key)
 	if err := ensureU32Len(klen); err != nil {
 		return nil, err
@@ -189,41 +120,19 @@ func EncodeRequest(req Request) ([]byte, error) {
 		return nil, err
 	}
 
-	// Determine flags based on command and fields
 	var flags uint8
-	switch req.Cmd {
-	case CmdPut:
+	if req.Cmd == CmdPut {
 		flags |= FlagHasSeq
-		if req.RequireQuorum {
-			flags |= FlagRequireQuorum
-		}
-		if req.RequestId != "" {
-			flags |= FlagHasRequestId
-		}
-	case CmdReplicate, CmdPing, CmdTimeoutNow:
-		flags |= FlagHasSeq
-	case CmdGet:
-		if req.RequireQuorum {
-			flags |= FlagRequireQuorum
-		}
-	case CmdAck, CmdNack:
-		if req.RequestId != "" {
-			flags |= FlagHasRequestId
-		}
 	}
 
-	// Uniform header for all commands
-	buf := make([]byte, requestHeaderSize+ridlen+klen+vlen)
+	buf := make([]byte, requestHeaderSize+klen+vlen)
 	buf[requestCmdOff] = byte(req.Cmd)
 	buf[requestFlagsOff] = flags
 	putU64LE(buf, requestSeqOff, req.Seq)
-	putU32LE(buf, requestRidLenOff, ridlen)
+	putU32LE(buf, requestRidLenOff, 0)
 	putU32LE(buf, requestKLenOff, klen)
 	putU32LE(buf, requestVLenOff, vlen)
-	// Variable-length sections in order: requestId, key, value
 	off := requestDataOff
-	copy(buf[off:], req.RequestId)
-	off += ridlen
 	copy(buf[off:], req.Key)
 	off += klen
 	copy(buf[off:], req.Value)
@@ -263,10 +172,8 @@ func DecodeRequest(payload []byte) (Request, error) {
 		return Request{}, ErrInvalidMessage
 	}
 
-	// Parse variable-length sections in order: requestId, key, value
-	off := requestDataOff
-	rid := string(payload[off : off+ridlen])
-	off += ridlen
+	// Parse variable-length sections in order: key, value
+	off := requestDataOff + ridlen
 	key := append([]byte(nil), payload[off:off+klen]...)
 	off += klen
 	val := append([]byte(nil), payload[off:off+vlen]...)
@@ -277,15 +184,8 @@ func DecodeRequest(payload []byte) (Request, error) {
 		Value: val,
 	}
 
-	// Apply flags: only set fields if flag indicates they're meaningful
 	if flags&FlagHasSeq != 0 {
 		req.Seq = seq
-	}
-	if flags&FlagRequireQuorum != 0 {
-		req.RequireQuorum = true
-	}
-	if flags&FlagHasRequestId != 0 {
-		req.RequestId = rid
 	}
 
 	return req, nil
@@ -297,11 +197,8 @@ func DecodeRequest(payload []byte) (Request, error) {
 //
 //	[status uint8][seq uint64 LE][vlen uint32 LE][value bytes]
 //
-// The seq field indicates the server's sequence number at time of response (for replication tracking).
 // The value field is optional and used only for:
 //   - StatusOK: Retrieved value from GET operations
-//   - StatusReadOnly: Primary server address for redirect (host:port)
-//   - StatusFullResync: Full database snapshot for replica resync
 func EncodeResponse(resp Response) ([]byte, error) {
 	vlen := len(resp.Value)
 	if err := ensureU32Len(vlen); err != nil {
@@ -312,11 +209,7 @@ func EncodeResponse(resp Response) ([]byte, error) {
 		return nil, ErrUnknownStatus
 	}
 
-	// Response payload carries value only for specific status codes:
-	// - StatusOK: GET responses contain the retrieved value
-	// - StatusReadOnly: Replica rejection contains primary address for redirect
-	// - StatusReplicaTooStale: Stale replica rejection contains primary address
-	// - StatusFullResync: Full resync responses contain database snapshot
+	// Response payload carries value only for StatusOK (GET responses).
 	if !statusCanCarryValue(resp.Status) && vlen != 0 {
 		return nil, ErrInvalidMessage
 	}
@@ -351,11 +244,7 @@ func DecodeResponse(payload []byte) (Response, error) {
 		return Response{}, ErrUnknownStatus
 	}
 
-	// Response payload carries value only for specific status codes:
-	// - StatusOK: GET responses contain the retrieved value
-	// - StatusReadOnly: Replica rejection contains primary address for redirect
-	// - StatusReplicaTooStale: Stale replica rejection contains primary address
-	// - StatusFullResync: Full resync responses contain database snapshot
+	// Response payload carries value only for StatusOK (GET responses).
 	if !statusCanCarryValue(st) && vlen != 0 {
 		return Response{}, ErrInvalidMessage
 	}
