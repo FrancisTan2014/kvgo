@@ -251,9 +251,9 @@ func TestNewEntryIsReadyAfterFollowerStepMsgApp_036f(t *testing.T) {
 	require.Len(t, rd.Entries, 1)
 	require.Equal(t, msg.Entries[0], rd.Entries[0])
 
-	// follower doesn't get entry through Propose()
+	// follower without a leader drops proposal with ErrProposalDropped
 	follower2 := newTestRaft(3)
-	require.NoError(t, follower2.Propose([]byte("foo")))
+	require.ErrorIs(t, follower2.Propose([]byte("foo")), ErrProposalDropped)
 
 	rd = follower2.Ready()
 	require.Len(t, rd.Messages, 0)
@@ -909,12 +909,34 @@ func TestNodeStepRejectsLocalMessages_036t(t *testing.T) {
 	localTypes := []raftpb.MessageType{
 		raftpb.MessageType_MsgHup,
 		raftpb.MessageType_MsgBeat,
-		raftpb.MessageType_MsgProp,
 	}
 	for _, mt := range localTypes {
 		err := n.Step(ctx, &raftpb.Message{Type: mt, From: 99})
 		require.Error(t, err, "Node.Step should reject local message type %v", mt)
 	}
+}
+
+func TestNodeStepAcceptsMsgProp_037c(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Set up a leader node so MsgProp is actually processed.
+	n := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
+	defer n.Stop()
+	n.r.becomeLeader()
+	go n.run()
+
+	// MsgProp arriving over "the network" must be accepted by Node.Step.
+	err := n.Step(ctx, &raftpb.Message{
+		Type:    raftpb.MessageType_MsgProp,
+		From:    2,
+		Entries: []*raftpb.Entry{{Data: []byte("hello")}},
+	})
+	require.NoError(t, err)
+
+	// The leader should have appended the entry.
+	rd := <-n.Ready()
+	require.True(t, len(rd.Entries) > 0, "leader should have appended forwarded proposal")
 }
 
 func TestFollowerResetsTimerOnLeaderContact_036t(t *testing.T) {
@@ -1045,4 +1067,106 @@ func TestNewRaftRestoresPersistedState_036t(t *testing.T) {
 	require.Equal(t, uint64(2), r.votedFor)
 	require.Equal(t, uint64(3), r.commitIndex)
 	require.Equal(t, Follower, r.state)
+}
+
+// ---------------------------------------------------------------------------
+// 037c — MsgProp Forwarding
+// ---------------------------------------------------------------------------
+
+func TestFollowerForwardsMsgPropToLeader_037c(t *testing.T) {
+	r := newTestRaft(2)
+	r.peers = []uint64{1}
+	r.becomeFollower(1, 1) // term=1, leader=1
+
+	err := r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgProp,
+		Entries: []*raftpb.Entry{{Data: []byte("hello")}},
+	})
+	require.NoError(t, err)
+
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	msg := rd.Messages[0]
+	require.Equal(t, raftpb.MessageType_MsgProp, msg.Type)
+	require.Equal(t, uint64(1), msg.To) // forwarded to leader
+	require.Equal(t, []byte("hello"), msg.Entries[0].Data)
+}
+
+func TestFollowerDropsMsgPropWhenNoLeader_037c(t *testing.T) {
+	r := newTestRaft(2)
+	r.peers = []uint64{1}
+	r.becomeFollower(1, None) // term=1, no leader known
+
+	err := r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgProp,
+		Entries: []*raftpb.Entry{{Data: []byte("hello")}},
+	})
+	require.ErrorIs(t, err, ErrProposalDropped)
+
+	rd := r.Ready()
+	require.Empty(t, rd.Messages)
+}
+
+func TestSendStampsFromOnAllMessages_037c(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.becomeLeader()
+	r.Advance()
+
+	// Propose produces MsgApp to peer — verify From is stamped.
+	require.NoError(t, r.Propose([]byte("data")))
+	rd := r.Ready()
+	require.True(t, len(rd.Messages) > 0)
+	for _, msg := range rd.Messages {
+		require.Equal(t, uint64(1), msg.From, "send should stamp From on %s", msg.Type)
+		require.Equal(t, r.term, msg.Term, "send should stamp Term on %s", msg.Type)
+	}
+}
+
+func TestSendStampsFromOnForwardedProp_037c(t *testing.T) {
+	r := newTestRaft(2)
+	r.peers = []uint64{1}
+	r.becomeFollower(1, 1)
+
+	// MsgProp forwarded from follower — From was unset, send should fill it.
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgProp,
+		Entries: []*raftpb.Entry{{Data: []byte("hello")}},
+	}))
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, uint64(2), rd.Messages[0].From, "send should stamp From on forwarded MsgProp")
+	require.Equal(t, uint64(0), rd.Messages[0].Term, "MsgProp should carry no term")
+}
+
+func TestCandidateDropsMsgProp_037c(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3}
+	r.becomeCandidate()
+
+	err := r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgProp,
+		Entries: []*raftpb.Entry{{Data: []byte("hello")}},
+	})
+	require.ErrorIs(t, err, ErrProposalDropped)
+
+	rd := r.Ready()
+	// No outbound messages from the proposal — only the vote requests from becomeCandidate.
+	for _, msg := range rd.Messages {
+		require.Equal(t, raftpb.MessageType_MsgVote, msg.Type, "candidate should not forward MsgProp")
+	}
+}
+
+func TestLeaderPanicsOnEmptyMsgProp_037c(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.becomeLeader()
+	r.Advance()
+
+	require.Panics(t, func() {
+		_ = r.Step(&raftpb.Message{
+			Type:    raftpb.MessageType_MsgProp,
+			Entries: []*raftpb.Entry{},
+		})
+	}, "empty MsgProp should panic — it indicates a programming error")
 }

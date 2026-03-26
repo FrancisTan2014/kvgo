@@ -502,3 +502,32 @@ func TestPutAppearsInFollowerSM_036u(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 037c — MsgProp Forwarding Integration
+// ---------------------------------------------------------------------------
+
+func TestPutOnFollowerCommitsViaForwarding_037c(t *testing.T) {
+	s1, s2, s3 := newTestCluster(t)
+	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
+
+	// Pick a follower.
+	var follower *Server
+	for _, s := range []*Server{s1, s2, s3} {
+		if s != leader {
+			follower = s
+			break
+		}
+	}
+	require.NotNil(t, follower)
+
+	// Send PUT to the follower. Raft forwards MsgProp to leader internally.
+	ctx := newRequestContext(protocol.CmdPut, "fwd-key", "fwd-val")
+	err := follower.handlePut(ctx)
+	require.NoError(t, err)
+
+	// The entry should appear in the follower's own state machine.
+	val, ok := follower.sm.Get("fwd-key")
+	require.True(t, ok, "key not found in follower SM after forwarded PUT")
+	require.Equal(t, []byte("fwd-val"), val)
+}

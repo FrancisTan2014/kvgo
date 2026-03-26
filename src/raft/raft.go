@@ -22,7 +22,10 @@ const (
 	Leader
 )
 
-var ErrUnexpectedBytes = errors.New("unexpected bytes")
+var (
+	ErrUnexpectedBytes = errors.New("unexpected bytes")
+	ErrProposalDropped = errors.New("raft: proposal dropped")
+)
 
 type Ready struct {
 	Lead             uint64
@@ -134,6 +137,23 @@ func (r *Raft) Propose(data []byte) error {
 	})
 }
 
+func (r *Raft) send(m *raftpb.Message) {
+	if m.From == None {
+		m.From = r.id
+	}
+	switch m.Type {
+	case raftpb.MessageType_MsgVote, raftpb.MessageType_MsgVoteResp:
+		if m.Term == 0 {
+			panic("term should be set when sending vote message")
+		}
+	case raftpb.MessageType_MsgProp:
+		// Proposals carry no term — they are forwarded as-is.
+	default:
+		m.Term = r.term
+	}
+	r.messages = append(r.messages, m)
+}
+
 func (r *Raft) HardState() *raftpb.HardState {
 	return &raftpb.HardState{
 		Term:           r.term,
@@ -195,9 +215,8 @@ func (r *Raft) Step(m *raftpb.Message) error {
 		if !rejected {
 			r.votedFor = m.From
 		}
-		r.messages = append(r.messages, &raftpb.Message{
+		r.send(&raftpb.Message{
 			Type:   raftpb.MessageType_MsgVoteResp,
-			From:   r.id,
 			To:     m.From,
 			Term:   r.term,
 			Reject: rejected,
@@ -213,9 +232,8 @@ func (r *Raft) Step(m *raftpb.Message) error {
 
 		lastLog := r.lastLog()
 		for _, pid := range r.peers {
-			r.messages = append(r.messages, &raftpb.Message{
+			r.send(&raftpb.Message{
 				Type:    raftpb.MessageType_MsgVote,
-				From:    r.id,
 				To:      pid,
 				Term:    r.term,
 				Index:   lastLog.Index,
@@ -244,10 +262,8 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 			firstIndex := r.storage.FirstIndex()
 			if firstIndex > 0 && m.RejectHint < firstIndex-1 {
 				if snap, err := r.storage.Snapshot(); err == nil {
-					r.messages = append(r.messages, &raftpb.Message{
+					r.send(&raftpb.Message{
 						Type:     raftpb.MessageType_MsgSnap,
-						From:     r.id,
-						Term:     r.term,
 						To:       m.From,
 						Snapshot: snap,
 					})
@@ -266,6 +282,10 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		}
 
 	case raftpb.MessageType_MsgProp:
+		if len(m.Entries) == 0 {
+			r.logger.Error("stepped empty MsgProp", "node", r.id)
+			panic("stepped empty MsgProp")
+		}
 		prev := r.lastLog()
 		e := &raftpb.Entry{
 			Index: prev.Index + 1,
@@ -279,11 +299,9 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 			if !exists {
 				return errors.New("TODO: will be replace with real coordination code later")
 			}
-			r.messages = append(r.messages, &raftpb.Message{
-				From:    r.id,
+			r.send(&raftpb.Message{
 				To:      pid,
 				Type:    raftpb.MessageType_MsgApp,
-				Term:    r.term,
 				Index:   prev.Index,
 				LogTerm: prev.Term,
 				Commit:  r.commitIndex,
@@ -293,11 +311,9 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 
 	case raftpb.MessageType_MsgBeat:
 		for _, pid := range r.peers {
-			r.messages = append(r.messages, &raftpb.Message{
-				From:   r.id,
+			r.send(&raftpb.Message{
 				To:     pid,
 				Type:   raftpb.MessageType_MsgApp,
-				Term:   r.term,
 				Commit: r.commitIndex,
 			})
 		}
@@ -311,6 +327,10 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 
 func stepCandidate(r *Raft, m *raftpb.Message) error {
 	switch m.Type {
+	case raftpb.MessageType_MsgProp:
+		r.logger.Info("proposal dropped: no leader during election", "node", r.id)
+		return ErrProposalDropped
+
 	case raftpb.MessageType_MsgVoteResp:
 		if m.Term < r.term {
 			return nil
@@ -332,6 +352,13 @@ func stepCandidate(r *Raft, m *raftpb.Message) error {
 
 func stepFollower(r *Raft, m *raftpb.Message) error {
 	switch m.Type {
+	case raftpb.MessageType_MsgProp:
+		if r.lead == None {
+			return ErrProposalDropped
+		}
+		m.To = r.lead
+		r.send(m)
+
 	case raftpb.MessageType_MsgApp:
 		r.electionElapsed = 0
 		r.lead = m.From
@@ -346,9 +373,7 @@ func stepFollower(r *Raft, m *raftpb.Message) error {
 
 		resp := &raftpb.Message{
 			Type: raftpb.MessageType_MsgAppResp,
-			From: r.id,
 			To:   m.From,
-			Term: r.term,
 		}
 		if r.anchorExists(m.Index, m.LogTerm) {
 			r.appendEntries(m.Entries)
@@ -362,7 +387,7 @@ func stepFollower(r *Raft, m *raftpb.Message) error {
 				resp.RejectHint = snap.LastIncludedIndex
 			}
 		}
-		r.messages = append(r.messages, resp)
+		r.send(resp)
 
 	case raftpb.MessageType_MsgSnap:
 		if err := r.storage.ApplySnapshot(m.Snapshot); err != nil {

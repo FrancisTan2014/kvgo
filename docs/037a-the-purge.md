@@ -18,7 +18,7 @@ In scope:
 - Purge all Phase 1 code in one episode — election, replication, heartbeat, fencing, backlog, peer management, quorum machinery, coordination handlers, and every server field that belongs to them
 - Purge Phase 1 integration tests and rebuild for Raft — obsolete scripts deleted, surviving scenarios rewritten
 - Build Raft-native equivalents for capabilities the core lacks — PreVote, CheckQuorum, leadership transfer
-- Reimplement upper-layer features on the clean architecture — GET, DELETE, write redirect, staleness bounds, session consistency, HEALTH, `engine.DB` as `StateMachine`
+- Reimplement upper-layer features on the clean architecture — GET, write redirect, staleness bounds, session consistency, HEALTH, `engine.DB` as `StateMachine`
 - Reimplement infrastructure — bootstrap/restart, leader routing, kv-server startup flags, kv-cli or a real client layer, engine compaction integrated with Raft snapshots
 
 Deferred:
@@ -75,7 +75,6 @@ These Phase 1 features addressed the server or client layer. The concept survive
 - **Write redirect** ([023-the-write](023-the-write.md)) — follower rejects writes with the leader's address. Raft `Ready` exposes `Lead` (node ID), but node ID ≠ network address. The routing layer needs to map Raft leader identity to a client-reachable address.
 - **Staleness bounds** ([022-the-stale](022-the-stale.md), [025-the-bound](025-the-bound.md)) — seq-based lag detection against `primarySeq`. The Raft-native equivalent is applied-index lag: how far behind is this node's state machine vs. the committed index? The concept survives, the mechanism (seq → applied index) changes.
 - **Session consistency** ([024-the-session](024-the-session.md)) — `WaitForSeq` let a client read-its-own-writes. The Raft-native equivalent: wait until applied index ≥ the index returned by the client's last write. Same guarantee, different coordinate system.
-- **DELETE** — never existed in Phase 1. Needs engine-level `Delete`, `StateMachine` support, and the propose-wait-apply path.
 - **HEALTH** — stateless; report Raft state instead of Phase 1 role.
 - **`engine.DB` as `StateMachine`** — collapse `sm` and `db` into one. The engine serves the Raft apply loop directly. StateMachine concurrency ([002-the-lock](002-the-lock.md)) needs a defined contract: the apply loop writes serially, GET reads concurrently — the engine's per-bucket sharding already supports this, but the boundary must be explicit.
 - **Engine compaction** ([006-the-log-compaction](006-the-log-compaction.md)) — the engine has its own compaction (stop-the-world WAL rewrite). Raft has its own log compaction via snapshots ([036e-the-compaction](036e-the-compaction.md)). Two compaction systems for two different logs. The engine's compaction lifecycle must integrate with Raft's snapshot lifecycle.
@@ -98,19 +97,18 @@ When 037 is complete, `Server` is thin: it owns a `RaftHost`, a `StateMachine`, 
 1. **The server compiles without Phase 1 code** — after the purge, no Phase 1 file (`election.go`, `replication.go`, `fence.go`, `backlog.go`, `peer_manager.go`) exists. No Phase 1 field (`seq`, `lastSeq`, `replicas`, `primary`, `peerManager`, `term`, `votedFor`, `role`, `backlog`, `quorumWrites`, `fenced`) exists on `Server`.
 2. **PUT still works through Raft** — three-node cluster, elect via Raft, PUT on leader, value reaches all followers' state machines. The only surviving path from before the purge.
 3. **GET reads from the Raft-applied state machine** — PUT a key, GET returns the value. The read path touches only the `StateMachine`, not a separate `db`.
-4. **DELETE through Raft** — DELETE a key via propose-wait-apply. GET afterward returns not-found.
-5. **HEALTH is stateless** — HEALTH responds with Raft state without touching the log or state machine.
-6. **Write to follower is redirected** — PUT on a follower returns the leader's address instead of applying locally or silently dropping.
-7. **engine.DB is the StateMachine** — the Raft apply loop writes to the real engine. No separate `sm` and `db` — the engine serves both apply and GET.
-8. **Server starts with Raft identity** — kv-server accepts `--node-id`, `--peers`, `--raft-port`. No `--replica-of`.
-9. **Restarted node rejoins via Raft** — kill a follower, restart it, it replays its Raft log and catches up from the leader. No Phase 1 discovery protocol.
-10. **Engine compaction integrates with Raft snapshots** — engine WAL compaction is triggered as part of the Raft snapshot lifecycle, not independently.
-11. **Staleness bounds use applied-index lag** — a follower measures how far behind its applied index is from the committed index, not Phase 1 seq.
-12. **Read-your-writes waits on applied index** — client waits until the follower's applied index reaches the index returned by the last write, not Phase 1 seq.
-13. **Leader fencing on quorum loss** — a leader that loses contact with a majority of peers steps down. No stale leader continues serving.
-14. **PreVote prevents term disruption** — a partitioned node does not increment the cluster term when it reconnects.
-15. **Leadership transfer via Raft** — the leader hands off leadership to a caught-up follower through `MsgTimeoutNow`, not an external control path.
-16. **Three-node cluster end-to-end** — start three nodes, elect via Raft, PUT + GET + DELETE on leader, all succeed. No Phase 1 subsystem participates.
+4. **HEALTH is stateless** — HEALTH responds with Raft state without touching the log or state machine.
+5. **Write to follower is redirected** — PUT on a follower returns the leader's address instead of applying locally or silently dropping.
+6. **engine.DB is the StateMachine** — the Raft apply loop writes to the real engine. No separate `sm` and `db` — the engine serves both apply and GET.
+7. **Server starts with Raft identity** — kv-server accepts `--node-id`, `--peers`, `--raft-port`. No `--replica-of`.
+8. **Restarted node rejoins via Raft** — kill a follower, restart it, it replays its Raft log and catches up from the leader. No Phase 1 discovery protocol.
+9. **Engine compaction integrates with Raft snapshots** — engine WAL compaction is triggered as part of the Raft snapshot lifecycle, not independently.
+10. **Staleness bounds use applied-index lag** — a follower measures how far behind its applied index is from the committed index, not Phase 1 seq.
+11. **Read-your-writes waits on applied index** — client waits until the follower's applied index reaches the index returned by the last write, not Phase 1 seq.
+12. **Leader fencing on quorum loss** — a leader that loses contact with a majority of peers steps down. No stale leader continues serving.
+13. **PreVote prevents term disruption** — a partitioned node does not increment the cluster term when it reconnects.
+14. **Leadership transfer via Raft** — the leader hands off leadership to a caught-up follower through `MsgTimeoutNow`, not an external control path.
+15. **Three-node cluster end-to-end** — start three nodes, elect via Raft, PUT + GET on leader, all succeed. No Phase 1 subsystem participates.
 
 ## Open threads
 
