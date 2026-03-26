@@ -97,6 +97,7 @@ In all three cases the safety property holds: no proposal is falsely acknowledge
 6. **PUT on leader still works** — existing behavior preserved. Leader propose-wait-apply returns StatusOK.
 7. **Candidate drops MsgProp with ErrProposalDropped** — a candidate receiving MsgProp returns ErrProposalDropped and produces no outbound proposal message.
 8. **Leader panics on empty MsgProp** — a MsgProp with no entries panics immediately; it indicates a programming error upstream (etcd does the same).
+9. **Stale leader re-forwards MsgProp** — a node that stepped down from leader to follower (with a known new leader) re-forwards an arriving MsgProp to the new leader. `From` preserves the original proposer.
 
 ## Open threads
 

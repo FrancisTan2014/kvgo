@@ -1170,3 +1170,27 @@ func TestLeaderPanicsOnEmptyMsgProp_037c(t *testing.T) {
 		})
 	}, "empty MsgProp should panic — it indicates a programming error")
 }
+
+func TestStaleLeaderReforwardsMsgProp_037c(t *testing.T) {
+	// Node 2 was leader, stepped down to follower in term 2 with leader=3.
+	r := newTestRaft(2)
+	r.peers = []uint64{1, 3}
+	r.becomeFollower(2, 3) // term=2, leader=3
+
+	// A MsgProp arrives from node 1 (forwarded during old term when node 2 was leader).
+	// Term=0 (proposals carry no term), so the m.Term > r.term guard doesn't fire.
+	err := r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgProp,
+		From:    1,
+		Entries: []*raftpb.Entry{{Data: []byte("re-forward")}},
+	})
+	require.NoError(t, err)
+
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	msg := rd.Messages[0]
+	require.Equal(t, raftpb.MessageType_MsgProp, msg.Type)
+	require.Equal(t, uint64(3), msg.To, "should re-forward to the new leader")
+	require.Equal(t, uint64(1), msg.From, "From preserves original proposer — send() only fills None")
+	require.Equal(t, []byte("re-forward"), msg.Entries[0].Data)
+}
