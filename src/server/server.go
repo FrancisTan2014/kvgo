@@ -29,7 +29,7 @@ var (
 
 type Options struct {
 	ID    uint64 // unique node ID
-	Peers []*rafttransport.Peer
+	Peers []*rafttransport.PeerInfo
 
 	Protocol     string       // ProtocolTCP (default); future: QUIC, gRPC, etc.
 	Network      string       // NetworkTCP, NetworkTCP4, NetworkTCP6, or NetworkUnix

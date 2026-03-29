@@ -19,13 +19,17 @@ type mockRaft struct {
 
 func newMockRaft() *mockRaft {
 	return &mockRaft{
-		procc: make(chan *raftpb.Message, 1),
+		procc: make(chan *raftpb.Message, 16),
 	}
 }
 
 func (r *mockRaft) Process(ctx context.Context, m *raftpb.Message) error {
-	r.procc <- m
-	return nil
+	select {
+	case r.procc <- m:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type testSuite struct {

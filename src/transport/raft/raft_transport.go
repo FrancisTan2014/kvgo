@@ -16,15 +16,20 @@ import (
 
 const messageBufferSize = 64
 
-type Peer struct {
+type Peer interface {
+	Send(msgs []*raftpb.Message)
+	Stop()
+}
+
+// PeerInfo is a simple ID+address pair for configuring peers.
+type PeerInfo struct {
 	ID   uint64
 	Addr string
+}
 
-	mu        sync.Mutex
-	connected atomic.Bool
-	conn      net.Conn
-	framer    *transport.Framer
-	writec    chan *raftpb.Message
+// resettable is an optional interface for peers that can be woken from backoff.
+type resettable interface {
+	Reset()
 }
 
 // Raft is the consumer of inbound raft messages delivered by the transport.
@@ -42,14 +47,15 @@ var ErrTransportStarted = errors.New("transport already started")
 var ErrTransportStopped = errors.New("transport already stopped")
 
 type RaftTransport struct {
-	cfg   RaftTransportConfig
-	raft  Raft
-	peers map[uint64]*Peer
+	cfg     RaftTransportConfig
+	raft    Raft
+	peers   map[uint64]Peer
+	peersMu sync.RWMutex
 
 	ln net.Listener
 
 	mu    sync.Mutex
-	conns []net.Conn
+	conns map[net.Conn]struct{}
 
 	started atomic.Bool
 	stopped atomic.Bool
@@ -76,7 +82,8 @@ func NewRaftTransport(cfg RaftTransportConfig, raft Raft, lg *slog.Logger) (*Raf
 	return &RaftTransport{
 		cfg:    cfg,
 		raft:   raft,
-		peers:  make(map[uint64]*Peer),
+		peers:  make(map[uint64]Peer),
+		conns:  make(map[net.Conn]struct{}),
 		ctx:    ctx,
 		cancel: cancel,
 		lg:     lg,
@@ -97,9 +104,16 @@ func (r *RaftTransport) Send(msgs []*raftpb.Message) {
 		groups[m.To] = append(groups[m.To], m)
 	}
 
+	r.peersMu.RLock()
 	for to, ml := range groups {
-		r.sendTo(to, ml)
+		p, exists := r.peers[to]
+		if !exists {
+			r.lg.Warn("unknown peer, message dropped", "to", to)
+			continue
+		}
+		p.Send(ml)
 	}
+	r.peersMu.RUnlock()
 }
 
 func (r *RaftTransport) Start() error {
@@ -110,7 +124,6 @@ func (r *RaftTransport) Start() error {
 		return ErrTransportStarted
 	}
 
-	// TODO: revisit listener ownership — consider letting the caller own accept (etcd pattern)
 	if r.cfg.Listener != nil {
 		r.ln = r.cfg.Listener
 	} else {
@@ -138,16 +151,24 @@ func (r *RaftTransport) acceptLoop() {
 			r.lg.Warn("failed to accept connection", "error", err)
 			continue
 		}
+
 		r.mu.Lock()
-		r.conns = append(r.conns, conn)
+		r.conns[conn] = struct{}{}
 		r.mu.Unlock()
 
 		f := transport.NewFramer(conn, conn)
-		r.wg.Go(func() { r.readLoop(f) })
+		r.wg.Go(func() { r.readLoop(conn, f) })
 	}
 }
 
-func (r *RaftTransport) readLoop(f *transport.Framer) {
+func (r *RaftTransport) readLoop(conn net.Conn, f *transport.Framer) {
+	defer func() {
+		conn.Close()
+		r.mu.Lock()
+		delete(r.conns, conn)
+		r.mu.Unlock()
+	}()
+	identified := false
 	for {
 		select {
 		case <-r.ctx.Done():
@@ -155,41 +176,37 @@ func (r *RaftTransport) readLoop(f *transport.Framer) {
 		default:
 		}
 
-		if payload, err := f.Read(); err != nil {
+		payload, err := f.Read()
+		if err != nil {
 			select {
 			case <-r.ctx.Done():
-				return // clean shutdown, no log
+				return
 			default:
 			}
-			r.lg.Warn("failed to read frame", "error", err)
+			r.lg.Debug("read failed", "error", err)
 			return
-		} else {
-			msg := &raftpb.Message{}
-			if err := proto.Unmarshal(payload, msg); err != nil {
-				r.lg.Warn("failed to unmarshal message", "error", err)
-				continue
-			}
-			if err := r.raft.Process(r.ctx, msg); err != nil {
-				r.lg.Warn("failed to process inbound message", "from", msg.From, "error", err)
-			}
 		}
-	}
-}
 
-func (p *Peer) writeLoop(r *RaftTransport, f *transport.Framer) {
-	for {
-		select {
-		case <-r.ctx.Done():
-			return
-		case m := <-p.writec:
-			data, err := proto.Marshal(m)
-			if err != nil {
-				r.lg.Warn("failed to marshal message", "error", err)
-				continue
-			}
+		msg := &raftpb.Message{}
+		if err := proto.Unmarshal(payload, msg); err != nil {
+			r.lg.Warn("failed to unmarshal message", "error", err)
+			continue
+		}
 
-			if err := f.WriteWithTimeout(data, r.cfg.WriteTimeout); err != nil {
-				r.lg.Warn("failed to write message", "To", m.To, "error", err)
+		if err := r.raft.Process(r.ctx, msg); err != nil {
+			r.lg.Warn("failed to process inbound message", "from", msg.From, "error", err)
+		}
+
+		// On first message, wake the peer's writer from backoff.
+		if !identified {
+			identified = true
+			r.peersMu.RLock()
+			p, exists := r.peers[msg.From]
+			r.peersMu.RUnlock()
+			if exists {
+				if rp, ok := p.(resettable); ok {
+					rp.Reset()
+				}
 			}
 		}
 	}
@@ -203,14 +220,14 @@ func (r *RaftTransport) Stop() {
 		r.ln.Close()
 	}
 
+	r.peersMu.RLock()
 	for _, p := range r.peers {
-		if p.conn != nil {
-			p.conn.Close()
-		}
+		p.Stop()
 	}
+	r.peersMu.RUnlock()
 
 	r.mu.Lock()
-	for _, c := range r.conns {
+	for c := range r.conns {
 		c.Close()
 	}
 	r.mu.Unlock()
@@ -226,59 +243,12 @@ func (r *RaftTransport) Addr() net.Addr {
 }
 
 func (r *RaftTransport) AddPeer(id uint64, addr string) {
+	r.peersMu.Lock()
+	defer r.peersMu.Unlock()
+
 	if _, exists := r.peers[id]; exists {
 		return
 	}
 
-	r.peers[id] = &Peer{
-		ID:     id,
-		Addr:   addr,
-		writec: make(chan *raftpb.Message, messageBufferSize),
-	}
-}
-
-func (p *Peer) dialPeer() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.connected.Load() {
-		// another goroutine dialed the peer while this one waited for the lock
-		return nil
-	}
-
-	c, err := net.Dial("tcp", p.Addr)
-	if err != nil {
-		return err
-	}
-
-	p.conn = c
-	p.framer = transport.NewFramer(c, c)
-	p.connected.Store(true)
-
-	return nil
-}
-
-func (r *RaftTransport) sendTo(to uint64, msgs []*raftpb.Message) {
-	p, exists := r.peers[to]
-	if !exists {
-		r.lg.Warn("unknown peer, message dropped", "to", to)
-		return
-	}
-
-	if !p.connected.Load() {
-		if err := p.dialPeer(); err != nil {
-			r.lg.Warn("failed to dial peer", "to", to, "addr", p.Addr, "error", err)
-			return
-		} else {
-			r.wg.Go(func() { p.writeLoop(r, p.framer) })
-		}
-	}
-
-	for _, m := range msgs {
-		select {
-		case p.writec <- m:
-		default:
-			r.lg.Warn("write buffer full, message dropped", "to", to)
-		}
-	}
+	r.peers[id] = newTCPPeer(id, addr, r.cfg.WriteTimeout, r.lg)
 }

@@ -15,11 +15,11 @@ import (
 	"time"
 )
 
-func parsePeers(raw string) ([]*rafttransport.Peer, error) {
+func parsePeers(raw string) ([]*rafttransport.PeerInfo, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	var peers []*rafttransport.Peer
+	var peers []*rafttransport.PeerInfo
 	for _, entry := range strings.Split(raw, ",") {
 		parts := strings.SplitN(entry, "=", 2)
 		if len(parts) != 2 {
@@ -33,7 +33,7 @@ func parsePeers(raw string) ([]*rafttransport.Peer, error) {
 		if raftAddr == "" {
 			return nil, fmt.Errorf("invalid peer %q: address is empty", entry)
 		}
-		peers = append(peers, &rafttransport.Peer{ID: id, Addr: raftAddr})
+		peers = append(peers, &rafttransport.PeerInfo{ID: id, Addr: raftAddr})
 	}
 	return peers, nil
 }

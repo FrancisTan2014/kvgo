@@ -337,7 +337,7 @@ func newTestCluster(t *testing.T) (*Server, *Server, *Server) {
 		ID:           1,
 		DataDir:      t.TempDir(),
 		RaftListener: s1rln,
-		Peers: []*rafttransport.Peer{
+		Peers: []*rafttransport.PeerInfo{
 			{ID: 2, Addr: s2rln.Addr().String()},
 			{ID: 3, Addr: s3rln.Addr().String()},
 		},
@@ -350,7 +350,7 @@ func newTestCluster(t *testing.T) (*Server, *Server, *Server) {
 		ID:           2,
 		DataDir:      t.TempDir(),
 		RaftListener: s2rln,
-		Peers: []*rafttransport.Peer{
+		Peers: []*rafttransport.PeerInfo{
 			{ID: 1, Addr: s1rln.Addr().String()},
 			{ID: 3, Addr: s3rln.Addr().String()},
 		},
@@ -363,7 +363,7 @@ func newTestCluster(t *testing.T) (*Server, *Server, *Server) {
 		ID:           3,
 		DataDir:      t.TempDir(),
 		RaftListener: s3rln,
-		Peers: []*rafttransport.Peer{
+		Peers: []*rafttransport.PeerInfo{
 			{ID: 1, Addr: s1rln.Addr().String()},
 			{ID: 2, Addr: s2rln.Addr().String()},
 		},
