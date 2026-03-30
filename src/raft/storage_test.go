@@ -346,3 +346,47 @@ func TestApplySnapshotRejectsStaleBoundary_036k(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, &raftpb.SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 2}, snap)
 }
+
+func TestSaveOverlappingEntriesTruncatesAndReplays_037e(t *testing.T) {
+	dir := t.TempDir()
+
+	// First session: save entries [1(t1), 2(t1), 3(t1)].
+	s1, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+	original := []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+	}
+	require.NoError(t, s1.Save(original, &raftpb.HardState{Term: 1}))
+
+	// Save overlapping replacement: [2(t2), 3(t2), 4(t2)].
+	replacement := []*raftpb.Entry{
+		{Index: 2, Term: 2, Data: []byte("B")},
+		{Index: 3, Term: 2, Data: []byte("C")},
+		{Index: 4, Term: 2, Data: []byte("D")},
+	}
+	require.NoError(t, s1.Save(replacement, &raftpb.HardState{Term: 2}))
+
+	// In-memory state should reflect the truncation.
+	require.Equal(t, uint64(4), s1.LastIndex())
+	ents, err := s1.Entries(1, 5)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), ents[0].Term)
+	require.Equal(t, uint64(2), ents[1].Term)
+	require.NoError(t, s1.Close())
+
+	// Second session: replay WAL and verify the same result.
+	s2, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s2.Close()) }()
+
+	require.Equal(t, uint64(4), s2.LastIndex())
+	ents, err = s2.Entries(1, 5)
+	require.NoError(t, err)
+	require.Len(t, ents, 4)
+	require.Equal(t, []byte("a"), ents[0].Data)
+	require.Equal(t, []byte("B"), ents[1].Data)
+	require.Equal(t, []byte("C"), ents[2].Data)
+	require.Equal(t, []byte("D"), ents[3].Data)
+}

@@ -126,6 +126,20 @@ func newRaft(cfg Config) *Raft {
 		r.commitIndex = hs.CommittedIndex
 	}
 
+	// Load persisted log entries from storage (restart path).
+	first := cfg.Storage.FirstIndex()
+	last := cfg.Storage.LastIndex()
+	if last > 0 && last >= first {
+		entries, err := cfg.Storage.Entries(first, last+1)
+		if err != nil {
+			panic(err)
+		}
+		r.log = entries
+		r.lastLogIndex = entries[len(entries)-1].Index
+		r.stableIndex = r.lastLogIndex
+		r.appliedIndex = r.commitIndex
+	}
+
 	r.becomeFollower(r.term, None)
 	return r
 }
@@ -605,13 +619,65 @@ func (r *Raft) voteQuorumReached() bool {
 	return cnt >= quorum
 }
 
+// findConflict returns the index of the first entry in entries that conflicts
+// with the existing log (same index, different term). Returns 0 if all entries
+// match or the log is empty.
+func (r *Raft) findConflict(entries []*raftpb.Entry) uint64 {
+	if len(r.log) == 0 {
+		return 0
+	}
+	first := r.log[0].Index
+	for _, e := range entries {
+		if e.Index < first {
+			continue
+		}
+		offset := int(e.Index - first)
+		if offset >= len(r.log) {
+			return 0 // extends beyond — no conflict
+		}
+		if r.log[offset].Term != e.Term {
+			return e.Index
+		}
+	}
+	return 0 // all match
+}
+
 func (r *Raft) appendEntries(entries []*raftpb.Entry) {
 	if len(entries) == 0 {
 		return
 	}
 
+	if len(r.log) > 0 {
+		first := r.log[0].Index
+		ci := r.findConflict(entries)
+		if ci > 0 {
+			// Truncate at the conflict point and append from there.
+			offset := int(ci - first)
+			r.log = r.log[:offset]
+			if truncIdx := first + uint64(offset) - 1; r.stableIndex > truncIdx {
+				r.stableIndex = truncIdx
+			}
+			entries = entries[ci-entries[0].Index:]
+		} else {
+			// No conflict — skip entries we already have, keep only the tail
+			// that extends beyond our log.
+			lastIdx := r.log[len(r.log)-1].Index
+			var tail []*raftpb.Entry
+			for i, e := range entries {
+				if e.Index > lastIdx {
+					tail = entries[i:]
+					break
+				}
+			}
+			entries = tail
+		}
+		if len(entries) == 0 {
+			return
+		}
+	}
+
 	r.log = append(r.log, entries...)
-	r.lastLogIndex = entries[len(entries)-1].Index
+	r.lastLogIndex = r.log[len(r.log)-1].Index
 }
 
 func (r *Raft) Campaign() error {

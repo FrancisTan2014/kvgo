@@ -531,3 +531,118 @@ func TestPutOnFollowerCommitsViaForwarding_037c(t *testing.T) {
 	require.True(t, ok, "key not found in follower SM after forwarded PUT")
 	require.Equal(t, []byte("fwd-val"), val)
 }
+
+// ---------------------------------------------------------------------------
+// 037e — The Bootstrap
+// ---------------------------------------------------------------------------
+
+func TestPutBeforeShutdownIsReadableAfterRestart_037e(t *testing.T) {
+	// Pre-bind all listeners so we know addresses before constructing servers.
+	s1ln, s1rln := newListenerPair(t)
+	s2ln, s2rln := newListenerPair(t)
+	s3ln, s3rln := newListenerPair(t)
+
+	// Node 3 uses a fixed data dir (survives restart).
+	s3Dir := t.TempDir()
+
+	s1, err := NewServer(Options{
+		ID: 1, DataDir: t.TempDir(), RaftListener: s1rln,
+		Peers: []*rafttransport.PeerInfo{
+			{ID: 2, Addr: s2rln.Addr().String()},
+			{ID: 3, Addr: s3rln.Addr().String()},
+		},
+	})
+	require.NoError(t, err)
+	s1.ln = s1ln
+	require.NoError(t, s1.Start())
+
+	s2, err := NewServer(Options{
+		ID: 2, DataDir: t.TempDir(), RaftListener: s2rln,
+		Peers: []*rafttransport.PeerInfo{
+			{ID: 1, Addr: s1rln.Addr().String()},
+			{ID: 3, Addr: s3rln.Addr().String()},
+		},
+	})
+	require.NoError(t, err)
+	s2.ln = s2ln
+	require.NoError(t, s2.Start())
+
+	s3, err := NewServer(Options{
+		ID: 3, DataDir: s3Dir, RaftListener: s3rln,
+		Peers: []*rafttransport.PeerInfo{
+			{ID: 1, Addr: s1rln.Addr().String()},
+			{ID: 2, Addr: s2rln.Addr().String()},
+		},
+	})
+	require.NoError(t, err)
+	s3.ln = s3ln
+	require.NoError(t, s3.Start())
+
+	// Elect a leader.
+	leader := waitForLeader(t, 5*time.Second, s1, s2, s3)
+	require.NotNil(t, leader)
+
+	// PUT a value.
+	ctx := newRequestContext(protocol.CmdPut, "persist-key", "persist-val")
+	require.NoError(t, leader.handlePut(ctx))
+
+	// Wait until node 3 has applied the entry.
+	deadline := time.After(5 * time.Second)
+	for {
+		if val, ok := s3.sm.Get("persist-key"); ok {
+			require.Equal(t, []byte("persist-val"), val)
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("node 3 did not apply entry before shutdown")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	// Kill node 3.
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutCancel()
+	require.NoError(t, s3.Shutdown(shutCtx))
+
+	// Restart node 3 with the same data dir but new listeners.
+	s3rln2, err := net.Listen("tcp", s3rln.Addr().String())
+	require.NoError(t, err)
+	s3ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	s3New, err := NewServer(Options{
+		ID: 3, DataDir: s3Dir, RaftListener: s3rln2,
+		Peers: []*rafttransport.PeerInfo{
+			{ID: 1, Addr: s1rln.Addr().String()},
+			{ID: 2, Addr: s2rln.Addr().String()},
+		},
+	})
+	require.NoError(t, err)
+	s3New.ln = s3ln2
+	require.NoError(t, s3New.Start())
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s1.Shutdown(ctx)
+		_ = s2.Shutdown(ctx)
+		_ = s3New.Shutdown(ctx)
+	})
+
+	// The restarted node should have the value from its Raft log
+	// (recovered by DurableStorage replay → newRaft log load).
+	// The engine also replays its own WAL, so GET should work.
+	deadline = time.After(5 * time.Second)
+	for {
+		if val, ok := s3New.sm.Get("persist-key"); ok {
+			require.Equal(t, []byte("persist-val"), val)
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("restarted node 3 does not have persist-key")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 
 type mockStorage struct {
 	firstIndex uint64
+	entries    []*raftpb.Entry
 	snap       *raftpb.SnapshotMeta
 	applied    []*raftpb.SnapshotMeta
 	hardState  *raftpb.HardState
@@ -29,14 +31,32 @@ func (m *mockStorage) Save(entries []*raftpb.Entry, hard *raftpb.HardState) erro
 }
 
 func (m *mockStorage) Entries(lo, hi uint64) ([]*raftpb.Entry, error) {
-	return nil, nil
+	if len(m.entries) == 0 {
+		return nil, nil
+	}
+	first := m.entries[0].Index
+	start := int(lo - first)
+	end := int(hi - first)
+	if start < 0 || end > len(m.entries) {
+		return nil, fmt.Errorf("out of range [%d,%d) in entries [%d,%d]",
+			lo, hi, first, m.entries[len(m.entries)-1].Index)
+	}
+	result := make([]*raftpb.Entry, end-start)
+	copy(result, m.entries[start:end])
+	return result, nil
 }
 
 func (m *mockStorage) FirstIndex() uint64 {
+	if len(m.entries) > 0 {
+		return m.entries[0].Index
+	}
 	return m.firstIndex
 }
 
 func (m *mockStorage) LastIndex() uint64 {
+	if len(m.entries) > 0 {
+		return m.entries[len(m.entries)-1].Index
+	}
 	if m.snap != nil && m.snap.LastIncludedIndex > 0 {
 		return m.snap.LastIncludedIndex
 	}
@@ -1193,4 +1213,286 @@ func TestStaleLeaderReforwardsMsgProp_037c(t *testing.T) {
 	require.Equal(t, uint64(3), msg.To, "should re-forward to the new leader")
 	require.Equal(t, uint64(1), msg.From, "From preserves original proposer — send() only fills None")
 	require.Equal(t, []byte("re-forward"), msg.Entries[0].Data)
+}
+
+// ---------------------------------------------------------------------------
+// 037e — The Bootstrap
+// ---------------------------------------------------------------------------
+
+func storageWithEntries(entries []*raftpb.Entry, hs *raftpb.HardState) *mockStorage {
+	return &mockStorage{
+		entries:   entries,
+		hardState: hs,
+	}
+}
+
+func TestRestartedRaftLoadsLogFromStorage_037e(t *testing.T) {
+	entries := []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 2, Data: []byte("c")},
+	}
+	hs := &raftpb.HardState{Term: 2, VotedFor: 1, CommittedIndex: 2}
+
+	r := newRaft(Config{
+		ID:            1,
+		Storage:       storageWithEntries(entries, hs),
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	require.Equal(t, uint64(3), r.lastLogIndex)
+	require.Len(t, r.log, 3)
+	require.Equal(t, uint64(1), r.log[0].Index)
+	require.Equal(t, uint64(3), r.log[2].Index)
+	require.Equal(t, []byte("c"), r.log[2].Data)
+	require.Equal(t, uint64(3), r.stableIndex)
+	require.Equal(t, uint64(2), r.appliedIndex)
+}
+
+func TestRestartedRaftDoesNotReEmitStableEntries_037e(t *testing.T) {
+	entries := []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+	}
+	hs := &raftpb.HardState{Term: 1, CommittedIndex: 2}
+
+	r := newRaft(Config{
+		ID:            1,
+		Storage:       storageWithEntries(entries, hs),
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	rd := r.Ready()
+	require.Empty(t, rd.Entries, "stable entries should not be re-emitted")
+}
+
+func TestRestartedRaftPreservesVoteAndTerm_037e(t *testing.T) {
+	entries := []*raftpb.Entry{
+		{Index: 1, Term: 5, Data: []byte("x")},
+	}
+	hs := &raftpb.HardState{Term: 5, VotedFor: 2, CommittedIndex: 1}
+
+	r := newRaft(Config{
+		ID:            1,
+		Storage:       storageWithEntries(entries, hs),
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	require.Equal(t, uint64(5), r.term)
+	require.Equal(t, uint64(2), r.votedFor)
+
+	// Vote request in same term from a different node should be rejected.
+	err := r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgVote,
+		From:    3,
+		Term:    5,
+		Index:   1,
+		LogTerm: 5,
+	})
+	require.NoError(t, err)
+
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.True(t, rd.Messages[0].Reject, "should reject vote: already voted for 2 in term 5")
+}
+
+func TestRestartedFollowerReceivesNewEntries_037e(t *testing.T) {
+	entries := []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+		{Index: 4, Term: 2, Data: []byte("d")},
+		{Index: 5, Term: 2, Data: []byte("e")},
+	}
+	hs := &raftpb.HardState{Term: 2, CommittedIndex: 5}
+
+	r := newRaft(Config{
+		ID:            1,
+		Peers:         []uint64{2, 3},
+		Storage:       storageWithEntries(entries, hs),
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	// Leader sends MsgApp with new entries 6–7.
+	err := r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgApp,
+		From:    2,
+		Term:    2,
+		Index:   5,
+		LogTerm: 2,
+		Entries: []*raftpb.Entry{
+			{Index: 6, Term: 2, Data: []byte("f")},
+			{Index: 7, Term: 2, Data: []byte("g")},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, uint64(7), r.lastLogIndex)
+	require.Len(t, r.log, 7)
+	require.Equal(t, []byte("g"), r.log[6].Data)
+}
+
+func TestRestartedNodeDoesNotDisruptLeader_037e(t *testing.T) {
+	entries := []*raftpb.Entry{
+		{Index: 1, Term: 3, Data: []byte("x")},
+	}
+	hs := &raftpb.HardState{Term: 3, CommittedIndex: 1}
+
+	r := newRaft(Config{
+		ID:            2,
+		Peers:         []uint64{1, 3},
+		Storage:       storageWithEntries(entries, hs),
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	require.Equal(t, Follower, r.state)
+	require.Equal(t, uint64(3), r.term)
+
+	// Leader heartbeat suppresses election timer.
+	r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgApp,
+		From: 1,
+		Term: 3,
+	})
+	require.Equal(t, Follower, r.state)
+	require.Equal(t, uint64(1), r.lead)
+}
+
+func TestEmptyStorageStartsFresh_037e(t *testing.T) {
+	r := newRaft(Config{
+		ID:            1,
+		Peers:         []uint64{2, 3},
+		Storage:       &mockStorage{},
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	require.Equal(t, uint64(0), r.lastLogIndex)
+	require.Empty(t, r.log)
+	require.Equal(t, uint64(0), r.stableIndex)
+	require.Equal(t, uint64(0), r.appliedIndex)
+	require.Equal(t, Follower, r.state)
+}
+
+func TestAppendEntriesSkipsDuplicates_037e(t *testing.T) {
+	r := newTestRaft(1)
+	r.appendEntries([]*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+	})
+
+	// Overlapping append with same terms — should be a no-op.
+	r.appendEntries([]*raftpb.Entry{
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+	})
+
+	require.Len(t, r.log, 3)
+	require.Equal(t, uint64(3), r.lastLogIndex)
+}
+
+func TestAppendEntriesTruncatesOnConflict_037e(t *testing.T) {
+	r := newTestRaft(1)
+	r.appendEntries([]*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+	})
+
+	// Leader sends entries 2–4 with a new term at index 2.
+	// Entries 2–3 (term 1) should be truncated, replaced by term 2.
+	r.appendEntries([]*raftpb.Entry{
+		{Index: 2, Term: 2, Data: []byte("B")},
+		{Index: 3, Term: 2, Data: []byte("C")},
+		{Index: 4, Term: 2, Data: []byte("D")},
+	})
+
+	require.Len(t, r.log, 4)
+	require.Equal(t, uint64(4), r.lastLogIndex)
+	require.Equal(t, uint64(2), r.log[1].Term, "entry 2 should have new term")
+	require.Equal(t, []byte("B"), r.log[1].Data)
+	require.Equal(t, []byte("D"), r.log[3].Data)
+}
+
+func TestAppendEntriesExtendsLog_037e(t *testing.T) {
+	r := newTestRaft(1)
+	r.appendEntries([]*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+	})
+
+	// Overlapping with match, then extending.
+	r.appendEntries([]*raftpb.Entry{
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+	})
+
+	require.Len(t, r.log, 3)
+	require.Equal(t, uint64(3), r.lastLogIndex)
+	require.Equal(t, []byte("c"), r.log[2].Data)
+}
+
+func TestConflictingAppendEmitsReplacementEntriesInReady_037e(t *testing.T) {
+	r := newTestRaft(1)
+	r.appendEntries([]*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+	})
+	// Simulate persisting all entries and advancing.
+	r.stableIndex = 3
+
+	// Conflicting append at index 2: truncates [2,3] and appends [2,3,4] with term 2.
+	r.appendEntries([]*raftpb.Entry{
+		{Index: 2, Term: 2, Data: []byte("B")},
+		{Index: 3, Term: 2, Data: []byte("C")},
+		{Index: 4, Term: 2, Data: []byte("D")},
+	})
+
+	// stableIndex must be reset to the truncation point (index 1).
+	require.Equal(t, uint64(1), r.stableIndex)
+
+	// Ready().Entries must contain the replacement entries for persistence.
+	rd := r.Ready()
+	require.Len(t, rd.Entries, 3)
+	require.Equal(t, uint64(2), rd.Entries[0].Index)
+	require.Equal(t, uint64(2), rd.Entries[0].Term)
+}
+
+func TestRestartWithSnapshotAndEntriesLoadsCorrectly_037e(t *testing.T) {
+	storage := &mockStorage{
+		snap: &raftpb.SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 2},
+		entries: []*raftpb.Entry{
+			{Index: 11, Term: 2, Data: []byte("x")},
+			{Index: 12, Term: 3, Data: []byte("y")},
+			{Index: 13, Term: 3, Data: []byte("z")},
+		},
+		hardState: &raftpb.HardState{Term: 3, VotedFor: 2, CommittedIndex: 12},
+	}
+
+	r := newRaft(Config{
+		ID:            1,
+		Peers:         []uint64{1, 2, 3},
+		Storage:       storage,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+	})
+
+	require.Len(t, r.log, 3)
+	require.Equal(t, uint64(13), r.lastLogIndex)
+	require.Equal(t, uint64(13), r.stableIndex)
+	require.Equal(t, uint64(12), r.appliedIndex)
+	require.Equal(t, uint64(11), r.log[0].Index)
 }

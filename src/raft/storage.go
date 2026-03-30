@@ -82,14 +82,12 @@ func computeTotalSize(entries []*raftpb.Entry) int {
 }
 
 // Save appends `entries` and `hard` together as a single batch at the end of the log.
+// Entries may overlap with existing entries (log repair after truncation).
 func (s *DurableStorage) Save(entries []*raftpb.Entry, hard *raftpb.HardState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(entries) == 0 && IsEmptyHardState(hard) {
 		return nil
-	}
-	if err := s.validateAppend(entries); err != nil {
-		return err
 	}
 	effectiveHard := hard
 	if IsEmptyHardState(effectiveHard) {
@@ -107,8 +105,7 @@ func (s *DurableStorage) Save(entries []*raftpb.Entry, hard *raftpb.HardState) e
 	}
 
 	s.hd = effectiveHard
-	s.appendEntries(entries)
-	return nil
+	return s.truncateAndAppend(entries)
 }
 
 func (s *DurableStorage) firstIndexWithoutLock() uint64 {
@@ -221,7 +218,7 @@ func (s *DurableStorage) replayLog() (err error) {
 		ents = filterRetainedEntries(ents, s.snap.LastIncludedIndex)
 
 		s.hd = hd
-		if err := s.appendEntries(ents); err != nil {
+		if err := s.truncateAndAppend(ents); err != nil {
 			return err
 		}
 		position += int64(frameHeaderSize + len(batch))
@@ -265,36 +262,44 @@ func (s *DurableStorage) replaySnapshotMeta() (err error) {
 	return nil
 }
 
-func (s *DurableStorage) appendEntries(entries []*raftpb.Entry) error {
+// truncateAndAppend handles overlapping entries by truncating the in-memory
+// log at the overlap point before appending. This is needed because the WAL
+// is append-only: a leader truncation writes replacement entries as a new
+// batch, and on replay those entries overlap with previously replayed ones.
+func (s *DurableStorage) truncateAndAppend(entries []*raftpb.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	if err := s.validateAppend(entries); err != nil {
-		return err
-	}
-	s.entries = append(s.entries, entries...)
-	return nil
-}
-
-func (s *DurableStorage) validateAppend(entries []*raftpb.Entry) error {
-	if len(entries) == 0 {
-		return nil
-	}
-
-	expected := entries[0].Index
-	if len(s.entries) > 0 {
-		expected = s.lastIndexWithoutLock() + 1
-	} else if s.snap.LastIncludedIndex > 0 {
-		expected = s.snap.LastIncludedIndex + 1
-	}
-
-	for _, e := range entries {
-		if e.Index != expected {
-			return fmt.Errorf("%w: got %d want %d", ErrNonContiguous, e.Index, expected)
+	if len(s.entries) == 0 {
+		// With no in-memory entries, validate against snapshot boundary.
+		expected := uint64(1)
+		if s.snap.LastIncludedIndex > 0 {
+			expected = s.snap.LastIncludedIndex + 1
 		}
-		expected++
+		if entries[0].Index != expected {
+			return fmt.Errorf("%w: got %d want %d", ErrNonContiguous, entries[0].Index, expected)
+		}
+		s.entries = append(s.entries, entries...)
+		return nil
 	}
-
+	first := entries[0].Index
+	last := s.lastIndexWithoutLock()
+	switch {
+	case first == last+1:
+		// Normal contiguous append.
+		s.entries = append(s.entries, entries...)
+	case first > last+1:
+		// Gap — entries skip ahead, which is never valid.
+		return fmt.Errorf("%w: got %d want %d", ErrNonContiguous, first, last+1)
+	case first <= s.firstIndexWithoutLock():
+		// Complete replacement — the leader's log is authoritative after truncation.
+		s.entries = make([]*raftpb.Entry, len(entries))
+		copy(s.entries, entries)
+	default:
+		// Partial overlap — keep entries before the overlap point.
+		keep := first - s.firstIndexWithoutLock()
+		s.entries = append(s.entries[:keep], entries...)
+	}
 	return nil
 }
 
