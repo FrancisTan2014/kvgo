@@ -33,7 +33,8 @@ type raftHostConfig struct {
 }
 
 type toApply struct {
-	data [][]byte
+	data        [][]byte
+	appliedThru uint64
 }
 
 type RaftHost interface {
@@ -104,7 +105,7 @@ func newRaftHost(cfg raftHostConfig) (*raftHost, error) {
 		storage:      cfg.Storage,
 		transport:    cfg.Transport,
 		tickInterval: tickInterval,
-		applyc:       make(chan toApply),
+		applyc:       make(chan toApply, 1),
 		errc:         make(chan error, 1),
 		stopc:        make(chan struct{}),
 		done:         make(chan struct{}),
@@ -153,7 +154,7 @@ func NewRaftHost(cfg RaftHostConfig) (*raftHost, error) {
 		storage:      cfg.Storage,
 		transport:    cfg.Transport,
 		tickInterval: tickInterval,
-		applyc:       make(chan toApply),
+		applyc:       make(chan toApply, 1),
 		errc:         make(chan error, 1),
 		stopc:        make(chan struct{}),
 		done:         make(chan struct{}),
@@ -218,8 +219,9 @@ func (r *raftHost) handleBatch(rd raft.Ready) error {
 			data[i] = buf[:n]
 			buf = buf[n:]
 		}
+		lastIndex := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		select {
-		case r.applyc <- toApply{data: data}:
+		case r.applyc <- toApply{data: data, appliedThru: lastIndex}:
 		case <-r.stopc:
 			return nil
 		}

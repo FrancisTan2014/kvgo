@@ -67,10 +67,6 @@ func (m *mockStorage) LastIndex() uint64 {
 	return 0
 }
 
-func (m *mockStorage) Compact(index uint64) error {
-	return nil
-}
-
 func (m *mockStorage) Close() error {
 	return nil
 }

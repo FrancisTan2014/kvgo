@@ -266,7 +266,7 @@ func TestHostDrainsReadyThenAdvance_036m(t *testing.T) {
 	// handleBatch blocks on unbuffered applyc — read to unblock
 	select {
 	case applied := <-host.Apply():
-		require.Equal(t, toApply{data: [][]byte{[]byte("foo")}}, applied)
+		require.Equal(t, toApply{data: [][]byte{[]byte("foo")}, appliedThru: 1}, applied)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("timeout waiting for apply channel")
 	}

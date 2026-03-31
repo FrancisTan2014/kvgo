@@ -18,41 +18,59 @@ type Storage interface {
 	Entries(lo, hi uint64) ([]*raftpb.Entry, error)
 	FirstIndex() uint64
 	LastIndex() uint64
-	Compact(index uint64) error
 	Close() error
 	Snapshot() (*raftpb.SnapshotMeta, error)
 	ApplySnapshot(snap *raftpb.SnapshotMeta) error
 }
 
-const logFilename = "replication.log"
 const snapFilename = "snapshot.log"
+const DefaultCompactThreshold = uint64(10000)
+
+type DurableStorageOptions struct {
+	SegmentLimit     int64
+	CompactThreshold uint64
+}
 
 type DurableStorage struct {
-	rw      *wal
-	sw      *wal
-	mu      sync.RWMutex
-	hd      *raftpb.HardState
-	entries []*raftpb.Entry
-	snap    *raftpb.SnapshotMeta
+	rw               *segmentedWAL
+	sw               *wal
+	mu               sync.RWMutex
+	hd               *raftpb.HardState
+	entries          []*raftpb.Entry
+	snap             *raftpb.SnapshotMeta
+	segLastIdx       map[string]uint64
+	compactThreshold uint64
 }
 
 func NewDurableStorage(dir string) (*DurableStorage, error) {
-	rw, err := newWAL(dir, logFilename)
+	return NewDurableStorageWithOptions(dir, DurableStorageOptions{})
+}
+
+func NewDurableStorageWithOptions(dir string, opts DurableStorageOptions) (*DurableStorage, error) {
+	threshold := opts.CompactThreshold
+	if threshold == 0 {
+		threshold = DefaultCompactThreshold
+	}
+
+	rw, err := newSegmentedWAL(dir, opts.SegmentLimit)
 	if err != nil {
 		return nil, err
 	}
 
 	sw, err := newWAL(dir, snapFilename)
 	if err != nil {
+		_ = rw.close()
 		return nil, err
 	}
 
 	d := &DurableStorage{
-		rw:      rw,
-		sw:      sw,
-		hd:      &raftpb.HardState{},
-		entries: make([]*raftpb.Entry, 0),
-		snap:    &raftpb.SnapshotMeta{},
+		rw:               rw,
+		sw:               sw,
+		hd:               &raftpb.HardState{},
+		entries:          make([]*raftpb.Entry, 0),
+		snap:             &raftpb.SnapshotMeta{},
+		segLastIdx:       make(map[string]uint64),
+		compactThreshold: threshold,
 	}
 
 	if err := d.replay(); err != nil {
@@ -101,6 +119,14 @@ func (s *DurableStorage) Save(entries []*raftpb.Entry, hard *raftpb.HardState) e
 		se = s.rw.sync()
 	}
 	if err := errors.Join(we, se); err != nil {
+		return err
+	}
+
+	if len(entries) > 0 {
+		s.segLastIdx[s.rw.currentSegment()] = entries[len(entries)-1].Index
+	}
+
+	if err := s.rw.maybeCut(); err != nil {
 		return err
 	}
 
@@ -187,44 +213,24 @@ func (s *DurableStorage) replay() (err error) {
 	return nil
 }
 
-func (s *DurableStorage) replayLog() (err error) {
-	var position int64
-	defer func() {
-		if err == ErrTailCorruption {
-			if truncErr := s.rw.truncate(position); truncErr != nil {
-				e := fmt.Errorf("truncation failed after corruption: %w", truncErr)
-				err = errors.Join(err, e)
-				return
-			}
-			err = nil
-		}
-	}()
-
+func (s *DurableStorage) replayLog() error {
 	s.entries = s.entries[:0]
 
-	for {
-		batch, err := s.rw.read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
+	return s.rw.readAll(func(seg string, batch []byte) error {
 		hd, ents, err := decodeSaveBatch(batch)
 		if err != nil {
 			return err
 		}
+
+		if len(ents) > 0 {
+			s.segLastIdx[seg] = ents[len(ents)-1].Index
+		}
+
 		ents = filterRetainedEntries(ents, s.snap.LastIncludedIndex)
 
 		s.hd = hd
-		if err := s.truncateAndAppend(ents); err != nil {
-			return err
-		}
-		position += int64(frameHeaderSize + len(batch))
-	}
-
-	return nil
+		return s.truncateAndAppend(ents)
+	})
 }
 
 func (s *DurableStorage) replaySnapshotMeta() (err error) {
@@ -303,10 +309,7 @@ func (s *DurableStorage) truncateAndAppend(entries []*raftpb.Entry) error {
 	return nil
 }
 
-func (s *DurableStorage) Compact(index uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *DurableStorage) compactLocked(index uint64) error {
 	if s.snap.LastIncludedIndex > 0 && index <= s.snap.LastIncludedIndex {
 		return ErrCompacted
 	}
@@ -335,7 +338,44 @@ func (s *DurableStorage) Compact(index uint64) error {
 	s.entries = retained
 	s.snap = snap
 
-	return nil
+	return s.deleteOldSegments()
+}
+
+func (s *DurableStorage) MaybeCompact(appliedIndex uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if appliedIndex <= s.snap.LastIncludedIndex {
+		return nil
+	}
+	if appliedIndex-s.snap.LastIncludedIndex < s.compactThreshold {
+		return nil
+	}
+	return s.compactLocked(appliedIndex)
+}
+
+func (s *DurableStorage) deleteOldSegments() error {
+	boundary := s.snap.LastIncludedIndex
+	canDelete := make(map[string]bool)
+	for _, name := range s.rw.segments {
+		if name == s.rw.currentSegment() {
+			break
+		}
+		lastIdx, ok := s.segLastIdx[name]
+		if !ok || lastIdx > boundary {
+			break
+		}
+		canDelete[name] = true
+	}
+	if len(canDelete) == 0 {
+		return nil
+	}
+	for name := range canDelete {
+		delete(s.segLastIdx, name)
+	}
+	return s.rw.deleteSegments(func(name string) bool {
+		return canDelete[name]
+	})
 }
 
 func (s *DurableStorage) termWithoutLock(index uint64) (uint64, error) {

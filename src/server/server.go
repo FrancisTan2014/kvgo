@@ -399,6 +399,11 @@ func (s *Server) run() {
 			return
 		case ap := <-applyc:
 			s.applyBatch(ap)
+			if ap.appliedThru > 0 {
+				if err := s.raftStorage.MaybeCompact(ap.appliedThru); err != nil {
+					s.log().Error("compaction failed", "error", err, "applied_thru", ap.appliedThru)
+				}
+			}
 		}
 	}
 }

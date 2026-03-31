@@ -96,7 +96,7 @@ func TestReplayTruncatesCorruptedTail_036c(t *testing.T) {
 	require.NoError(t, s1.Save(expectedEntries, expectedHard))
 	require.NoError(t, s1.Close())
 
-	path := filepath.Join(dir, logFilename)
+	path := filepath.Join(dir, segmentName(0))
 	infoBefore, err := os.Stat(path)
 	require.NoError(t, err)
 
@@ -181,7 +181,7 @@ func TestReplayFailsOnMalformedFullBatch_036c(t *testing.T) {
 	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 1, Term: 1, Data: []byte("ok")}}, &raftpb.HardState{Term: 1}))
 	require.NoError(t, s1.Close())
 
-	path := filepath.Join(dir, logFilename)
+	path := filepath.Join(dir, segmentName(0))
 	infoBefore, err := os.Stat(path)
 	require.NoError(t, err)
 
@@ -216,6 +216,8 @@ func TestComputeTotalSizeReturnsExpectedNumber_036c(t *testing.T) {
 	require.Equal(t, 45, total)
 }
 
+// 037f supersedes: TestCompactPreservesEntriesAboveBoundary_037f covers this
+// at larger scale with segmented WAL and segment deletion.
 func TestEntriesBeforeBoundaryReturnErrCompacted_036e(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewDurableStorage(dir)
@@ -228,7 +230,10 @@ func TestEntriesBeforeBoundaryReturnErrCompacted_036e(t *testing.T) {
 	require.NoError(t, s.Save([]*raftpb.Entry{{Index: 2, Term: 1, Data: []byte("two")}}, &raftpb.HardState{Term: 1}))
 	require.NoError(t, s.Save([]*raftpb.Entry{{Index: 3, Term: 2, Data: []byte("three")}}, &raftpb.HardState{Term: 2}))
 
-	require.NoError(t, s.Compact(2))
+	// compactLocked is internal; production compaction runs through MaybeCompact.
+	s.mu.Lock()
+	require.NoError(t, s.compactLocked(2))
+	s.mu.Unlock()
 	_, err = s.Entries(1, 3)
 	require.ErrorIs(t, err, ErrCompacted)
 
@@ -238,6 +243,8 @@ func TestEntriesBeforeBoundaryReturnErrCompacted_036e(t *testing.T) {
 	require.Equal(t, &raftpb.Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
 }
 
+// 037f supersedes: TestSegmentDeletionReclaimsDisk_037f covers compact +
+// restart with segmented WAL and segment deletion.
 func TestCompactionSurvivesRestart_036e(t *testing.T) {
 	dir := t.TempDir()
 	s1, err := NewDurableStorage(dir)
@@ -247,7 +254,10 @@ func TestCompactionSurvivesRestart_036e(t *testing.T) {
 	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 2, Term: 1, Data: []byte("two")}}, &raftpb.HardState{Term: 1}))
 	require.NoError(t, s1.Save([]*raftpb.Entry{{Index: 3, Term: 2, Data: []byte("three")}}, &raftpb.HardState{Term: 2}))
 
-	require.NoError(t, s1.Compact(2))
+	// compactLocked is internal; production compaction runs through MaybeCompact.
+	s1.mu.Lock()
+	require.NoError(t, s1.compactLocked(2))
+	s1.mu.Unlock()
 	require.NoError(t, s1.Close())
 
 	s2, err := NewDurableStorage(dir)
@@ -262,22 +272,31 @@ func TestCompactionSurvivesRestart_036e(t *testing.T) {
 	require.Equal(t, &raftpb.Entry{Index: 3, Term: 2, Data: []byte("three")}, ents[0])
 }
 
+// 037f rewrites: original 036e test wrote directly to the single-file WAL;
+// segmented WAL makes that approach fragile. Rewritten to use Save() with a
+// pre-existing snapshot boundary so the gap is detected during Save, not replay.
 func TestReplayFailsOnGapAfterSnapshotBoundary_036e(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewDurableStorage(dir)
-	require.NoError(t, err)
 
+	// Set up a snapshot boundary at index 2 by writing the snapshot WAL directly.
+	sw, err := newWAL(dir, snapFilename)
+	require.NoError(t, err)
 	snap := raftpb.SnapshotMeta{LastIncludedIndex: 2, LastIncludedTerm: 1}
 	buf := make([]byte, SnapshotMetaBytes)
 	encodeSnapshotMeta(&snap, buf)
-	require.NoError(t, s.sw.write(buf))
-	require.NoError(t, s.sw.sync())
+	require.NoError(t, sw.write(buf))
+	require.NoError(t, sw.sync())
+	require.NoError(t, sw.close())
 
+	// Write a replication log entry with a gap (index 4 when boundary is 2,
+	// so expected next is 3).
+	rw, err := newSegmentedWAL(dir, 0)
+	require.NoError(t, err)
 	hard := raftpb.HardState{Term: 2, VotedFor: 1, CommittedIndex: 2}
 	gapEntries := []*raftpb.Entry{{Index: 4, Term: 2, Data: []byte("four")}}
-	require.NoError(t, s.rw.write(encodeSaveBatch(&hard, gapEntries)))
-	require.NoError(t, s.rw.sync())
-	require.NoError(t, s.Close())
+	require.NoError(t, rw.write(encodeSaveBatch(&hard, gapEntries)))
+	require.NoError(t, rw.sync())
+	require.NoError(t, rw.close())
 
 	_, err = NewDurableStorage(dir)
 	require.ErrorIs(t, err, ErrNonContiguous)
@@ -389,4 +408,174 @@ func TestSaveOverlappingEntriesTruncatesAndReplays_037e(t *testing.T) {
 	require.Equal(t, []byte("B"), ents[1].Data)
 	require.Equal(t, []byte("C"), ents[2].Data)
 	require.Equal(t, []byte("D"), ents[3].Data)
+}
+
+func TestSegmentDeletionReclaimsDisk_037f(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{
+		SegmentLimit: 50, // tiny segments to force rotation
+	})
+	require.NoError(t, err)
+
+	// Write 10 entries; small segment limit forces multiple segments.
+	for i := uint64(1); i <= 10; i++ {
+		require.NoError(t, s.Save(
+			[]*raftpb.Entry{{Index: i, Term: 1, Data: []byte("data")}},
+			&raftpb.HardState{Term: 1, CommittedIndex: i},
+		))
+	}
+	segsBefore := s.rw.segmentCount()
+	require.Greater(t, segsBefore, 1, "expected multiple segments")
+
+	// compactLocked is internal; production compaction runs through MaybeCompact.
+	s.mu.Lock()
+	require.NoError(t, s.compactLocked(5))
+	s.mu.Unlock()
+
+	segsAfter := s.rw.segmentCount()
+	require.Less(t, segsAfter, segsBefore, "expected segments to be deleted")
+
+	// Retained entries are correct.
+	ents, err := s.Entries(6, 11)
+	require.NoError(t, err)
+	require.Len(t, ents, 5)
+	require.Equal(t, uint64(6), ents[0].Index)
+	require.NoError(t, s.Close())
+
+	// Reopen — verify retained entries survive.
+	s2, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{SegmentLimit: 50})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s2.Close()) }()
+
+	_, err = s2.Entries(1, 6)
+	require.ErrorIs(t, err, ErrCompacted)
+
+	ents, err = s2.Entries(6, 11)
+	require.NoError(t, err)
+	require.Len(t, ents, 5)
+}
+
+func TestSegmentDeletionCrashSafe_037f(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{
+		SegmentLimit: 50,
+	})
+	require.NoError(t, err)
+
+	// Write entries across segments.
+	for i := uint64(1); i <= 10; i++ {
+		require.NoError(t, s.Save(
+			[]*raftpb.Entry{{Index: i, Term: 1, Data: []byte("data")}},
+			&raftpb.HardState{Term: 1, CommittedIndex: i},
+		))
+	}
+
+	// Persist snapshot boundary manually without deleting segments
+	// (simulating crash between snapshot persist and segment deletion).
+	snap := &raftpb.SnapshotMeta{LastIncludedIndex: 5, LastIncludedTerm: 1}
+	buf := make([]byte, SnapshotMetaBytes)
+	encodeSnapshotMeta(snap, buf)
+	require.NoError(t, s.sw.truncate(0))
+	require.NoError(t, s.sw.write(buf))
+	require.NoError(t, s.sw.sync())
+	require.NoError(t, s.Close())
+
+	// Old segments still exist — this simulates a crash before deletion.
+	// Reopen: replay should skip compacted entries.
+	s2, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{SegmentLimit: 50})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s2.Close()) }()
+
+	_, err = s2.Entries(1, 6)
+	require.ErrorIs(t, err, ErrCompacted)
+
+	ents, err := s2.Entries(6, 11)
+	require.NoError(t, err)
+	require.Len(t, ents, 5)
+	require.Equal(t, uint64(6), ents[0].Index)
+}
+
+func TestMaybeCompactSkipsBelowThreshold_037f(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{
+		CompactThreshold: 10,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
+
+	// Write 15 entries.
+	for i := uint64(1); i <= 15; i++ {
+		require.NoError(t, s.Save(
+			[]*raftpb.Entry{{Index: i, Term: 1, Data: []byte("x")}},
+			&raftpb.HardState{Term: 1, CommittedIndex: i},
+		))
+	}
+
+	// Below threshold — no compaction.
+	require.NoError(t, s.MaybeCompact(5))
+	require.Equal(t, uint64(1), s.FirstIndex())
+
+	// At threshold — compaction runs.
+	require.NoError(t, s.MaybeCompact(10))
+	require.Equal(t, uint64(11), s.FirstIndex())
+}
+
+func TestCompactPreservesEntriesAboveBoundary_037f(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorage(dir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s.Close()) }()
+
+	entries := make([]*raftpb.Entry, 100)
+	for i := range entries {
+		entries[i] = &raftpb.Entry{Index: uint64(i + 1), Term: 1, Data: []byte("v")}
+	}
+	require.NoError(t, s.Save(entries, &raftpb.HardState{Term: 1, CommittedIndex: 100}))
+
+	// compactLocked is internal; production compaction runs through MaybeCompact.
+	s.mu.Lock()
+	require.NoError(t, s.compactLocked(80))
+	s.mu.Unlock()
+
+	_, err = s.Entries(1, 81)
+	require.ErrorIs(t, err, ErrCompacted)
+
+	ents, err := s.Entries(81, 101)
+	require.NoError(t, err)
+	require.Len(t, ents, 20)
+	require.Equal(t, uint64(81), ents[0].Index)
+	require.Equal(t, uint64(100), ents[19].Index)
+}
+
+func TestMultiSegmentReplayAfterRestart_037f(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{
+		SegmentLimit: 50,
+	})
+	require.NoError(t, err)
+
+	// Write enough to create 3+ segments.
+	for i := uint64(1); i <= 20; i++ {
+		require.NoError(t, s.Save(
+			[]*raftpb.Entry{{Index: i, Term: 1, Data: []byte("data")}},
+			&raftpb.HardState{Term: 1, CommittedIndex: i},
+		))
+	}
+	require.GreaterOrEqual(t, s.rw.segmentCount(), 3)
+	require.NoError(t, s.Close())
+
+	// Reopen and verify all entries recovered.
+	s2, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{SegmentLimit: 50})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s2.Close()) }()
+
+	require.Equal(t, uint64(1), s2.FirstIndex())
+	require.Equal(t, uint64(20), s2.LastIndex())
+
+	ents, err := s2.Entries(1, 21)
+	require.NoError(t, err)
+	require.Len(t, ents, 20)
+	for i, e := range ents {
+		require.Equal(t, uint64(i+1), e.Index)
+	}
 }
