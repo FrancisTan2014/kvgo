@@ -1237,6 +1237,7 @@ func TestRestartedRaftLoadsLogFromStorage_037e(t *testing.T) {
 	r := newRaft(Config{
 		ID:            1,
 		Storage:       storageWithEntries(entries, hs),
+		Applied:       2,
 		ElectionTick:  10,
 		HeartbeatTick: 1,
 		Logger:        slog.Default(),
@@ -1261,6 +1262,7 @@ func TestRestartedRaftDoesNotReEmitStableEntries_037e(t *testing.T) {
 	r := newRaft(Config{
 		ID:            1,
 		Storage:       storageWithEntries(entries, hs),
+		Applied:       2,
 		ElectionTick:  10,
 		HeartbeatTick: 1,
 		Logger:        slog.Default(),
@@ -1279,6 +1281,7 @@ func TestRestartedRaftPreservesVoteAndTerm_037e(t *testing.T) {
 	r := newRaft(Config{
 		ID:            1,
 		Storage:       storageWithEntries(entries, hs),
+		Applied:       1,
 		ElectionTick:  10,
 		HeartbeatTick: 1,
 		Logger:        slog.Default(),
@@ -1316,6 +1319,7 @@ func TestRestartedFollowerReceivesNewEntries_037e(t *testing.T) {
 		ID:            1,
 		Peers:         []uint64{2, 3},
 		Storage:       storageWithEntries(entries, hs),
+		Applied:       5,
 		ElectionTick:  10,
 		HeartbeatTick: 1,
 		Logger:        slog.Default(),
@@ -1350,6 +1354,7 @@ func TestRestartedNodeDoesNotDisruptLeader_037e(t *testing.T) {
 		ID:            2,
 		Peers:         []uint64{1, 3},
 		Storage:       storageWithEntries(entries, hs),
+		Applied:       1,
 		ElectionTick:  10,
 		HeartbeatTick: 1,
 		Logger:        slog.Default(),
@@ -1486,6 +1491,7 @@ func TestRestartWithSnapshotAndEntriesLoadsCorrectly_037e(t *testing.T) {
 		ID:            1,
 		Peers:         []uint64{1, 2, 3},
 		Storage:       storage,
+		Applied:       10,
 		ElectionTick:  10,
 		HeartbeatTick: 1,
 	})
@@ -1493,6 +1499,186 @@ func TestRestartWithSnapshotAndEntriesLoadsCorrectly_037e(t *testing.T) {
 	require.Len(t, r.log, 3)
 	require.Equal(t, uint64(13), r.lastLogIndex)
 	require.Equal(t, uint64(13), r.stableIndex)
-	require.Equal(t, uint64(12), r.appliedIndex)
+	require.Equal(t, uint64(10), r.appliedIndex)
 	require.Equal(t, uint64(11), r.log[0].Index)
+}
+
+// 037g — The Replay
+// ---------------------------------------------------------------------------
+
+func TestConfigAppliedReplaysUnappliedEntries_037g(t *testing.T) {
+	entries := []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+		{Index: 4, Term: 1, Data: []byte("d")},
+		{Index: 5, Term: 1, Data: []byte("e")},
+		{Index: 6, Term: 1, Data: []byte("f")},
+		{Index: 7, Term: 1, Data: []byte("g")},
+		{Index: 8, Term: 1, Data: []byte("h")},
+		{Index: 9, Term: 1, Data: []byte("i")},
+		{Index: 10, Term: 1, Data: []byte("j")},
+	}
+	hs := &raftpb.HardState{Term: 1, CommittedIndex: 10}
+
+	r := newRaft(Config{
+		ID:            1,
+		Storage:       storageWithEntries(entries, hs),
+		Applied:       0,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	rd := r.Ready()
+	require.Len(t, rd.CommittedEntries, 10)
+	require.Equal(t, uint64(1), rd.CommittedEntries[0].Index)
+	require.Equal(t, uint64(10), rd.CommittedEntries[9].Index)
+}
+
+func TestConfigAppliedSkipsAlreadyAppliedEntries_037g(t *testing.T) {
+	entries := []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+		{Index: 4, Term: 1, Data: []byte("d")},
+		{Index: 5, Term: 1, Data: []byte("e")},
+		{Index: 6, Term: 1, Data: []byte("f")},
+		{Index: 7, Term: 1, Data: []byte("g")},
+		{Index: 8, Term: 1, Data: []byte("h")},
+		{Index: 9, Term: 1, Data: []byte("i")},
+		{Index: 10, Term: 1, Data: []byte("j")},
+	}
+	hs := &raftpb.HardState{Term: 1, CommittedIndex: 10}
+
+	r := newRaft(Config{
+		ID:            1,
+		Storage:       storageWithEntries(entries, hs),
+		Applied:       7,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	rd := r.Ready()
+	require.Len(t, rd.CommittedEntries, 3)
+	require.Equal(t, uint64(8), rd.CommittedEntries[0].Index)
+	require.Equal(t, uint64(10), rd.CommittedEntries[2].Index)
+}
+
+func TestConfigAppliedGreaterThanCommitIndexPanics_037g(t *testing.T) {
+	entries := []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+		{Index: 4, Term: 1, Data: []byte("d")},
+		{Index: 5, Term: 1, Data: []byte("e")},
+		{Index: 6, Term: 1, Data: []byte("f")},
+		{Index: 7, Term: 1, Data: []byte("g")},
+		{Index: 8, Term: 1, Data: []byte("h")},
+		{Index: 9, Term: 1, Data: []byte("i")},
+		{Index: 10, Term: 1, Data: []byte("j")},
+	}
+	hs := &raftpb.HardState{Term: 1, CommittedIndex: 10}
+
+	require.Panics(t, func() {
+		newRaft(Config{
+			ID:            1,
+			Storage:       storageWithEntries(entries, hs),
+			Applied:       15,
+			ElectionTick:  10,
+			HeartbeatTick: 1,
+			Logger:        slog.Default(),
+		})
+	})
+}
+
+func TestConfigAppliedBelowFirstIndexPanics_037g(t *testing.T) {
+	// Entries 1–10 compacted, entries 11–20 remain. Applied=5 claims a
+	// position inside the compacted range — raft can't replay entries 6–10.
+	storage := &mockStorage{
+		snap: &raftpb.SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 1},
+		entries: []*raftpb.Entry{
+			{Index: 11, Term: 1}, {Index: 12, Term: 1},
+			{Index: 13, Term: 1}, {Index: 14, Term: 1},
+			{Index: 15, Term: 1},
+		},
+		hardState: &raftpb.HardState{Term: 1, CommittedIndex: 15},
+	}
+
+	require.Panics(t, func() {
+		newRaft(Config{
+			ID:            1,
+			Storage:       storage,
+			Applied:       5,
+			ElectionTick:  10,
+			HeartbeatTick: 1,
+			Logger:        slog.Default(),
+		})
+	})
+}
+
+func TestFreshStartWithZeroApplied_037g(t *testing.T) {
+	r := newRaft(Config{
+		ID:            1,
+		Peers:         []uint64{2, 3},
+		Storage:       &mockStorage{},
+		Applied:       0,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	require.Equal(t, uint64(0), r.appliedIndex)
+	require.Equal(t, uint64(0), r.commitIndex)
+	require.False(t, r.HasReady())
+}
+
+func TestReplayAfterCompactionBoundedByLog_037g(t *testing.T) {
+	// Entries 1–10 compacted, entries 11–20 remain in log.
+	storage := &mockStorage{
+		snap: &raftpb.SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 1},
+		entries: []*raftpb.Entry{
+			{Index: 11, Term: 1, Data: []byte("k")},
+			{Index: 12, Term: 1, Data: []byte("l")},
+			{Index: 13, Term: 1, Data: []byte("m")},
+			{Index: 14, Term: 1, Data: []byte("n")},
+			{Index: 15, Term: 1, Data: []byte("o")},
+			{Index: 16, Term: 1, Data: []byte("p")},
+			{Index: 17, Term: 1, Data: []byte("q")},
+			{Index: 18, Term: 1, Data: []byte("r")},
+			{Index: 19, Term: 1, Data: []byte("s")},
+			{Index: 20, Term: 1, Data: []byte("t")},
+		},
+		hardState: &raftpb.HardState{Term: 1, CommittedIndex: 20},
+	}
+
+	// With Applied = snapshot boundary, replay entries 11–20.
+	r1 := newRaft(Config{
+		ID:            1,
+		Peers:         []uint64{2, 3},
+		Storage:       storage,
+		Applied:       10,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+	rd1 := r1.Ready()
+	require.Len(t, rd1.CommittedEntries, 10)
+	require.Equal(t, uint64(11), rd1.CommittedEntries[0].Index)
+
+	// With Applied = 0, still get entries 11–20 — compacted entries are gone.
+	r2 := newRaft(Config{
+		ID:            1,
+		Peers:         []uint64{2, 3},
+		Storage:       storage,
+		Applied:       0,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+	rd2 := r2.Ready()
+	require.Len(t, rd2.CommittedEntries, 10)
+	require.Equal(t, uint64(11), rd2.CommittedEntries[0].Index)
+	require.Equal(t, uint64(20), rd2.CommittedEntries[9].Index)
 }

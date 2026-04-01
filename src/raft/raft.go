@@ -3,6 +3,7 @@ package raft
 import (
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"kvgo/raftpb"
 	"log/slog"
 	"math/big"
@@ -126,6 +127,10 @@ func newRaft(cfg Config) *Raft {
 		r.commitIndex = hs.CommittedIndex
 	}
 
+	if cfg.Applied > r.commitIndex {
+		panic(fmt.Sprintf("applied(%d) is greater than committed(%d)", cfg.Applied, r.commitIndex))
+	}
+
 	// Load persisted log entries from storage (restart path).
 	first := cfg.Storage.FirstIndex()
 	last := cfg.Storage.LastIndex()
@@ -137,8 +142,18 @@ func newRaft(cfg Config) *Raft {
 		r.log = entries
 		r.lastLogIndex = entries[len(entries)-1].Index
 		r.stableIndex = r.lastLogIndex
-		r.appliedIndex = r.commitIndex
 	}
+
+	// Applied=0 means "no state machine position" — replay from beginning of
+	// available log. Any other value must be reachable: at or above the first
+	// log entry minus one (the snapshot boundary). Values between 1 and
+	// firstIndex-2 indicate a caller bug — the position was compacted away.
+	if cfg.Applied > 0 && len(r.log) > 0 && cfg.Applied < r.log[0].Index-1 {
+		panic(fmt.Sprintf("applied(%d) is before the first log entry(%d); compacted entries cannot be replayed",
+			cfg.Applied, r.log[0].Index))
+	}
+
+	r.appliedIndex = cfg.Applied
 
 	r.becomeFollower(r.term, None)
 	return r

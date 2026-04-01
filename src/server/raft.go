@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"kvgo/raft"
 	"kvgo/raftpb"
 	"sync"
@@ -137,10 +138,18 @@ func NewRaftHost(cfg RaftHostConfig) (*raftHost, error) {
 		tickInterval = 100 * time.Millisecond
 	}
 
+	// Read the compaction boundary so raft replays committed-but-unapplied
+	// entries on restart. See 037g-the-replay.md.
+	snap, err := cfg.Storage.Snapshot()
+	if err != nil {
+		return nil, fmt.Errorf("reading snapshot for applied index: %w", err)
+	}
+
 	n := newRaftNode(raft.Config{
 		ID:            cfg.ID,
 		Storage:       cfg.Storage,
 		Peers:         pids,
+		Applied:       snap.LastIncludedIndex,
 		HeartbeatTick: heartbeat,
 		ElectionTick:  election,
 	})

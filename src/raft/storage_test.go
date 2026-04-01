@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/binary"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -577,5 +578,87 @@ func TestMultiSegmentReplayAfterRestart_037f(t *testing.T) {
 	require.Len(t, ents, 20)
 	for i, e := range ents {
 		require.Equal(t, uint64(i+1), e.Index)
+	}
+}
+
+// 037g — The Replay
+// ---------------------------------------------------------------------------
+
+func TestCrashMidApplyRecoversEntries_037g(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{CompactThreshold: 80})
+	require.NoError(t, err)
+
+	// Persist 100 entries with commitIndex = 100.
+	entries := make([]*raftpb.Entry, 100)
+	for i := range entries {
+		entries[i] = &raftpb.Entry{Index: uint64(i + 1), Term: 1, Data: []byte{byte(i + 1)}}
+	}
+	require.NoError(t, s.Save(entries, &raftpb.HardState{Term: 1, CommittedIndex: 100}))
+	require.NoError(t, s.Close())
+
+	// First "restart": construct Raft with Applied=0, get all committed entries.
+	s1, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{CompactThreshold: 80})
+	require.NoError(t, err)
+
+	r1 := newRaft(Config{
+		ID:            1,
+		Storage:       s1,
+		Applied:       0,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	rd1 := r1.Ready()
+	require.Len(t, rd1.CommittedEntries, 100)
+
+	// Simulate applying only 95 entries to a fake state machine.
+	applied := make(map[uint64][]byte)
+	for _, e := range rd1.CommittedEntries[:95] {
+		applied[e.Index] = e.Data
+	}
+	require.Len(t, applied, 95)
+
+	// Compact at 80 — the server calls MaybeCompact after each apply batch.
+	require.NoError(t, s1.MaybeCompact(80))
+	snap, err := s1.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, uint64(80), snap.LastIncludedIndex)
+
+	// "Crash": discard raft, close storage.
+	require.NoError(t, s1.Close())
+
+	// Second "restart": realistic server path — Applied from snapshot boundary.
+	s2, err := NewDurableStorageWithOptions(dir, DurableStorageOptions{CompactThreshold: 80})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s2.Close()) }()
+
+	snap2, err := s2.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, uint64(80), snap2.LastIncludedIndex)
+
+	r2 := newRaft(Config{
+		ID:            1,
+		Storage:       s2,
+		Applied:       snap2.LastIncludedIndex,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		Logger:        slog.Default(),
+	})
+
+	rd2 := r2.Ready()
+	// Entries 1–80 are compacted. Applied=80 means replay 81–100.
+	require.Len(t, rd2.CommittedEntries, 20)
+	require.Equal(t, uint64(81), rd2.CommittedEntries[0].Index)
+	require.Equal(t, uint64(100), rd2.CommittedEntries[19].Index)
+
+	// Apply all replayed entries — gap from crash (96–100) is now filled.
+	for _, e := range rd2.CommittedEntries {
+		applied[e.Index] = e.Data
+	}
+	require.Len(t, applied, 100)
+	for i := uint64(1); i <= 100; i++ {
+		require.Equal(t, []byte{byte(i)}, applied[i])
 	}
 }
