@@ -33,7 +33,7 @@ etcd reclaims disk through segmented WAL files (64MB each). After a snapshot, it
 Our compaction follows etcd’s pattern but without state machine snapshots:
 
 1. **Trigger.** After each `applyBatch`, call `DurableStorage.MaybeCompact(appliedIndex)`. The storage decides internally whether the gap warrants compaction.
-2. **Compact.** If `appliedIndex - snap.LastIncludedIndex > threshold`, persist the new `SnapshotMeta` boundary and trim in-memory entries.
+2. **Compact.** If `appliedIndex - snap.LastIncludedIndex ≥ threshold`, persist the new `SnapshotMeta` boundary and trim in-memory entries.
 3. **Delete old segments.** After compaction, delete WAL segment files whose entries are entirely below the new snapshot boundary.
 
 `MaybeCompact` is the only public compaction entry point. There is no public `Compact` method — compaction is always threshold-gated. This matches etcd, where `Compact` lives on the concrete `MemoryStorage` type, not on the `raft.Storage` interface.
@@ -83,4 +83,4 @@ Segment deletion is crash-safe by ordering: `SnapshotMeta` is persisted *before*
 ## Open threads
 
 1. **Slow follower overlap** — etcd keeps 5,000 entries after the snapshot boundary so slow followers can catch up from the log. We compact everything up to `appliedIndex`, which means a slow follower that falls behind the boundary needs a full snapshot transfer. This is acceptable while snapshot transfer (036k) isn't wired.
-2. **Compaction during snapshot inflight** — etcd skips compaction if snapshot transfer is in progress to a slow follower (the leader still needs those entries). We don’t track inflight snapshots yet.
+2. **Compaction during snapshot inflight** — etcd skips compaction if snapshot transfer is in progress to a slow follower (the leader still needs those entries). We don’t track inflight snapshots yet.3. **Non-atomic snapshot meta persistence** — `persistSnapshotMeta` truncates the file then writes. A crash between truncate and write loses the boundary, causing the node to replay already-compacted entries (or fail if the WAL segments were already deleted). The fix is write-to-temp + rename, which is atomic on both Linux and Windows NTFS. Acceptable for now because the window is sub-millisecond and the consequence is a single-node recovery error, not data loss.

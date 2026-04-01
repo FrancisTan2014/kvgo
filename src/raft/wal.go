@@ -48,6 +48,24 @@ func openFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
 }
 
+func openWALReadOnly(dir string, filename string) (*wal, error) {
+	file, err := os.Open(filepath.Join(dir, filename))
+	if err != nil {
+		return nil, err
+	}
+	size, err := fileSize(file)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return &wal{
+		path:     dir,
+		filename: filename,
+		file:     file,
+		size:     size,
+	}, nil
+}
+
 func fileSize(file *os.File) (int64, error) {
 	info, err := file.Stat()
 	if err != nil {

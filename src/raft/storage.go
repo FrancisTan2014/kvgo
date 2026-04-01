@@ -354,15 +354,28 @@ func (s *DurableStorage) MaybeCompact(appliedIndex uint64) error {
 	return s.compactLocked(appliedIndex)
 }
 
+// deleteOldSegments removes sealed WAL segments whose entries have all been
+// compacted (i.e. every entry index ≤ the snapshot boundary). Segments are
+// walked oldest-first and we stop at the first segment that still holds
+// entries above the boundary — later segments are guaranteed to be higher.
 func (s *DurableStorage) deleteOldSegments() error {
 	boundary := s.snap.LastIncludedIndex
 	canDelete := make(map[string]bool)
 	for _, name := range s.rw.segments {
+		// Never delete the segment currently being written to.
 		if name == s.rw.currentSegment() {
 			break
 		}
 		lastIdx, ok := s.segLastIdx[name]
-		if !ok || lastIdx > boundary {
+		if !ok {
+			// Empty segment (e.g. created by cut() then crashed before
+			// any writes). Safe to remove — it contains no entries.
+			canDelete[name] = true
+			continue
+		}
+		// This segment has entries above the compaction boundary, so it
+		// (and all later segments) must be retained.
+		if lastIdx > boundary {
 			break
 		}
 		canDelete[name] = true

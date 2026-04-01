@@ -154,7 +154,7 @@ func (sw *segmentedWAL) readAll(fn func(seg string, batch []byte) error) error {
 			}
 			r = sw.current
 		} else {
-			r, err = newWAL(sw.dir, name)
+			r, err = openWALReadOnly(sw.dir, name)
 			if err != nil {
 				return err
 			}
