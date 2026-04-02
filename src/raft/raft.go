@@ -279,6 +279,53 @@ func (r *Raft) Step(m *raftpb.Message) error {
 
 type stepFunc func(r *Raft, m *raftpb.Message) error
 
+func (r *Raft) sendAppend(to uint64) {
+	prs, exists := r.progress[to]
+	if !exists {
+		r.logger.Warn("sendAppend to unknown peer", "to", to)
+		return
+	}
+
+	prevIndex := prs.NextIndex - 1
+	var prevTerm uint64
+	for _, e := range r.log {
+		if e.Index == prevIndex {
+			prevTerm = e.Term
+			break
+		}
+	}
+
+	// Entry not in log — check snapshot or fall back to snapshot transfer.
+	if prevIndex > 0 && prevTerm == 0 {
+		snap, err := r.storage.Snapshot()
+		if err != nil {
+			r.logger.Warn("sendAppend failed to load snapshot", "to", to, "error", err)
+			return
+		}
+		if snap.LastIncludedIndex == prevIndex {
+			prevTerm = snap.LastIncludedTerm
+		} else {
+			// Anchor is compacted beyond snapshot boundary — send snapshot.
+			r.logger.Info("sendAppend falling back to snapshot", "to", to, "prevIndex", prevIndex, "snapIndex", snap.LastIncludedIndex)
+			r.send(&raftpb.Message{
+				Type:     raftpb.MessageType_MsgSnap,
+				To:       to,
+				Snapshot: snap,
+			})
+			return
+		}
+	}
+
+	r.send(&raftpb.Message{
+		To:      to,
+		Type:    raftpb.MessageType_MsgApp,
+		Index:   prevIndex,
+		LogTerm: prevTerm,
+		Commit:  r.commitIndex,
+		Entries: r.entriesBetween(prs.NextIndex-1, r.lastLogIndex),
+	})
+}
+
 func stepLeader(r *Raft, m *raftpb.Message) error {
 	switch m.Type {
 	case raftpb.MessageType_MsgAppResp:
@@ -324,27 +371,27 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		r.appendEntries([]*raftpb.Entry{e})
 
 		for _, pid := range r.peers {
-			prs, exists := r.progress[pid]
-			if !exists {
-				return errors.New("TODO: will be replace with real coordination code later")
-			}
-			r.send(&raftpb.Message{
-				To:      pid,
-				Type:    raftpb.MessageType_MsgApp,
-				Index:   prev.Index,
-				LogTerm: prev.Term,
-				Commit:  r.commitIndex,
-				Entries: r.entriesBetween(prs.NextIndex-1, r.lastLogIndex),
-			})
+			r.sendAppend(pid)
 		}
 
 	case raftpb.MessageType_MsgBeat:
 		for _, pid := range r.peers {
+			prs := r.progress[pid]
 			r.send(&raftpb.Message{
 				To:     pid,
-				Type:   raftpb.MessageType_MsgApp,
-				Commit: r.commitIndex,
+				Type:   raftpb.MessageType_MsgHeartbeat,
+				Commit: min(prs.MatchIndex, r.commitIndex),
 			})
+		}
+
+	case raftpb.MessageType_MsgHeartbeatResp:
+		prs, exists := r.progress[m.From]
+		if !exists {
+			r.logger.Warn("MsgHeartbeatResp from unknown peer", "from", m.From)
+			return nil
+		}
+		if prs.MatchIndex < r.lastLogIndex {
+			r.sendAppend(m.From)
 		}
 
 	default:
@@ -439,6 +486,17 @@ func stepFollower(r *Raft, m *raftpb.Message) error {
 		if r.appliedIndex < m.Snapshot.LastIncludedIndex {
 			r.appliedIndex = m.Snapshot.LastIncludedIndex
 		}
+
+	case raftpb.MessageType_MsgHeartbeat:
+		r.electionElapsed = 0
+		r.lead = m.From
+		if m.Commit > r.commitIndex {
+			r.CommitTo(m.Commit)
+		}
+		r.send(&raftpb.Message{
+			To:   m.From,
+			Type: raftpb.MessageType_MsgHeartbeatResp,
+		})
 
 	default:
 		// TODO: deal with the remaining message types
@@ -554,14 +612,17 @@ func (r *Raft) anchorExists(index uint64, term uint64) bool {
 	}
 
 	snap, err := r.storage.Snapshot()
-	if err == nil {
-		if index == snap.LastIncludedIndex && term == snap.LastIncludedTerm {
-			return true
-		}
+	if err != nil {
+		r.logger.Warn("anchorExists failed to load snapshot", "error", err)
+		snap = nil
+	}
+
+	if snap != nil && index == snap.LastIncludedIndex && term == snap.LastIncludedTerm {
+		return true
 	}
 
 	for _, e := range r.log {
-		if err == nil && e.Index <= snap.LastIncludedIndex {
+		if snap != nil && e.Index <= snap.LastIncludedIndex {
 			continue
 		}
 		if e.Index == index && e.Term == term {

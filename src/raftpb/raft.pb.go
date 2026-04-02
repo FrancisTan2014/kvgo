@@ -24,40 +24,46 @@ const (
 type MessageType int32
 
 const (
-	MessageType_MsgUnknown  MessageType = 0 // proto3 requires a zero value
-	MessageType_MsgApp      MessageType = 1
-	MessageType_MsgAppResp  MessageType = 2
-	MessageType_MsgVote     MessageType = 3
-	MessageType_MsgVoteResp MessageType = 4
-	MessageType_MsgSnap     MessageType = 5
-	MessageType_MsgHup      MessageType = 6
-	MessageType_MsgBeat     MessageType = 7
-	MessageType_MsgProp     MessageType = 8
+	MessageType_MsgUnknown       MessageType = 0 // proto3 requires a zero value
+	MessageType_MsgApp           MessageType = 1
+	MessageType_MsgAppResp       MessageType = 2
+	MessageType_MsgVote          MessageType = 3
+	MessageType_MsgVoteResp      MessageType = 4
+	MessageType_MsgSnap          MessageType = 5
+	MessageType_MsgHup           MessageType = 6
+	MessageType_MsgBeat          MessageType = 7
+	MessageType_MsgProp          MessageType = 8
+	MessageType_MsgHeartbeat     MessageType = 9
+	MessageType_MsgHeartbeatResp MessageType = 10
 )
 
 // Enum value maps for MessageType.
 var (
 	MessageType_name = map[int32]string{
-		0: "MsgUnknown",
-		1: "MsgApp",
-		2: "MsgAppResp",
-		3: "MsgVote",
-		4: "MsgVoteResp",
-		5: "MsgSnap",
-		6: "MsgHup",
-		7: "MsgBeat",
-		8: "MsgProp",
+		0:  "MsgUnknown",
+		1:  "MsgApp",
+		2:  "MsgAppResp",
+		3:  "MsgVote",
+		4:  "MsgVoteResp",
+		5:  "MsgSnap",
+		6:  "MsgHup",
+		7:  "MsgBeat",
+		8:  "MsgProp",
+		9:  "MsgHeartbeat",
+		10: "MsgHeartbeatResp",
 	}
 	MessageType_value = map[string]int32{
-		"MsgUnknown":  0,
-		"MsgApp":      1,
-		"MsgAppResp":  2,
-		"MsgVote":     3,
-		"MsgVoteResp": 4,
-		"MsgSnap":     5,
-		"MsgHup":      6,
-		"MsgBeat":     7,
-		"MsgProp":     8,
+		"MsgUnknown":       0,
+		"MsgApp":           1,
+		"MsgAppResp":       2,
+		"MsgVote":          3,
+		"MsgVoteResp":      4,
+		"MsgSnap":          5,
+		"MsgHup":           6,
+		"MsgBeat":          7,
+		"MsgProp":          8,
+		"MsgHeartbeat":     9,
+		"MsgHeartbeatResp": 10,
 	}
 )
 
@@ -414,7 +420,7 @@ const file_raftpb_raft_proto_rawDesc = "" +
 	"RejectHint\x18\n" +
 	" \x01(\x04R\n" +
 	"RejectHint\x120\n" +
-	"\bSnapshot\x18\v \x01(\v2\x14.raftpb.SnapshotMetaR\bSnapshot*\x8a\x01\n" +
+	"\bSnapshot\x18\v \x01(\v2\x14.raftpb.SnapshotMetaR\bSnapshot*\xb2\x01\n" +
 	"\vMessageType\x12\x0e\n" +
 	"\n" +
 	"MsgUnknown\x10\x00\x12\n" +
@@ -428,7 +434,10 @@ const file_raftpb_raft_proto_rawDesc = "" +
 	"\n" +
 	"\x06MsgHup\x10\x06\x12\v\n" +
 	"\aMsgBeat\x10\a\x12\v\n" +
-	"\aMsgProp\x10\bB\rZ\vkvgo/raftpbb\x06proto3"
+	"\aMsgProp\x10\b\x12\x10\n" +
+	"\fMsgHeartbeat\x10\t\x12\x14\n" +
+	"\x10MsgHeartbeatResp\x10\n" +
+	"B\rZ\vkvgo/raftpbb\x06proto3"
 
 var (
 	file_raftpb_raft_proto_rawDescOnce sync.Once

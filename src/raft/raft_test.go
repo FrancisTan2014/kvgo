@@ -873,7 +873,27 @@ func TestTickElectionProducesMsgHup_036t(t *testing.T) {
 	require.Equal(t, uint64(2), rd.Messages[0].To)
 }
 
-func TestTickHeartbeatProducesMsgApp_036t(t *testing.T) {
+// Superseded by 037h: heartbeats now use dedicated MsgHeartbeat instead of empty MsgApp
+//
+// func TestTickHeartbeatProducesMsgApp_036t(t *testing.T) {
+// 	leader := newLeaderRaftWithOnePeer()
+// 	leader.Advance()
+//
+// 	// Tick past heartbeatTimeout.
+// 	for i := 0; i < leader.heartbeatTimeout; i++ {
+// 		leader.tick()
+// 	}
+//
+// 	rd := leader.Ready()
+// 	require.Len(t, rd.Messages, 1)
+// 	require.Equal(t, raftpb.MessageType_MsgApp, rd.Messages[0].Type)
+// 	require.Equal(t, uint64(2), rd.Messages[0].To)
+// 	require.Equal(t, leader.term, rd.Messages[0].Term)
+// 	// Heartbeat carries no entries, just commit index.
+// 	require.Empty(t, rd.Messages[0].Entries)
+// }
+
+func TestTickHeartbeatProducesMsgHeartbeat_037h(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
 	leader.Advance()
 
@@ -884,11 +904,9 @@ func TestTickHeartbeatProducesMsgApp_036t(t *testing.T) {
 
 	rd := leader.Ready()
 	require.Len(t, rd.Messages, 1)
-	require.Equal(t, raftpb.MessageType_MsgApp, rd.Messages[0].Type)
+	require.Equal(t, raftpb.MessageType_MsgHeartbeat, rd.Messages[0].Type)
 	require.Equal(t, uint64(2), rd.Messages[0].To)
 	require.Equal(t, leader.term, rd.Messages[0].Term)
-	// Heartbeat carries no entries, just commit index.
-	require.Empty(t, rd.Messages[0].Entries)
 }
 
 func TestCandidateReElectsAtHigherTermOnTimeout_036t(t *testing.T) {
@@ -1681,4 +1699,210 @@ func TestReplayAfterCompactionBoundedByLog_037g(t *testing.T) {
 	require.Len(t, rd2.CommittedEntries, 10)
 	require.Equal(t, uint64(11), rd2.CommittedEntries[0].Index)
 	require.Equal(t, uint64(20), rd2.CommittedEntries[9].Index)
+}
+
+// ---------------------------------------------------------------------------
+// 037h — The Heartbeat
+// ---------------------------------------------------------------------------
+
+func TestHeartbeatCarriesCappedCommitIndex_037h(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3}
+	r.term = 1
+	r.becomeLeader()
+
+	// Simulate different progress per peer.
+	r.commitIndex = 10
+	r.progress[2] = &Progress{MatchIndex: 7, NextIndex: 8}
+	r.progress[3] = &Progress{MatchIndex: 10, NextIndex: 11}
+	r.Advance()
+
+	require.NoError(t, r.Step(&raftpb.Message{From: r.id, Type: raftpb.MessageType_MsgBeat}))
+
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 2)
+
+	for _, msg := range rd.Messages {
+		require.Equal(t, raftpb.MessageType_MsgHeartbeat, msg.Type)
+		if msg.To == 2 {
+			require.Equal(t, uint64(7), msg.Commit, "commit to peer 2 should be capped at MatchIndex=7")
+		} else {
+			require.Equal(t, uint64(10), msg.Commit, "commit to peer 3 should be commitIndex=10")
+		}
+	}
+}
+
+func TestFollowerResetsElectionTimerOnHeartbeat_037h(t *testing.T) {
+	r := newTestRaft(2)
+	r.peers = []uint64{1}
+	r.becomeFollower(1, 1)
+
+	// Advance election timer partway.
+	for i := 0; i < r.electionTimeout-2; i++ {
+		r.tick()
+	}
+	require.True(t, r.electionElapsed > 0)
+
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgHeartbeat,
+		From: 1,
+		Term: 1,
+	}))
+	require.Equal(t, 0, r.electionElapsed)
+}
+
+func TestFollowerAdvancesCommitOnHeartbeat_037h(t *testing.T) {
+	r := newTestRaft(2)
+	r.peers = []uint64{1}
+	r.becomeFollower(1, 1)
+	r.log = []*raftpb.Entry{
+		{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1},
+		{Index: 4, Term: 1}, {Index: 5, Term: 1}, {Index: 6, Term: 1},
+		{Index: 7, Term: 1}, {Index: 8, Term: 1}, {Index: 9, Term: 1},
+		{Index: 10, Term: 1},
+	}
+	r.lastLogIndex = 10
+	r.commitIndex = 5
+
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgHeartbeat,
+		From:   1,
+		Term:   1,
+		Commit: 8,
+	}))
+	require.Equal(t, uint64(8), r.commitIndex)
+}
+
+func TestFollowerRespondsWithMsgHeartbeatResp_037h(t *testing.T) {
+	r := newTestRaft(2)
+	r.peers = []uint64{1}
+	r.becomeFollower(1, 1)
+
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgHeartbeat,
+		From: 1,
+		Term: 1,
+	}))
+
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, raftpb.MessageType_MsgHeartbeatResp, rd.Messages[0].Type)
+	require.Equal(t, uint64(1), rd.Messages[0].To)
+}
+
+func TestLeaderSendsMsgAppAfterHeartbeatRespFromBehindPeer_037h(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.term = 1
+	r.becomeLeader()
+	r.log = []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+		{Index: 2, Term: 1, Data: []byte("b")},
+		{Index: 3, Term: 1, Data: []byte("c")},
+	}
+	r.lastLogIndex = 3
+	r.progress[2] = &Progress{MatchIndex: 1, NextIndex: 2}
+	r.Advance()
+
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgHeartbeatResp,
+		From: 2,
+		Term: 1,
+	}))
+
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, raftpb.MessageType_MsgApp, rd.Messages[0].Type)
+	require.Equal(t, uint64(2), rd.Messages[0].To)
+	// Should send entries from NextIndex onward.
+	require.True(t, len(rd.Messages[0].Entries) > 0, "should send entries to catch up behind peer")
+}
+
+func TestLeaderSkipsMsgAppAfterHeartbeatRespFromCaughtUpPeer_037h(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.term = 1
+	r.becomeLeader()
+	r.log = []*raftpb.Entry{
+		{Index: 1, Term: 1, Data: []byte("a")},
+	}
+	r.lastLogIndex = 1
+	r.progress[2] = &Progress{MatchIndex: 1, NextIndex: 2}
+	r.Advance()
+
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgHeartbeatResp,
+		From: 2,
+		Term: 1,
+	}))
+
+	rd := r.Ready()
+	require.Empty(t, rd.Messages, "caught-up peer should not receive MsgApp")
+}
+
+func TestHeartbeatDoesNotInterfereWithReplication_037h(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.term = 1
+	r.becomeLeader()
+	r.Advance()
+
+	// Propose an entry — normal replication.
+	require.NoError(t, r.Propose([]byte("x")))
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, raftpb.MessageType_MsgApp, rd.Messages[0].Type)
+	appMsg := rd.Messages[0]
+	r.Advance()
+
+	// Follower acks via MsgAppResp — leader advances commit.
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:  raftpb.MessageType_MsgAppResp,
+		From:  2,
+		Term:  1,
+		Index: appMsg.Entries[0].Index,
+	}))
+	require.Equal(t, uint64(1), r.commitIndex)
+	r.Advance()
+
+	// Now tick heartbeat — should produce MsgHeartbeat, not interfere.
+	for i := 0; i < r.heartbeatTimeout; i++ {
+		r.tick()
+	}
+	rd = r.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, raftpb.MessageType_MsgHeartbeat, rd.Messages[0].Type)
+}
+
+func TestHeartbeatRespSendsSnapshotWhenAnchorIsCompacted_037h(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.term = 1
+	r.becomeLeader()
+	r.storage = &mockStorage{
+		snap: &raftpb.SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 1},
+		entries: []*raftpb.Entry{
+			{Index: 11, Term: 1, Data: []byte("a")},
+			{Index: 12, Term: 1, Data: []byte("b")},
+		},
+	}
+	r.log = []*raftpb.Entry{
+		{Index: 11, Term: 1, Data: []byte("a")},
+		{Index: 12, Term: 1, Data: []byte("b")},
+	}
+	r.lastLogIndex = 12
+	// Peer is far behind — NextIndex points into the compacted range.
+	r.progress[2] = &Progress{MatchIndex: 0, NextIndex: 5}
+	r.Advance()
+
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgHeartbeatResp,
+		From: 2,
+		Term: 1,
+	}))
+
+	rd := r.Ready()
+	require.Len(t, rd.Messages, 1)
+	require.Equal(t, raftpb.MessageType_MsgSnap, rd.Messages[0].Type)
+	require.Equal(t, uint64(10), rd.Messages[0].Snapshot.LastIncludedIndex)
 }
