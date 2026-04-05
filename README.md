@@ -12,6 +12,7 @@ By building a key-value store, I want to:
 Small essays distilled from the build process:
 
 - [Stop Before the Boundary and Prove What You Have](docs/articles/stop-before-the-boundary.md) — the first lesson that became concrete for me in the Raft rewrite: find the seam, shrink the subject, prove it, then move forward.
+- [Software Design Moves Top-Down, Bottom-Up, and Back Again](docs/articles/back-and-forth-in-software-design.md) — how the 036 series taught me that real software design does not move in one direction; it stabilizes through repeated movement between architectural direction and implementation pressure.
 
 ## Current status
 
