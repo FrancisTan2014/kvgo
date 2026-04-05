@@ -1,10 +1,33 @@
 # kv-go
+
 This repo is my starting point for building things from scratch to understand what’s happening “under the hood”.
 
 By building a key-value store, I want to:
 1. Apply what I’ve learned from CS:APP
 2. Learn Go by writing real code
 3. Learn how modern distributed systems work
+
+## Articles
+
+Small essays distilled from the build process:
+
+- [Stop Before the Boundary and Prove What You Have](docs/articles/stop-before-the-boundary.md) — the first lesson that became concrete for me in the Raft rewrite: find the seam, shrink the subject, prove it, then move forward.
+
+## Current status
+
+As of episode `037h`, `kv-go` is a Raft-owned distributed key-value store in active construction.
+
+What works today:
+- three-node Raft cluster with tick-driven election and TCP transport
+- `PUT` flows through propose → majority agreement → apply
+- restart recovery from durable storage
+- segmented WAL with automatic compaction
+- dedicated heartbeat messages (`MsgHeartbeat` / `MsgHeartbeatResp`) preparing the path for linearizable reads
+
+Still open:
+- `ReadIndex` / linearizable `GET`
+- membership changes and learners
+- snapshot transfer and more client-facing polish
 
 ## Sabotage
 I think of this as a question-driven methodology: I start with questions and let them guide me through distributed
