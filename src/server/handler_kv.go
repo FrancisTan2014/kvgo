@@ -25,18 +25,29 @@ func (s *Server) handleGet(ctx *RequestContext) error {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handlePut(ctx *RequestContext) error {
+	if err := s.proposePut(string(ctx.Request.Key), ctx.Request.Value); err != nil {
+		return err
+	}
+	return s.responseWithStatus(ctx, protocol.StatusOK)
+}
+
+// proposePut proposes a PUT through Raft and blocks until the entry is
+// committed and applied, or the write timeout expires. Shared by the binary
+// protocol handler and the HTTP handler.
+func (s *Server) proposePut(key string, value []byte) error {
 	id := s.nextRequestID()
 	ch := s.w.Register(id)
 
-	timeoutCtx, cancel := context.WithTimeout(s.ctx, s.opts.WriteTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, s.opts.WriteTimeout)
 	defer cancel()
 
-	encoded, err := protocol.EncodeRequest(ctx.Request)
+	req := protocol.Request{Cmd: protocol.CmdPut, Key: []byte(key), Value: value}
+	encoded, err := protocol.EncodeRequest(req)
 	if err != nil {
 		s.w.Trigger(id, err)
 	} else {
 		data := marshalEnvelope(id, encoded)
-		if err := s.raftHost.Propose(timeoutCtx, data); err != nil {
+		if err := s.raftHost.Propose(ctx, data); err != nil {
 			s.w.Trigger(id, err)
 		}
 	}
@@ -46,9 +57,9 @@ func (s *Server) handlePut(ctx *RequestContext) error {
 		if result != nil {
 			return result.(error)
 		}
-		return s.responseWithStatus(ctx, protocol.StatusOK)
-	case <-timeoutCtx.Done():
-		return timeoutCtx.Err()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

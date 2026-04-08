@@ -1,0 +1,5 @@
+# All build outputs: kv-server binary, Leiningen target, Jepsen store
+bin/
+
+# Generated SSH keys (test-only)
+docker/secret/

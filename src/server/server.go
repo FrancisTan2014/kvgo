@@ -13,6 +13,7 @@ import (
 	rafttransport "kvgo/transport/raft"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,8 @@ type Options struct {
 	// Lower values reduce latency but increase fsync overhead.
 	// Zero means use engine.DefaultSyncInterval (100ms).
 	SyncInterval time.Duration
+
+	HTTPPort uint16 // optional: HTTP API port for external tools (0 = disabled)
 
 	Logger *slog.Logger // optional debug logger; nil disables logging
 }
@@ -84,6 +87,10 @@ type Server struct {
 	sm            StateMachine
 	w             Wait
 	reqIDGen      atomic.Uint64
+
+	// HTTP API (optional, for external testing tools like Jepsen)
+	httpLn  net.Listener
+	httpSrv *http.Server
 }
 
 func validate(opts *Options) error {
@@ -129,6 +136,13 @@ func (s *Server) Addr() string {
 		return ""
 	}
 	return s.ln.Addr().String()
+}
+
+func (s *Server) HTTPAddr() string {
+	if s.httpLn == nil {
+		return ""
+	}
+	return s.httpLn.Addr().String()
 }
 
 func (s *Server) Start() (err error) {
@@ -198,6 +212,18 @@ func (s *Server) Start() (err error) {
 	s.raftHost.Start()
 
 	s.wg.Go(func() { s.run() })
+
+	// Start optional HTTP API server.
+	if s.opts.HTTPPort > 0 {
+		httpAddr := fmt.Sprintf("%s:%d", s.httpHost(), s.opts.HTTPPort)
+		s.httpLn, err = net.Listen("tcp", httpAddr)
+		if err != nil {
+			return fmt.Errorf("server: http listen: %w", err)
+		}
+		s.httpSrv = &http.Server{Handler: s.httpMux()}
+		go s.httpSrv.Serve(s.httpLn)
+		s.log().Info("http api listening", "addr", s.httpLn.Addr().String())
+	}
 
 	return nil
 }
@@ -270,6 +296,14 @@ func (s *Server) monitorDBHealth() {
 	os.Exit(1)
 }
 
+func (s *Server) httpHost() string {
+	host := s.opts.Host
+	if host == "" {
+		host = defaultHost
+	}
+	return host
+}
+
 func (s *Server) listenAddr() string {
 	network := s.network()
 	if network == NetworkUnix {
@@ -298,6 +332,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Stop accepting new connections.
 	if s.ln != nil {
 		_ = s.ln.Close()
+	}
+
+	// Stop HTTP server if running.
+	if s.httpSrv != nil {
+		_ = s.httpSrv.Shutdown(ctx)
 	}
 
 	// Cancel all subsystem contexts.

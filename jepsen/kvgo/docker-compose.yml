@@ -1,0 +1,73 @@
+services:
+  # Jepsen control node — runs Leiningen and drives the test
+  control:
+    build:
+      context: .
+      dockerfile: docker/control.Dockerfile
+    container_name: jepsen-control
+    hostname: control
+    volumes:
+      - .:/jepsen/kvgo
+      - store:/jepsen/kvgo/bin/store
+    ports:
+      - "8080:8080"   # lein run serve
+    networks:
+      - jepsen
+    depends_on:
+      - n1
+      - n2
+      - n3
+      - n4
+      - n5
+    stdin_open: true
+    tty: true
+
+  # Database nodes — each runs kv-server via Jepsen's SSH automation
+  n1:
+    build: &node-build
+      context: .
+      dockerfile: docker/node.Dockerfile
+    container_name: n1
+    hostname: n1
+    privileged: true
+    networks:
+      - jepsen
+
+  n2:
+    build: *node-build
+    container_name: n2
+    hostname: n2
+    privileged: true
+    networks:
+      - jepsen
+
+  n3:
+    build: *node-build
+    container_name: n3
+    hostname: n3
+    privileged: true
+    networks:
+      - jepsen
+
+  n4:
+    build: *node-build
+    container_name: n4
+    hostname: n4
+    privileged: true
+    networks:
+      - jepsen
+
+  n5:
+    build: *node-build
+    container_name: n5
+    hostname: n5
+    privileged: true
+    networks:
+      - jepsen
+
+volumes:
+  store:
+
+networks:
+  jepsen:
+    driver: bridge
