@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"kvgo/raft"
 	"kvgo/raftpb"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,7 @@ type RaftHostConfig struct {
 	Peers         []uint64
 	Storage       raft.Storage
 	Transport     RaftTransporter
+	Logger        *slog.Logger  // optional; nil uses slog.Default()
 	HeartbeatTick int           // raft logical ticks between heartbeats (default 1)
 	ElectionTick  int           // raft logical ticks for election timeout (default 10)
 	TickInterval  time.Duration // wall-clock interval per logical tick (default 100ms)
@@ -150,6 +152,7 @@ func NewRaftHost(cfg RaftHostConfig) (*raftHost, error) {
 		Storage:       cfg.Storage,
 		Peers:         pids,
 		Applied:       snap.LastIncludedIndex,
+		Logger:        cfg.Logger,
 		HeartbeatTick: heartbeat,
 		ElectionTick:  election,
 	})

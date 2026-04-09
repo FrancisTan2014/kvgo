@@ -103,6 +103,10 @@ func newRaft(cfg Config) *Raft {
 		panic(err.Error())
 	}
 
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+
 	peers := make([]uint64, len(cfg.Peers))
 	copy(peers, cfg.Peers)
 

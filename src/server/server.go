@@ -255,6 +255,7 @@ func (s *Server) initializeRaftHost() error {
 		Peers:     pids,
 		Storage:   rs,
 		Transport: rt,
+		Logger:    s.log(),
 	})
 	if err != nil {
 		return err
