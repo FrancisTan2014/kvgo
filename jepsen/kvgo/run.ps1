@@ -34,11 +34,11 @@ if (-not $LeinArgs) {
     Write-Host "==> Starting cluster (interactive control shell)..."
     Write-Host "    Run:  lein run test -w basic"
     Write-Host "    Exit: Ctrl-D, then: docker compose -f $DockerDir\docker-compose.yml down"
-    docker compose -f "$DockerDir\docker-compose.yml" run --rm control
+    docker compose -f "$DockerDir\docker-compose.yml" run --service-ports --rm control
 } else {
     $cmd = $LeinArgs -join " "
     Write-Host "==> Running: $cmd"
-    docker compose -f "$DockerDir\docker-compose.yml" run --rm control bash -c $cmd
+    docker compose -f "$DockerDir\docker-compose.yml" run --service-ports --rm control bash -c $cmd
 }
 
 Write-Host "==> Tearing down cluster..."

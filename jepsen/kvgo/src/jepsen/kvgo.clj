@@ -1,13 +1,12 @@
 (ns jepsen.kvgo
   "Jepsen test suite for kv-go: a Raft-based distributed key-value store.
 
-  Shared infrastructure — db lifecycle, client, configuration — lives here.
-  Individual workloads (basic, stale, partition, …) live under jepsen.kvgo.*."
+  This namespace owns shared infrastructure — db lifecycle, test construction,
+  CLI entry point. Clients and HTTP helpers live in jepsen.kvgo.support.
+  Individual workloads live under jepsen.kvgo.{basic,partition,...}."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
-            [clj-http.client :as http]
             [jepsen [cli :as cli]
-                    [client :as client]
                     [control :as c]
                     [db :as db]
                     [nemesis :as nemesis]
@@ -15,7 +14,8 @@
                     [store :as store]
                     [tests :as tests]]
             [jepsen.control.util :as cu]
-            [jepsen.kvgo.basic :as basic]))
+            [jepsen.kvgo.basic :as basic]
+            [jepsen.kvgo.partition :as partition]))
 
 ;; ---------------------------------------------------------------------------
 ;; Configuration
@@ -87,72 +87,21 @@
       [log-file])))
 
 ;; ---------------------------------------------------------------------------
-;; Client
-;; ---------------------------------------------------------------------------
-
-(defn kv-url
-  "Returns the HTTP URL for a key on a given node."
-  [node key]
-  (str "http://" (name node) ":" http-port "/kv/" key))
-
-(def http-opts
-  "Common HTTP client options."
-  {:socket-timeout     5000
-   :connection-timeout 5000
-   :throw-exceptions   false})
-
-(defrecord KvClient [node]
-  client/Client
-
-  (open! [this _test node]
-    (assoc this :node node))
-
-  (setup! [_this _test])
-
-  (invoke! [this _test op]
-    (let [url (kv-url node "jepsen")]
-      (case (:f op)
-        :read
-        (try
-          (let [resp (http/get url http-opts)]
-            (case (:status resp)
-              200 (assoc op :type :ok
-                            :value (Long/parseLong (:body resp)))
-              404 (assoc op :type :ok :value nil)
-              (assoc op :type :fail
-                        :error [:unexpected-status (:status resp)])))
-          (catch Exception e
-            (assoc op :type :fail :error (.getMessage e))))
-
-        :write
-        (try
-          (let [resp (http/put url (merge http-opts
-                                          {:body (str (:value op))}))]
-            (case (:status resp)
-              200 (assoc op :type :ok)
-              (assoc op :type :info
-                        :error [:unexpected-status (:status resp)])))
-          (catch Exception e
-            (assoc op :type :info :error (.getMessage e)))))))
-
-  (teardown! [_this _test])
-
-  (close! [_this _test]))
-
-;; ---------------------------------------------------------------------------
 ;; Workload registry
 ;; ---------------------------------------------------------------------------
 
 (def workloads
   "Map of workload name → workload constructor."
-  {"basic" basic/workload})
+  {"basic"     basic/workload
+   "partition" partition/workload})
 
 ;; ---------------------------------------------------------------------------
 ;; Test definition
 ;; ---------------------------------------------------------------------------
 
 (defn kvgo-test
-  "Constructs a Jepsen test map from CLI options."
+  "Constructs a Jepsen test map from CLI options.
+  Workloads return {:client :generator :checker :nemesis}."
   [opts]
   (let [workload-name (get opts :workload "basic")
         workload-fn   (get workloads workload-name)]
@@ -167,7 +116,7 @@
               :name            (str "kvgo-" workload-name)
               :os              os/noop
               :db              (db)
-              :client          (KvClient. nil)
+              :client          (:client wl)
               :nemesis         (:nemesis wl nemesis/noop)
               :checker         (:checker wl)
               :generator       (:generator wl)}))))
@@ -184,7 +133,7 @@
 (defn -main
   "Jepsen CLI entry point."
   [& args]
-  (alter-var-root #'store/base-dir (constantly "bin/store"))
+  (alter-var-root #'store/base-dir (constantly "store"))
   (cli/run! (merge (cli/single-test-cmd {:test-fn  kvgo-test
                                          :opt-spec cli-opts})
                    (cli/serve-cmd))
