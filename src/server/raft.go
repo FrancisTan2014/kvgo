@@ -46,6 +46,8 @@ type RaftHost interface {
 	Campaign(ctx context.Context) error
 	Apply() <-chan toApply
 	LeaderID() uint64
+	ReadIndex(ctx context.Context, rctx []byte) error
+	ReadState() <-chan raft.ReadState
 
 	Start()
 	Stop()
@@ -59,6 +61,7 @@ type raftHost struct {
 	transport    RaftTransporter
 	tickInterval time.Duration
 	applyc       chan toApply
+	readStatec   chan raft.ReadState
 	lead         atomic.Uint64
 
 	started  atomic.Bool
@@ -109,6 +112,7 @@ func newRaftHost(cfg raftHostConfig) (*raftHost, error) {
 		transport:    cfg.Transport,
 		tickInterval: tickInterval,
 		applyc:       make(chan toApply, 1),
+		readStatec:   make(chan raft.ReadState, 1),
 		errc:         make(chan error, 1),
 		stopc:        make(chan struct{}),
 		done:         make(chan struct{}),
@@ -218,6 +222,15 @@ func (r *raftHost) handleBatch(rd raft.Ready) error {
 	if len(rd.Messages) > 0 {
 		r.transport.Send(rd.Messages)
 	}
+	if len(rd.ReadStates) > 0 {
+		for _, rs := range rd.ReadStates {
+			select {
+			case r.readStatec <- rs:
+			case <-r.stopc:
+				return nil
+			}
+		}
+	}
 	if len(rd.CommittedEntries) > 0 {
 		total := 0
 		for _, e := range rd.CommittedEntries {
@@ -263,4 +276,12 @@ func (r *raftHost) Errors() <-chan error {
 
 func (r *raftHost) LeaderID() uint64 {
 	return r.lead.Load()
+}
+
+func (r *raftHost) ReadIndex(ctx context.Context, rctx []byte) error {
+	return r.n.ReadIndex(ctx, rctx)
+}
+
+func (r *raftHost) ReadState() <-chan raft.ReadState {
+	return r.readStatec
 }

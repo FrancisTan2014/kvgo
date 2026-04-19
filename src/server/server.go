@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"kvgo/engine"
+	"kvgo/pkg/wait"
 	"kvgo/protocol"
 	"kvgo/raft"
 	"kvgo/raftpb"
@@ -85,7 +87,8 @@ type Server struct {
 	raftTransport RaftTransporter
 	raftStorage   *raft.DurableStorage
 	sm            StateMachine
-	w             Wait
+	w             wait.Wait
+	applyWait     wait.WaitTime
 	reqIDGen      atomic.Uint64
 
 	// HTTP API (optional, for external testing tools like Jepsen)
@@ -119,7 +122,8 @@ func NewServer(opts Options) (*Server, error) {
 		opts:            opts,
 		conns:           make(map[transport.StreamTransport]struct{}),
 		requestHandlers: make(map[protocol.Cmd]HandlerFunc),
-		w:               newWait(),
+		w:               wait.New(),
+		applyWait:       wait.NewTimeList(),
 	}
 
 	s.registerRequestHandlers()
@@ -433,13 +437,17 @@ func (s *Server) log() *slog.Logger {
 
 func (s *Server) run() {
 	applyc := s.raftHost.Apply()
+	readStateC := s.raftHost.ReadState()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
+		case rs := <-readStateC:
+			s.w.Trigger(binary.BigEndian.Uint64(rs.RequestCtx), rs.Index)
 		case ap := <-applyc:
 			s.applyBatch(ap)
 			if ap.appliedThru > 0 {
+				s.applyWait.Trigger(ap.appliedThru)
 				if err := s.raftStorage.MaybeCompact(ap.appliedThru); err != nil {
 					s.log().Error("compaction failed", "error", err, "applied_thru", ap.appliedThru)
 				}

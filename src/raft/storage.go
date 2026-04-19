@@ -11,6 +11,7 @@ import (
 var ErrCompacted = errors.New("requested index is unavailable due to compaction")
 var ErrNonContiguous = errors.New("non-contiguous raftpb.Entry index")
 var ErrSnapOutOfDate = errors.New("requested snapshot is older than existing snapshot")
+var ErrUnavailable = errors.New("requested index is unavailable")
 
 type Storage interface {
 	InitialState() (*raftpb.HardState, error)
@@ -21,6 +22,7 @@ type Storage interface {
 	Close() error
 	Snapshot() (*raftpb.SnapshotMeta, error)
 	ApplySnapshot(snap *raftpb.SnapshotMeta) error
+	Term(i uint64) (uint64, error)
 }
 
 const snapFilename = "snapshot.log"
@@ -455,4 +457,22 @@ func (s *DurableStorage) ApplySnapshot(snap *raftpb.SnapshotMeta) error {
 	s.snap = snap
 	s.entries = filterRetainedEntries(s.entries, snap.LastIncludedIndex)
 	return nil
+}
+
+func (s *DurableStorage) Term(i uint64) (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if i < s.snap.LastIncludedIndex {
+		return 0, ErrCompacted
+	}
+	if i > s.LastIndex() {
+		return 0, ErrUnavailable
+	}
+
+	if i == s.snap.LastIncludedIndex {
+		return s.snap.LastIncludedTerm, nil
+	}
+
+	return s.entries[i-s.firstIndexWithoutLock()].Term, nil
 }

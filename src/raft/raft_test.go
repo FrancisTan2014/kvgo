@@ -87,6 +87,19 @@ func (m *mockStorage) ApplySnapshot(snap *raftpb.SnapshotMeta) error {
 	return nil
 }
 
+func (m *mockStorage) Term(i uint64) (uint64, error) {
+	if m.snap != nil && i == m.snap.LastIncludedIndex {
+		return m.snap.LastIncludedTerm, nil
+	}
+	if len(m.entries) > 0 {
+		first := m.entries[0].Index
+		if i >= first && i <= m.entries[len(m.entries)-1].Index {
+			return m.entries[int(i-first)].Term, nil
+		}
+	}
+	return 0, ErrUnavailable
+}
+
 func newTestRaft(id uint64) *Raft {
 	return newRaft(Config{
 		ID:            id,
@@ -1905,4 +1918,302 @@ func TestHeartbeatRespSendsSnapshotWhenAnchorIsCompacted_037h(t *testing.T) {
 	require.Len(t, rd.Messages, 1)
 	require.Equal(t, raftpb.MessageType_MsgSnap, rd.Messages[0].Type)
 	require.Equal(t, uint64(10), rd.Messages[0].Snapshot.LastIncludedIndex)
+}
+
+// --- 037l ReadIndex tests ---
+
+// #14 becomeLeader appends a no-op entry in the new term so that Raft §5.4.2
+// can commit previous-term entries and so that `committedEntryInCurrentTerm`
+// will eventually flip to true (unblocking ReadIndex).
+func TestBecomeLeaderAppendsNoOpEntry_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.term = 1
+	r.becomeLeader()
+
+	require.Len(t, r.log, 1, "becomeLeader must append exactly one no-op entry")
+	require.Equal(t, uint64(1), r.log[0].Index)
+	require.Equal(t, uint64(1), r.log[0].Term)
+	require.Nil(t, r.log[0].Data, "no-op entry must carry nil Data")
+}
+
+// #6 A single-node cluster has trivial quorum (itself). No heartbeat broadcast
+// is needed — stepLeader short-circuits MsgReadIndex and immediately appends a
+// ReadState.
+func TestSingletonClusterReadIndexSkipsHeartbeat_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = nil
+	r.term = 1
+	r.becomeLeader()
+	r.Advance() // drain becomeLeader's Ready
+
+	rctx := []byte("rctx-singleton")
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		From:    1,
+		Context: rctx,
+	}))
+
+	rd := r.Ready()
+	for _, m := range rd.Messages {
+		require.NotEqual(t, raftpb.MessageType_MsgHeartbeat, m.Type,
+			"singleton ReadIndex must not broadcast heartbeats")
+	}
+	require.Len(t, rd.ReadStates, 1)
+	require.Equal(t, rctx, rd.ReadStates[0].RequestCtx)
+}
+
+// #15 A follower with no known leader, or a candidate mid-election, has no
+// upstream to forward MsgReadIndex to. Both fast-fail with ErrProposalDropped
+// so the caller sees the failure immediately instead of blocking to its ctx
+// deadline.
+func TestStepFollowerReadIndexWithoutLeaderIsDropped_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.becomeFollower(1, None)
+
+	err := r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		Context: []byte("rctx"),
+	})
+	require.ErrorIs(t, err, ErrProposalDropped)
+}
+
+func TestStepCandidateReadIndexIsDropped_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.becomeCandidate()
+
+	err := r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		Context: []byte("rctx"),
+	})
+	require.ErrorIs(t, err, ErrProposalDropped)
+}
+
+// #13 maybeCommit must refuse to advance commitIndex over a previous-term
+// entry (Raft §5.4.2). It advances only after a current-term entry commits at
+// a higher index, which then carries the prior-term entries with it.
+func TestMaybeCommitSkipsPreviousTermMedian_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3}
+	r.term = 2
+	r.state = Leader
+	r.step = stepLeader
+	r.log = []*raftpb.Entry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 2}, // current-term no-op
+	}
+	r.lastLogIndex = 3
+	// storage.Term must resolve each index so matchTerm works.
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{
+			{Index: 1, Term: 1},
+			{Index: 2, Term: 1},
+			{Index: 3, Term: 2},
+		},
+	}
+
+	require.False(t, r.maybeCommit(2), "median at prior-term index must be rejected")
+	require.Zero(t, r.commitIndex, "commitIndex must not advance on prior-term median")
+
+	require.True(t, r.maybeCommit(3), "median at current-term index must commit")
+	require.Equal(t, uint64(3), r.commitIndex, "commitIndex jumps past prior-term entries")
+}
+
+// #1 Leader ReadIndex with quorum — single reader. After quorum acks, Raft
+// emits a ReadState carrying the recorded commitIndex and the original rctx.
+// (Concurrent-reader correlation is #16.)
+func TestLeaderReadIndexReturnsReadState_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3}
+	r.term = 1
+	r.becomeLeader()
+	// Pre-populate storage so matchTerm(1) is true. Without this the
+	// committedEntryInCurrentTerm guard would queue the request.
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{{Index: 1, Term: 1}},
+	}
+	r.commitIndex = 1
+	r.Advance() // drain becomeLeader's Ready
+
+	rctx := []byte("rctx-solo")
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		From:    1,
+		Context: rctx,
+	}))
+
+	// Leader broadcasts heartbeat carrying rctx; no ReadState yet.
+	rd := r.Ready()
+	var heartbeats int
+	for _, m := range rd.Messages {
+		if m.Type == raftpb.MessageType_MsgHeartbeat {
+			heartbeats++
+			require.Equal(t, rctx, m.Context)
+		}
+	}
+	require.Equal(t, 2, heartbeats, "heartbeat to every peer")
+	require.Empty(t, rd.ReadStates, "ReadState must wait for quorum ack")
+	r.Advance()
+
+	// One peer ack pushes the leader to quorum (self already acked).
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgHeartbeatResp,
+		From:    2,
+		Context: rctx,
+	}))
+
+	rd = r.Ready()
+	require.Len(t, rd.ReadStates, 1)
+	require.Equal(t, uint64(1), rd.ReadStates[0].Index)
+	require.Equal(t, rctx, rd.ReadStates[0].RequestCtx)
+}
+
+// #16 Two concurrent ReadIndex requests produce two ReadStates, each keyed by
+// its originating rctx. A later quorum proof subsumes all earlier ones —
+// leadership is monotonic within a term — so acking the second request also
+// releases the first.
+func TestLeaderReadIndexConcurrentRctxCorrelation_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3}
+	r.term = 1
+	r.becomeLeader()
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{{Index: 1, Term: 1}},
+	}
+	r.commitIndex = 1
+	r.Advance()
+
+	rctxA := []byte("rctx-A")
+	rctxB := []byte("rctx-B")
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgReadIndex, From: 1, Context: rctxA,
+	}))
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgReadIndex, From: 1, Context: rctxB,
+	}))
+	r.Ready() // drain heartbeats
+	r.Advance()
+
+	// Peer 2 acks B. readOnly.advance drains the queue up to and including
+	// B — releasing A too (subsumed by the later quorum proof).
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgHeartbeatResp, From: 2, Context: rctxB,
+	}))
+
+	rd := r.Ready()
+	require.Len(t, rd.ReadStates, 2, "both rctx must surface together")
+	require.Equal(t, rctxA, rd.ReadStates[0].RequestCtx, "queue order preserved: A first")
+	require.Equal(t, rctxB, rd.ReadStates[1].RequestCtx)
+	require.Equal(t, uint64(1), rd.ReadStates[0].Index)
+	require.Equal(t, uint64(1), rd.ReadStates[1].Index)
+}
+
+// #2 Follower forwards MsgReadIndex to its known leader via raft transport.
+// The follower must not emit a ReadState on its own — it has no authority to
+// prove commitIndex. The outbound MsgReadIndex carries the original rctx and
+// targets r.lead.
+func TestFollowerForwardsMsgReadIndexToLeader_037l(t *testing.T) {
+	r := newTestRaft(2)
+	r.peers = []uint64{1, 3}
+	r.becomeFollower(1, 1) // term=1, lead=1
+	r.Advance()
+
+	rctx := []byte("rctx-fwd")
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		From:    2,
+		Context: rctx,
+	}))
+
+	rd := r.Ready()
+	require.Empty(t, rd.ReadStates, "follower must not emit its own ReadState")
+	require.Len(t, rd.Messages, 1)
+	fwd := rd.Messages[0]
+	require.Equal(t, raftpb.MessageType_MsgReadIndex, fwd.Type)
+	require.Equal(t, uint64(1), fwd.To, "forwarded to known leader")
+	require.Equal(t, rctx, fwd.Context, "rctx preserved across forward")
+}
+
+// #3 A leader that cannot reach a majority (heartbeats go out but no
+// MsgHeartbeatResp returns) never emits a ReadState. The request stays
+// pending in readOnly until quorum arrives or the caller times out.
+func TestLeaderWithoutQuorumDoesNotEmitReadState_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3, 4, 5} // quorum = 3
+	r.term = 1
+	r.becomeLeader()
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{{Index: 1, Term: 1}},
+	}
+	r.commitIndex = 1
+	r.Advance()
+
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		From:    1,
+		Context: []byte("rctx-nq"),
+	}))
+	r.Ready() // drain heartbeats
+	r.Advance()
+
+	// Only one peer acks — not enough for quorum (self + 1 = 2 < 3).
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgHeartbeatResp, From: 2, Context: []byte("rctx-nq"),
+	}))
+
+	rd := r.Ready()
+	require.Empty(t, rd.ReadStates, "no quorum → no ReadState emitted")
+}
+
+// #5 A ReadIndex arriving before the leader has committed any entry in its
+// own term is queued into pendingReadIndexRequests. After a current-term
+// entry commits (carrying commitIndex forward via maybeCommit), the queue
+// drains and the request is processed.
+func TestReadIndexPostponedUntilCurrentTermCommit_037l(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2}
+	r.term = 2
+	r.becomeLeader()
+	// becomeLeader appended a term-2 no-op at index 1. Pre-populate storage
+	// so matchTerm can resolve index 1's term. commitIndex stays at 0.
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{{Index: 1, Term: 2}},
+	}
+	require.Zero(t, r.commitIndex, "no current-term commit yet")
+	r.Advance() // drain becomeLeader's Ready
+
+	rctx := []byte("rctx-pending")
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		From:    1,
+		Context: rctx,
+	}))
+	require.Len(t, r.pendingReadIndexRequests, 1, "queued because no current-term commit yet")
+
+	rd := r.Ready()
+	require.Empty(t, rd.ReadStates, "no ReadState while queued")
+	for _, m := range rd.Messages {
+		require.NotEqual(t, raftpb.MessageType_MsgHeartbeat, m.Type, "no heartbeat while queued")
+	}
+	r.Advance()
+
+	// Peer acks index 1 (current-term no-op) — maybeCommit advances, drains.
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:  raftpb.MessageType_MsgAppResp,
+		From:  2,
+		Term:  2,
+		Index: 1,
+	}))
+	require.Equal(t, uint64(1), r.commitIndex, "no-op committed via maybeCommit")
+	require.Empty(t, r.pendingReadIndexRequests, "queue drained on commit")
+
+	// The drain uses the no-op commit itself as proof of quorum — maybeCommit
+	// only advances on a current-term commit, which already required quorum
+	// replication. No fresh heartbeat needed; ReadState emitted directly.
+	rd = r.Ready()
+	require.Len(t, rd.ReadStates, 1)
+	require.Equal(t, rctx, rd.ReadStates[0].RequestCtx)
+	require.Equal(t, uint64(1), rd.ReadStates[0].Index)
 }

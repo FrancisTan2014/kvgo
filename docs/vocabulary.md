@@ -296,3 +296,10 @@ Each word is shown through visible dimensions for word choice:
 - **tone:** neutral, often cautionary in design talk
 - **nearby alternatives:** `expand` is broader; `broaden` is close; `widen` often feels spatial and useful for scope creep or interface growth
 - **where it breaks:** not ideal when growth is vertical depth rather than broader coverage
+
+## watermark
+- **meaning:** a tracked position that records how far a process has progressed
+- **pressure:** use it when one component advances through a sequence and another component needs to know how far it has gotten — especially when the two run at different speeds
+- **tone:** technical, systems-oriented, concrete
+- **nearby alternatives:** `cursor` tracks a single reader's position; `offset` is a raw number without progress semantics; `high-water mark` emphasizes the maximum seen so far; `watermark` implies a boundary between "done" and "not yet done"
+- **where it breaks:** do not use it for a simple counter or index with no consumer waiting on it; the word implies coordination between a producer and a reader

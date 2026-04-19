@@ -50,6 +50,12 @@ func TestHTTPGetReturnsValueAfterPut_037j(t *testing.T) {
 	suite, base := newTestServerWithHTTP(t)
 	defer suite.server.cancel()
 
+	// httpGet goes through proposeRead → ReadIndex since 037l.
+	// Enable auto-ReadState on the fake and start the run loop so the
+	// ReadState feeds back through s.w to unblock proposeRead.
+	suite.fr.autoReadState = true
+	go suite.server.run()
+
 	// Seed state machine directly — this tests the HTTP GET path, not Raft.
 	suite.fsm.data["hello"] = []byte("world")
 
@@ -65,6 +71,9 @@ func TestHTTPGetReturnsValueAfterPut_037j(t *testing.T) {
 func TestHTTPGetReturns404ForMissingKey_037j(t *testing.T) {
 	suite, base := newTestServerWithHTTP(t)
 	defer suite.server.cancel()
+
+	suite.fr.autoReadState = true
+	go suite.server.run()
 
 	resp, err := http.Get(base + "/kv/nonexistent")
 	require.NoError(t, err)

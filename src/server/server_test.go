@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"errors"
+	"kvgo/pkg/wait"
 	"kvgo/protocol"
+	"kvgo/raft"
 	rafttransport "kvgo/transport/raft"
 	"net"
 	"testing"
@@ -32,12 +34,14 @@ func newTestServer(t *testing.T) *testServeSuite {
 		opts: Options{
 			ID:           1,
 			WriteTimeout: 5 * time.Second,
+			ReadTimeout:  5 * time.Second,
 		},
-		sm:       fsm,
-		raftHost: fr,
-		w:        fw,
-		ctx:      ctx,
-		cancel:   cancel,
+		sm:        fsm,
+		raftHost:  fr,
+		w:         fw,
+		applyWait: wait.NewTimeList(),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	return &testServeSuite{
@@ -644,5 +648,110 @@ func TestPutBeforeShutdownIsReadableAfterRestart_037e(t *testing.T) {
 			t.Fatal("restarted node 3 does not have persist-key")
 		case <-time.After(50 * time.Millisecond):
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 037l — ReadIndex server-layer tests
+// ---------------------------------------------------------------------------
+
+// #7 handleGet must call raftHost.ReadIndex before serving from the state
+// machine. This is the linearizability gate: without ReadIndex, a partitioned
+// node could serve stale reads.
+func TestHandleGetCallsReadIndexBeforeStateMachine_037l(t *testing.T) {
+	suite := newTestServer(t)
+	s := suite.server
+	defer s.cancel()
+
+	suite.fr.autoReadState = true
+	go s.run()
+
+	suite.fsm.data["k"] = []byte("v")
+
+	ctx := newRequestContext(protocol.CmdGet, "k", "")
+	errc := make(chan error, 1)
+	go func() { errc <- s.handleGet(ctx) }()
+
+	// ReadIndex must have been called (the blocking step of proposeRead).
+	select {
+	case <-suite.fr.readIndexCalled:
+	case <-time.After(time.Second):
+		t.Fatal("handleGet did not call raftHost.ReadIndex")
+	}
+
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("handleGet did not return")
+	}
+}
+
+// #4 A leader that loses authority mid-ReadIndex — no quorum proof ever
+// arrives — unblocks the caller with ctx.DeadlineExceeded at ctx timeout.
+// Clean leader-change notification is open thread #5.
+func TestProposeReadTimesOutWhenNoReadStateArrives_037l(t *testing.T) {
+	suite := newTestServer(t)
+	s := suite.server
+	defer s.cancel()
+
+	// Short ReadTimeout. No autoReadState → readStatec never fires.
+	s.opts.ReadTimeout = 100 * time.Millisecond
+	go s.run()
+
+	start := time.Now()
+	err := s.proposeRead()
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.GreaterOrEqual(t, elapsed, 100*time.Millisecond,
+		"must block until ReadTimeout, not fast-fail")
+}
+
+// #8 proposeRead must not return until the apply loop has applied entries up
+// through the readIndex returned by ReadState. ReadState at index 5 with
+// applyWait still at 0 means the reader blocks; triggering applyWait at >=5
+// releases it.
+func TestProposeReadBlocksUntilApplyWaitCatchesUp_037l(t *testing.T) {
+	suite := newTestServer(t)
+	s := suite.server
+	defer s.cancel()
+
+	s.opts.ReadTimeout = 2 * time.Second
+	// Manual control of ReadState: we want to emit a ReadState at index 5
+	// before triggering applyWait.
+	go s.run()
+
+	done := make(chan error, 1)
+	go func() { done <- s.proposeRead() }()
+
+	// Wait for ReadIndex to be called (proposeRead has registered on s.w).
+	select {
+	case rctx := <-suite.fr.readIndexCalled:
+		// Push a ReadState at index 5 for this rctx.
+		suite.fr.readStatec <- raft.ReadState{
+			Index:      5,
+			RequestCtx: rctx,
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadIndex not called")
+	}
+
+	// proposeRead must now be blocked on applyWait.Wait(5), not returned.
+	select {
+	case <-done:
+		t.Fatal("proposeRead returned before applyWait triggered")
+	case <-time.After(50 * time.Millisecond):
+		// ok — still blocked
+	}
+
+	// Trigger apply at index >= 5.
+	s.applyWait.Trigger(5)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("proposeRead did not unblock after applyWait.Trigger")
 	}
 }

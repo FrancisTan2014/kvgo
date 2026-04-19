@@ -29,10 +29,10 @@ if [ $# -eq 0 ]; then
     echo "==> Starting cluster (interactive control shell)..."
     echo "    Run:  lein run test -w basic"
     echo "    Exit: Ctrl-D, then: docker compose -f $DOCKER_DIR/docker-compose.yml down"
-    docker compose -f "$DOCKER_DIR/docker-compose.yml" run --rm control
+    docker compose -f "$DOCKER_DIR/docker-compose.yml" run --service-ports --rm control
 else
     echo "==> Running: $*"
-    docker compose -f "$DOCKER_DIR/docker-compose.yml" run --rm control bash -c "$*"
+    docker compose -f "$DOCKER_DIR/docker-compose.yml" run --service-ports --rm control bash -c "$*"
 fi
 
 echo "==> Tearing down cluster..."

@@ -1,4 +1,4 @@
-package server
+package wait
 
 import "sync"
 
@@ -21,7 +21,7 @@ type waitList struct {
 	m  map[uint64]chan any
 }
 
-func newWait() Wait {
+func New() Wait {
 	return &waitList{m: make(map[uint64]chan any)}
 }
 

@@ -34,8 +34,9 @@
    :throw-exceptions   false})
 
 (def write-opts
-  "HTTP options for writes — longer timeout to survive Raft commit latency."
-  {:socket-timeout     5000
+  "HTTP options for writes — must be shorter than the BroadcastClient deadline
+  (10s) divided by node count (5) = 2s max per attempt, so all nodes get tried."
+  {:socket-timeout     2000
    :connection-timeout 1000
    :throw-exceptions   false})
 

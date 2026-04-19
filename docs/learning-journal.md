@@ -636,3 +636,36 @@ In a team with strict "design → review → approve → code" flow, integration
 Write a retrospective design doc for the entire 036 series — after it closes. Tell the story bottom-up (how 036 converged), then flip it: what would the top-down doc have looked like on day one? That contrast is the article.
 
 This is why etcd's design feels effortless in Go and would feel forced in C# or Java. The architecture and the language primitive co-evolved. Choosing Go for a Raft implementation isn't about preference — it's about using a language where the central pattern is free.
+
+---
+
+## 2026-04-16 — The Monotonic Primitive (article idea)
+
+### The observation
+
+While designing `WaitTime` for ReadIndex, I noticed a pattern that recurs across very different systems: a single primitive value guards a state transition, and waiters block until the value crosses their threshold.
+
+| System | Primitive | Monotonic? | Waiters block on |
+|---|---|---|---|
+| `WaitTime` | `lastTriggerDeadline` (raft index) | Yes | "has the state machine reached my index?" |
+| Mutex / lock | owner ID (or CAS flag) | No — toggles | "is the resource free?" |
+| Semaphore | counter | No — inc/dec | "is count > 0?" |
+| Condition variable | user-defined predicate | Depends | "is my condition true?" |
+| Epoch / barrier | epoch number | Yes | "has the system entered my epoch?" |
+
+The shape is the same: a value, a check, a wait mechanism, a signal. What changes is the *semantics* of the value — logical time, ownership, availability, progress — and whether it's monotonic.
+
+### Why monotonicity matters
+
+Monotonic watermarks have a property the others don't: **once satisfied, always satisfied.** A reader waiting on index 5 never needs to re-check after being woken — the watermark can't go backward. This is why `WaitTime` can use a pre-closed channel for the fast path: past deadlines never un-pass.
+
+A lock can't do that. It toggles. A semaphore can't do that. It decrements. Both require re-checking after wakeup because the state can change between signal and observation.
+
+### The deeper structure
+
+The lock and the watermark look like different abstractions, but they share the same skeleton: use a primitive value as the source of truth, and block until it reaches a target state. The difference is whether the value's trajectory is constrained:
+
+- **Unconstrained** (lock, semaphore): the value can move in any direction. Waiters must re-verify after wakeup. Thundering herd is a real concern.
+- **Monotonic** (watermark, epoch, barrier): the value only moves forward. Once past your threshold, you're done forever. No re-check, no re-sleep, no herd.
+
+This is worth an article. The claim: most synchronization primitives are instances of the same pattern — "block until a value crosses a threshold" — and the design space is defined by two axes: (1) what the value represents, and (2) whether it's monotonic. The monotonic case is strictly simpler, and recognizing when your problem has a monotonic structure lets you pick a simpler primitive.

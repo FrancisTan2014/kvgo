@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +20,15 @@ func (s *Server) httpMux() *http.ServeMux {
 
 func (s *Server) httpGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	if err := s.proposeRead(); err != nil {
+		s.log().Warn("read failed", "err", err, "key", key)
+		if errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "read timeout", http.StatusGatewayTimeout)
+			return
+		}
+		http.Error(w, fmt.Sprintf("read failed: %v", err), http.StatusServiceUnavailable)
+		return
+	}
 	val, ok := s.sm.Get(key)
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)

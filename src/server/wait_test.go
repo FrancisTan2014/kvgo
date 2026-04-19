@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"kvgo/pkg/wait"
 	"kvgo/raft"
 	"kvgo/raftpb"
 	"testing"
@@ -9,30 +10,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
-
-// --- wait tests ---
-
-func TestWaitRegisterAndTrigger_036o(t *testing.T) {
-	w := newWait()
-	ch := w.Register(1)
-
-	go func() {
-		w.Trigger(1, "ok")
-	}()
-
-	select {
-	case v := <-ch:
-		require.Equal(t, "ok", v)
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timeout waiting for trigger")
-	}
-}
-
-func TestWaitTriggerUnregisteredIdIsNoop_036o(t *testing.T) {
-	w := newWait()
-	// must not panic
-	w.Trigger(999, "ignored")
-}
 
 // --- envelope tests ---
 
@@ -69,7 +46,7 @@ func TestProposalSignaledAfterApply_036o(t *testing.T) {
 	defer host.Stop()
 
 	// server-side: register waiter, marshal envelope, propose
-	w := newWait()
+	w := wait.New()
 	id := uint64(7)
 	payload := []byte("set x 1")
 	ch := w.Register(id)
@@ -105,7 +82,7 @@ func TestProposalSignaledAfterApply_036o(t *testing.T) {
 }
 
 func TestProposalTimesOutWithoutCommit_036o(t *testing.T) {
-	w := newWait()
+	w := wait.New()
 	id := uint64(8)
 	ch := w.Register(id)
 

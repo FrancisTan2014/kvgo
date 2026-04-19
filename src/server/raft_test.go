@@ -428,3 +428,45 @@ func TestDoubleStartIsNoop_036u(t *testing.T) {
 		t.Fatal("expected host.done to be closed after Stop")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 037l — ReadIndex seam
+// ---------------------------------------------------------------------------
+
+// #17 raftHost surfaces rd.ReadStates element-by-element on ReadState().
+// The server run loop reads from this channel and triggers the per-request
+// waiter keyed by RequestCtx.
+func TestRaftHostSurfacesReadStates_037l(t *testing.T) {
+	fn := &fakeNode{c: make(chan raft.Ready, 1)}
+	host, err := newRaftHost(raftHostConfig{
+		RaftHostConfig: newRaftHostConfig(),
+		n:              fn,
+	})
+	require.NoError(t, err)
+
+	host.Start()
+	defer host.Stop()
+
+	fn.c <- raft.Ready{
+		ReadStates: []raft.ReadState{
+			{Index: 5, RequestCtx: []byte("ctx-a")},
+			{Index: 7, RequestCtx: []byte("ctx-b")},
+		},
+	}
+
+	select {
+	case rs := <-host.ReadState():
+		require.Equal(t, uint64(5), rs.Index)
+		require.Equal(t, []byte("ctx-a"), rs.RequestCtx)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for first ReadState")
+	}
+
+	select {
+	case rs := <-host.ReadState():
+		require.Equal(t, uint64(7), rs.Index)
+		require.Equal(t, []byte("ctx-b"), rs.RequestCtx)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for second ReadState")
+	}
+}

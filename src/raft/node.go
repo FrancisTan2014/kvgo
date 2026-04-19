@@ -30,22 +30,24 @@ type Node interface {
 	Propose(ctx context.Context, data []byte) error
 	Step(ctx context.Context, m *raftpb.Message) error
 	Campaign(ctx context.Context) error
+	ReadIndex(ctx context.Context, rctx []byte) error
 	Advance()
 	Tick()
 	Stop()
 }
 
 type node struct {
-	r         *Raft
-	propc     chan proposeRequest
-	stepc     chan stepRequest
-	campaignc chan campaignRequest
-	readyc    chan Ready
-	advancec  chan struct{}
-	tickc     chan struct{}
-	stopc     chan struct{}
-	stopOnce  sync.Once
-	prevHard  *raftpb.HardState
+	r          *Raft
+	propc      chan proposeRequest
+	stepc      chan stepRequest
+	campaignc  chan campaignRequest
+	readIndexc chan readIndexRequest
+	readyc     chan Ready
+	advancec   chan struct{}
+	tickc      chan struct{}
+	stopc      chan struct{}
+	stopOnce   sync.Once
+	prevHard   *raftpb.HardState
 
 	// TODO: define a logger interface instead of relying on a concrete logger
 	lg *slog.Logger
@@ -65,6 +67,11 @@ type campaignRequest struct {
 	resp chan error
 }
 
+type readIndexRequest struct {
+	ctx  []byte
+	resp chan error
+}
+
 func NewNode(cfg Config) Node {
 	n := setupNode(cfg)
 	go n.run()
@@ -73,15 +80,16 @@ func NewNode(cfg Config) Node {
 
 func setupNode(cfg Config) *node {
 	return &node{
-		r:         newRaft(cfg),
-		propc:     make(chan proposeRequest),
-		stepc:     make(chan stepRequest),
-		campaignc: make(chan campaignRequest),
-		readyc:    make(chan Ready),
-		advancec:  make(chan struct{}),
-		tickc:     make(chan struct{}, 128),
-		stopc:     make(chan struct{}),
-		lg:        cfg.Logger,
+		r:          newRaft(cfg),
+		propc:      make(chan proposeRequest),
+		stepc:      make(chan stepRequest),
+		campaignc:  make(chan campaignRequest),
+		readIndexc: make(chan readIndexRequest),
+		readyc:     make(chan Ready),
+		advancec:   make(chan struct{}),
+		tickc:      make(chan struct{}, 128),
+		stopc:      make(chan struct{}),
+		lg:         cfg.Logger,
 	}
 }
 
@@ -105,6 +113,8 @@ func (n *node) run() {
 			req.resp <- n.r.Step(req.m)
 		case req := <-n.campaignc:
 			req.resp <- n.r.Campaign()
+		case req := <-n.readIndexc:
+			req.resp <- n.r.ReadIndex(req.ctx)
 		case <-advancec:
 			if !IsEmptyHardState(rd.HardState) {
 				n.prevHard = rd.HardState
@@ -217,4 +227,20 @@ func (n *node) Stop() {
 	n.stopOnce.Do(func() {
 		close(n.stopc)
 	})
+}
+
+func (n *node) ReadIndex(ctx context.Context, rctx []byte) error {
+	resp := make(chan error, 1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case n.readIndexc <- readIndexRequest{ctx: rctx, resp: resp}:
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-resp:
+		return err
+	}
 }

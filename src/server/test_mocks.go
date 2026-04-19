@@ -67,6 +67,10 @@ func (m *mockStorage) LastIndex() uint64 {
 	return 0
 }
 
+func (m *mockStorage) Term(i uint64) (uint64, error) {
+	return 0, nil
+}
+
 func (m *mockStorage) Close() error {
 	return nil
 }
@@ -152,6 +156,8 @@ func (n *fakeNode) Tick() {}
 
 func (n *fakeNode) Stop() { n.stopped = true }
 
+func (n *fakeNode) ReadIndex(ctx context.Context, rctx []byte) error { return nil }
+
 type fakeStateMachine struct {
 	data   map[string][]byte
 	putErr error
@@ -177,18 +183,24 @@ func (s *fakeStateMachine) Put(key string, value []byte) error {
 }
 
 type fakeRaftHost struct {
-	applyc     chan toApply
-	errorc     chan error
-	proposeErr error
-	proposed   []byte
-	proposec   chan []byte
+	applyc          chan toApply
+	errorc          chan error
+	proposeErr      error
+	proposed        []byte
+	proposec        chan []byte
+	readIndexErr    error
+	readIndexCalled chan []byte
+	readStatec      chan raft.ReadState
+	autoReadState   bool // when true, ReadIndex auto-pushes a ReadState (simulates instant quorum)
 }
 
 func newFakeRaftHost() *fakeRaftHost {
 	return &fakeRaftHost{
-		applyc:   make(chan toApply),
-		errorc:   make(chan error),
-		proposec: make(chan []byte, 1),
+		applyc:          make(chan toApply),
+		errorc:          make(chan error),
+		proposec:        make(chan []byte, 1),
+		readIndexCalled: make(chan []byte, 4),
+		readStatec:      make(chan raft.ReadState, 1),
 	}
 }
 
@@ -227,6 +239,27 @@ func (r *fakeRaftHost) Errors() <-chan error {
 func (r *fakeRaftHost) LeaderID() uint64 {
 	return 0
 }
+
+func (r *fakeRaftHost) ReadIndex(ctx context.Context, rctx []byte) error {
+	if r.readIndexCalled != nil {
+		select {
+		case r.readIndexCalled <- append([]byte(nil), rctx...):
+		default:
+		}
+	}
+	if r.readIndexErr != nil {
+		return r.readIndexErr
+	}
+	if r.autoReadState {
+		select {
+		case r.readStatec <- raft.ReadState{Index: 0, RequestCtx: append([]byte(nil), rctx...)}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (r *fakeRaftHost) ReadState() <-chan raft.ReadState { return r.readStatec }
 
 type fakeWait struct {
 	m map[uint64]chan any

@@ -34,6 +34,7 @@ type Ready struct {
 	CommittedEntries []*raftpb.Entry
 	Messages         []*raftpb.Message
 	HardState        *raftpb.HardState
+	ReadStates       []ReadState
 }
 
 type Progress struct {
@@ -65,6 +66,10 @@ type Raft struct {
 	peers    []uint64
 	votes    map[uint64]bool
 	votedFor uint64
+
+	readStates               []ReadState
+	readOnly                 *readOnly
+	pendingReadIndexRequests []*raftpb.Message
 
 	storage Storage
 
@@ -115,6 +120,7 @@ func newRaft(cfg Config) *Raft {
 		log:              make([]*raftpb.Entry, 0),
 		peers:            peers,
 		messages:         make([]*raftpb.Message, 0),
+		readOnly:         newReadOnly(),
 		storage:          cfg.Storage,
 		heartbeatTimeout: cfg.HeartbeatTick,
 		electionTimeout:  cfg.ElectionTick,
@@ -208,11 +214,13 @@ func (r *Raft) Ready() Ready {
 		CommittedEntries: r.entriesBetween(r.appliedIndex, r.commitIndex),
 		Messages:         r.messages,
 		HardState:        r.HardState(),
+		ReadStates:       r.readStates,
 	}
 }
 
 func (r *Raft) HasReady() bool {
 	return len(r.messages) > 0 ||
+		len(r.readStates) > 0 ||
 		r.stableIndex < r.lastLogIndex ||
 		r.appliedIndex < r.commitIndex
 }
@@ -221,6 +229,7 @@ func (r *Raft) Advance() {
 	r.stableIndex = r.lastLogIndex
 	r.appliedIndex = r.commitIndex
 	r.messages = make([]*raftpb.Message, 0)
+	r.readStates = make([]ReadState, 0)
 }
 
 func (r *Raft) Tick() {
@@ -357,8 +366,13 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		}
 
 		median := r.getMedian()
-		if median > r.commitIndex {
-			r.CommitTo(median)
+		if r.maybeCommit(median) {
+			// maybeCommit advanced commitIndex, and matchTerm confirmed the newly
+			// committed entry is from the current term. Per Raft §5.4.2, this is the
+			// moment stale commitIndex is safe to serve: the leader has proven its log
+			// is up-to-date with the quorum in this term, so commitIndex now reflects
+			// the linearized order. Pending ReadIndex requests can be answered.
+			r.drainPendingReadIndexRequests()
 		}
 
 	case raftpb.MessageType_MsgProp:
@@ -366,27 +380,11 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 			r.logger.Error("stepped empty MsgProp", "node", r.id)
 			panic("stepped empty MsgProp")
 		}
-		prev := r.lastLog()
-		e := &raftpb.Entry{
-			Index: prev.Index + 1,
-			Term:  r.term,
-			Data:  m.Entries[0].Data,
-		}
-		r.appendEntries([]*raftpb.Entry{e})
-
-		for _, pid := range r.peers {
-			r.sendAppend(pid)
-		}
+		r.appendEntry(m.Entries[0].Data)
+		r.bcastAppend()
 
 	case raftpb.MessageType_MsgBeat:
-		for _, pid := range r.peers {
-			prs := r.progress[pid]
-			r.send(&raftpb.Message{
-				To:     pid,
-				Type:   raftpb.MessageType_MsgHeartbeat,
-				Commit: min(prs.MatchIndex, r.commitIndex),
-			})
-		}
+		r.bcastHeartbeat(nil)
 
 	case raftpb.MessageType_MsgHeartbeatResp:
 		prs, exists := r.progress[m.From]
@@ -397,6 +395,29 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		if prs.MatchIndex < r.lastLogIndex {
 			r.sendAppend(m.From)
 		}
+		if len(m.Context) > 0 {
+			acks := r.readOnly.recvAck(m.From, m.Context)
+			if r.hasQuorum(acks) {
+				rss := r.readOnly.advance(m)
+				for _, rs := range rss {
+					r.respondReadIndexReq(rs.req, rs.index)
+				}
+			}
+		}
+
+	case raftpb.MessageType_MsgReadIndex:
+		if r.singletonCluster() {
+			r.respondReadIndexReq(m, r.commitIndex)
+			return nil
+		}
+		if !r.committedEntryInCurrentTerm() {
+			r.pendingReadIndexRequests = append(r.pendingReadIndexRequests, m)
+			return nil
+		}
+
+		r.readOnly.addRequest(r.commitIndex, m)
+		r.readOnly.recvAck(r.id, m.Context)
+		r.bcastHeartbeat(m.Context)
 
 	default:
 		// TODO: deal with the remaining message types
@@ -422,6 +443,11 @@ func stepCandidate(r *Raft, m *raftpb.Message) error {
 		if r.voteQuorumReached() {
 			r.becomeLeader()
 		}
+
+	case raftpb.MessageType_MsgReadIndex:
+		// No leader during election — fast-fail so the caller doesn't wait
+		// for its deadline.
+		return ErrProposalDropped
 
 	default:
 		// TODO: deal with the remaining message types
@@ -498,8 +524,29 @@ func stepFollower(r *Raft, m *raftpb.Message) error {
 			r.CommitTo(m.Commit)
 		}
 		r.send(&raftpb.Message{
-			To:   m.From,
-			Type: raftpb.MessageType_MsgHeartbeatResp,
+			To:      m.From,
+			Type:    raftpb.MessageType_MsgHeartbeatResp,
+			Context: m.Context,
+		})
+
+	case raftpb.MessageType_MsgReadIndex:
+		if r.lead == None {
+			// No known leader — fast-fail so the caller doesn't wait for its
+			// deadline. Mid-flight leader loss (leader existed at step time,
+			// steps down before the response arrives) still relies on the
+			// caller's context deadline; bounding that requires a server-side
+			// leader-change notifier (see 037l open threads).
+			return ErrProposalDropped
+		}
+		// Only rewrite To; leave From alone so send() fills it on first hop and
+		// preserves the original requester's ID across re-forwards (same as MsgProp).
+		m.To = r.lead
+		r.send(m)
+
+	case raftpb.MessageType_MsgReadIndexResp:
+		r.readStates = append(r.readStates, ReadState{
+			Index:      m.Index,
+			RequestCtx: m.Context,
 		})
 
 	default:
@@ -562,6 +609,14 @@ func (r *Raft) becomeLeader() {
 			NextIndex:  r.lastLogIndex + 1,
 		}
 	}
+
+	// Append a no-op entry in the new term. Per Raft §5.4.2, a leader cannot
+	// commit entries from prior terms directly; it must commit something in
+	// its own term first, which then transitively commits the tail. The no-op
+	// also unblocks ReadIndex — `committedEntryInCurrentTerm` stays false
+	// until this entry commits.
+	r.appendEntry(nil)
+	r.bcastAppend()
 }
 
 func (r *Raft) becomeCandidate() {
@@ -764,4 +819,108 @@ func (r *Raft) Campaign() error {
 	return r.Step(&raftpb.Message{
 		Type: raftpb.MessageType_MsgHup,
 	})
+}
+
+func (r *Raft) ReadIndex(ctx []byte) error {
+	return r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		Context: ctx,
+	})
+}
+
+func (r *Raft) singletonCluster() bool {
+	return len(r.peers) == 0
+}
+
+func (r *Raft) matchTerm(i uint64) bool {
+	if t, err := r.storage.Term(i); err != nil {
+		r.logger.Warn("matchTerm: storage.Term failed", "commitIndex", r.commitIndex, "error", err)
+		return false
+	} else {
+		return t == r.term
+	}
+}
+
+func (r *Raft) committedEntryInCurrentTerm() bool {
+	return r.matchTerm(r.commitIndex)
+}
+
+func (r *Raft) maybeCommit(i uint64) bool {
+	if i > r.commitIndex && r.matchTerm(i) {
+		r.CommitTo(i)
+		return true
+	}
+	return false
+}
+
+// respondReadIndexReq answers a ReadIndex request with readIndex — the
+// commitIndex captured when leadership was proven for this request, not the
+// current one. Serving the current commitIndex would still be linearizable
+// (any later index is a legal ordering), but makes the client wait for apply
+// to catch up to a newer index than necessary.
+func (r *Raft) respondReadIndexReq(m *raftpb.Message, readIndex uint64) {
+	if m.From == None || m.From == r.id {
+		r.readStates = append(r.readStates, ReadState{
+			Index:      readIndex,
+			RequestCtx: m.Context,
+		})
+		return
+	}
+
+	r.send(&raftpb.Message{
+		To:      m.From,
+		Type:    raftpb.MessageType_MsgReadIndexResp,
+		Context: m.Context,
+		Index:   readIndex,
+	})
+}
+
+func (r *Raft) bcastHeartbeat(ctx []byte) {
+	for _, pid := range r.peers {
+		prs := r.progress[pid]
+		r.send(&raftpb.Message{
+			To:      pid,
+			Type:    raftpb.MessageType_MsgHeartbeat,
+			Commit:  min(prs.MatchIndex, r.commitIndex),
+			Context: ctx,
+		})
+	}
+}
+
+func (r *Raft) drainPendingReadIndexRequests() {
+	if len(r.pendingReadIndexRequests) == 0 {
+		return
+	}
+
+	reqs := r.pendingReadIndexRequests
+	r.pendingReadIndexRequests = nil
+
+	for _, req := range reqs {
+		r.respondReadIndexReq(req, r.commitIndex)
+	}
+}
+
+func (r *Raft) hasQuorum(acks map[uint64]bool) bool {
+	// peers excludes self, so total voting nodes = len(peers) + 1.
+	return len(acks) >= (len(r.peers)+1)/2+1
+}
+
+// appendEntry wraps data into a new Entry at the next index/current term and
+// appends it to the local log. It does not broadcast.
+func (r *Raft) appendEntry(data []byte) {
+	prev := r.lastLog()
+	e := &raftpb.Entry{
+		Index: prev.Index + 1,
+		Term:  r.term,
+		Data:  data,
+	}
+	r.appendEntries([]*raftpb.Entry{e})
+}
+
+// bcastAppend sends MsgApp to every peer. Callers are responsible for having
+// appended the entry locally first.
+func (r *Raft) bcastAppend() {
+	for _, pid := range r.peers {
+		r.sendAppend(pid)
+	}
 }

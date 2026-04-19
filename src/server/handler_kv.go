@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"kvgo/protocol"
 )
 
@@ -10,6 +12,14 @@ import (
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleGet(ctx *RequestContext) error {
+	if err := s.proposeRead(); err != nil {
+		s.log().Warn("read failed", "err", err, "key", string(ctx.Request.Key))
+		if errors.Is(err, context.DeadlineExceeded) {
+			return s.responseWithStatus(ctx, protocol.StatusTimeout)
+		}
+		return s.responseStatusError(ctx)
+	}
+
 	key := string(ctx.Request.Key)
 	val, ok := s.sm.Get(key)
 
@@ -57,6 +67,37 @@ func (s *Server) proposePut(key string, value []byte) error {
 		if result != nil {
 			return result.(error)
 		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) proposeRead() error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.ReadTimeout)
+	defer cancel()
+
+	rctx := s.nextRequestID()
+	ch := s.w.Register(rctx)
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, rctx)
+
+	if err := s.raftHost.ReadIndex(ctx, b); err != nil {
+		s.w.Trigger(rctx, nil)
+		return err
+	}
+
+	var readIndex uint64
+	select {
+	case v := <-ch:
+		readIndex = v.(uint64)
+	case <-ctx.Done():
+		s.w.Trigger(rctx, nil)
+		return ctx.Err()
+	}
+
+	select {
+	case <-s.applyWait.Wait(readIndex):
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

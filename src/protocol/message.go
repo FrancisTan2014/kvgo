@@ -56,6 +56,7 @@ const (
 	StatusOK       Status = iota // Success
 	StatusNotFound               // Key not found (GET)
 	StatusError                  // Generic server error
+	StatusTimeout                // Request timed out; client may retry
 
 	statusMaxKnown // Sentinel: update when adding new status codes
 )
