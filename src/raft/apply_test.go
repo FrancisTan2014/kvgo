@@ -25,6 +25,9 @@ func (f *fakeApplyTarget) Apply(entries []*raftpb.Entry) error {
 func TestApplierDoesNotApplyUncommittedEntries_036d(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeLeader()
+	// 037m: drain AND commit the no-op (singleton = self-quorum).
+	r.CommitTo(r.lastLogIndex)
+	r.Advance()
 	target := &fakeApplyTarget{}
 	a := NewApplier(r, target)
 
@@ -40,6 +43,9 @@ func TestApplierDoesNotApplyUncommittedEntries_036d(t *testing.T) {
 func TestApplierAppliesCommittedEntriesBeforeAdvance_036d(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeLeader()
+	// 037m: drain AND commit the no-op (singleton = self-quorum).
+	r.CommitTo(r.lastLogIndex)
+	r.Advance()
 	target := &fakeApplyTarget{}
 	a := NewApplier(r, target)
 
@@ -56,7 +62,8 @@ func TestApplierAppliesCommittedEntriesBeforeAdvance_036d(t *testing.T) {
 	require.Len(t, unstable.Entries, 1)
 	require.Len(t, unstable.CommittedEntries, 0)
 
-	r.CommitTo(1)
+	// 037m: proposed entry is at index 2 (no-op at 1).
+	r.CommitTo(2)
 	rd, err := a.ConsumeReady()
 	require.NoError(t, err)
 	require.Len(t, rd.Entries, 0)
@@ -68,6 +75,9 @@ func TestApplierAppliesCommittedEntriesBeforeAdvance_036d(t *testing.T) {
 func TestApplierBlocksAdvanceOnApplyFailure_036d(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeLeader()
+	// 037m: drain AND commit the no-op (singleton = self-quorum).
+	r.CommitTo(r.lastLogIndex)
+	r.Advance()
 	target := &fakeApplyTarget{err: errors.New("apply failed")}
 	a := NewApplier(r, target)
 
@@ -75,7 +85,8 @@ func TestApplierBlocksAdvanceOnApplyFailure_036d(t *testing.T) {
 	_, err := a.ConsumeReady()
 	require.NoError(t, err)
 
-	r.CommitTo(1)
+	// 037m: proposed entry is at index 2.
+	r.CommitTo(2)
 	rd, err := a.ConsumeReady()
 	require.Error(t, err)
 	require.Len(t, rd.CommittedEntries, 1)

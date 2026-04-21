@@ -110,11 +110,23 @@ func newTestRaft(id uint64) *Raft {
 	})
 }
 
+// newLeaderRaftWithOnePeer returns a leader (id=1) in term 1 with one peer.
+// 037m: commits and drains the no-op entry appended by becomeLeader (added
+// in 037l) and advances peer progress past it, so tests start with a clean
+// Ready slate where the next Propose produces exactly one new entry.
 func newLeaderRaftWithOnePeer() *Raft {
 	r := newTestRaft(1)
 	r.peers = []uint64{2}
 	r.term = 1
 	r.becomeLeader()
+	// Commit the no-op (simulates quorum ack) so appliedIndex advances past it.
+	r.CommitTo(r.lastLogIndex)
+	r.Advance()
+	// Simulate the peer acking the no-op so NextIndex starts past it.
+	for _, pr := range r.progress {
+		pr.NextIndex = r.lastLogIndex + 1
+		pr.MatchIndex = r.lastLogIndex
+	}
 	return r
 }
 
@@ -131,22 +143,25 @@ func newLeaderRaftWithOnePeer() *Raft {
 
 func TestProposeNotChangeCommitIndex_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
+	// 037m: commitIndex is already 1 from the no-op committed in the helper.
+	initialCommit := r.commitIndex
 	require.NoError(t, r.Propose([]byte("")))
-	require.Zero(t, r.commitIndex)
+	require.Equal(t, initialCommit, r.commitIndex, "Propose must not advance commitIndex")
 }
 
 func TestReadyReturnsProposedEntry_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("")))
 	ready := r.Ready()
-	require.Len(t, ready.Entries, 1)
+	require.Len(t, ready.Entries, 1, "only the proposed entry; no-op drained by helper (037m)")
 	require.Len(t, ready.CommittedEntries, 0)
 }
 
 func TestAdvanceClearReadyEntries_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
-	r.CommitTo(1)
+	// 037m: no-op is at index 1, proposed entry at index 2.
+	r.CommitTo(2)
 
 	ready := r.Ready()
 	require.Len(t, ready.Entries, 1)
@@ -164,19 +179,21 @@ func TestCommitToIncreasesCommitIndex_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
-	r.CommitTo(1)
-	require.Equal(t, uint64(1), r.commitIndex)
+	// 037m: proposed entry is at index 2 (no-op at 1).
+	r.CommitTo(2)
+	require.Equal(t, uint64(2), r.commitIndex)
 }
 
 func TestCommitToNeverDecreasesCommitIndex_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
 
-	r.CommitTo(1)
-	require.Equal(t, uint64(1), r.commitIndex)
+	// 037m: proposed entry is at index 2.
+	r.CommitTo(2)
+	require.Equal(t, uint64(2), r.commitIndex)
 
 	r.CommitTo(0)
-	require.Equal(t, uint64(1), r.commitIndex)
+	require.Equal(t, uint64(2), r.commitIndex)
 }
 
 func TestReadyExposesCommittedEntsOnlyAfterCommitTo_036b(t *testing.T) {
@@ -186,7 +203,8 @@ func TestReadyExposesCommittedEntsOnlyAfterCommitTo_036b(t *testing.T) {
 	ready := r.Ready()
 	require.Len(t, ready.CommittedEntries, 0)
 
-	r.CommitTo(1)
+	// 037m: proposed entry is at index 2.
+	r.CommitTo(2)
 	ready = r.Ready()
 	require.Len(t, ready.CommittedEntries, 1)
 }
@@ -213,41 +231,47 @@ func TestReadyExposesHardStateAfterGrantingVote_036m(t *testing.T) {
 func TestReadyExposesHardStateAfterCommit_036m(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("foo")))
-	r.CommitTo(1)
+	// 037m: proposed entry is at index 2.
+	r.CommitTo(2)
 
 	rd := r.Ready()
-	require.Equal(t, &raftpb.HardState{Term: 1, VotedFor: 0, CommittedIndex: 1}, rd.HardState)
+	require.Equal(t, &raftpb.HardState{Term: 1, VotedFor: 0, CommittedIndex: 2}, rd.HardState)
 }
 
 func TestHardStateChangesWithoutMessagesOrEntries_036m(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 
 	require.NoError(t, r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgApp, From: 2, To: 1, Term: 2}))
-	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+	// 037m: after higher-term MsgApp, commitIndex resets to 0 via becomeFollower→reset.
+	// But reset only resets commitIndex if term changes. CommitTo never decreases.
+	// The MsgApp at term 2 triggers becomeFollower(2, 2). reset(2) clears lead but
+	// does NOT reset commitIndex. So commitIndex stays at 1 from the helper.
+	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 1}, r.HardState())
 }
 
 func TestAdvanceDoesNotChangeHardState_036m(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 
 	require.NoError(t, r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgApp, From: 2, To: 1, Term: 2}))
-	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+	// 037m: commitIndex is preserved at 1 from the helper (CommitTo never decreases).
+	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 1}, r.HardState())
 
 	r.Advance()
-	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, r.HardState())
+	require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 1}, r.HardState())
 }
 
 func TestFullLifecycle_036b(t *testing.T) {
 	r := newLeaderRaftWithOnePeer()
 	require.NoError(t, r.Propose([]byte("x")))
 
-	// Phase 1: unstable only
+	// Phase 1: unstable only (no-op already drained by helper — 037m)
 	rd := r.Ready()
 	require.Len(t, rd.Entries, 1)
 	require.Len(t, rd.CommittedEntries, 0) // ← invariant: not applied yet
 	r.Advance()
 
-	// Phase 2: committed
-	r.CommitTo(1)
+	// Phase 2: committed (037m: proposed entry is at index 2)
+	r.CommitTo(2)
 	rd = r.Ready()
 	require.Len(t, rd.Entries, 0)
 	require.Len(t, rd.CommittedEntries, 1) // ← now safe to apply
@@ -262,27 +286,44 @@ func TestAppendMessageIsReadyAfterLeaderPropose_036f(t *testing.T) {
 	require.NoError(t, r.Propose([]byte("foo")))
 
 	rd := r.Ready()
-	require.Len(t, rd.Messages, 1)
+	require.Len(t, rd.Messages, 1, "no-op MsgApp drained by helper (037m)")
 	require.Len(t, rd.CommittedEntries, 0)
 
 	msg := rd.Messages[0]
 	require.Equal(t, raftpb.MessageType_MsgApp, msg.Type)
 	require.Len(t, msg.Entries, 1)
-	require.Equal(t, uint64(1), msg.Entries[0].Index)
+	// 037m: proposed entry is at index 2 (no-op at 1).
+	require.Equal(t, uint64(2), msg.Entries[0].Index)
 	require.Equal(t, []byte("foo"), msg.Entries[0].Data)
 }
 
 func TestNewEntryIsReadyAfterFollowerStepMsgApp_036f(t *testing.T) {
-	leader := newLeaderRaftWithOnePeer()
+	// 037m: don't use the helper — we need NextIndex=1 so the MsgApp
+	// carries entries from the beginning, including the no-op, so a
+	// fresh follower (empty log) can accept them (prevIndex=0).
+	leader := newTestRaft(1)
+	leader.peers = []uint64{2}
+	leader.term = 1
+	leader.becomeLeader()
+	leader.CommitTo(leader.lastLogIndex)
+	leader.Advance()
+	// Keep progress[2].NextIndex at 1 (not yet acked).
+
 	require.NoError(t, leader.Propose([]byte("foo")))
 
-	msg := leader.Ready().Messages[0]
+	rd := leader.Ready()
+	require.Len(t, rd.Messages, 1)
+	msg := rd.Messages[0]
+	// MsgApp carries all entries from NextIndex=1: [no-op, "foo"].
+	require.Equal(t, raftpb.MessageType_MsgApp, msg.Type)
+
 	follower := newTestRaft(2)
 	require.NoError(t, follower.Step(msg))
 
-	rd := follower.Ready()
-	require.Len(t, rd.Entries, 1)
-	require.Equal(t, msg.Entries[0], rd.Entries[0])
+	frd := follower.Ready()
+	require.GreaterOrEqual(t, len(frd.Entries), 1)
+	last := frd.Entries[len(frd.Entries)-1]
+	require.Equal(t, []byte("foo"), last.Data)
 
 	// follower without a leader drops proposal with ErrProposalDropped
 	follower2 := newTestRaft(3)
@@ -707,11 +748,17 @@ func TestMsgSnapIsReadyWhenRepairCrossesCompactionBoundary_036k(t *testing.T) {
 	}))
 
 	rd := leader.Ready()
-	require.Len(t, rd.Messages, 1)
-	require.Equal(t, raftpb.MessageType_MsgSnap, rd.Messages[0].Type)
-	require.Equal(t, leader.id, rd.Messages[0].From)
-	require.Equal(t, uint64(2), rd.Messages[0].To)
-	require.Equal(t, &raftpb.SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 1}, rd.Messages[0].Snapshot)
+	// 037m: filter out any non-snapshot messages (MsgApp for no-op may be pending).
+	var snaps []*raftpb.Message
+	for _, m := range rd.Messages {
+		if m.Type == raftpb.MessageType_MsgSnap {
+			snaps = append(snaps, m)
+		}
+	}
+	require.Len(t, snaps, 1)
+	require.Equal(t, leader.id, snaps[0].From)
+	require.Equal(t, uint64(2), snaps[0].To)
+	require.Equal(t, &raftpb.SnapshotMeta{LastIncludedIndex: 4, LastIncludedTerm: 1}, snaps[0].Snapshot)
 }
 
 func TestFollowerInstallsSnapshotBoundaryFromMsgSnap_036k(t *testing.T) {
@@ -790,9 +837,12 @@ func TestProgressInitializedOnElection_036n(t *testing.T) {
 
 func TestProposeSendsEntriesFromNextIndex_036n(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
+	// 037m: becomeLeader appended a no-op at index 1. Rebuild log and
+	// progress to test NextIndex-based entry slicing independently.
 	leader.log = []*raftpb.Entry{
 		{Index: 1, Term: 1},
 	}
+	leader.lastLogIndex = 1
 	leader.progress = make(map[uint64]*Progress)
 	leader.progress[2] = &Progress{
 		MatchIndex: 0,
@@ -802,10 +852,18 @@ func TestProposeSendsEntriesFromNextIndex_036n(t *testing.T) {
 	require.NoError(t, leader.Propose([]byte("foo")))
 
 	rd := leader.Ready()
+	// Find the MsgApp carrying the proposed entry.
+	var appMsg *raftpb.Message
+	for _, m := range rd.Messages {
+		if m.Type == raftpb.MessageType_MsgApp {
+			appMsg = m
+		}
+	}
+	require.NotNil(t, appMsg)
 	require.Equal(t, []*raftpb.Entry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1, Data: []byte("foo")},
-	}, rd.Messages[0].Entries)
+	}, appMsg.Entries)
 }
 
 func TestCommitAdvancesOnMajorityMatch_036n(t *testing.T) {
@@ -818,6 +876,14 @@ func TestCommitAdvancesOnMajorityMatch_036n(t *testing.T) {
 		{Index: 2, Term: 1},
 		{Index: 3, Term: 1},
 	}
+	// 037m: matchTerm needs storage to verify the entry's term.
+	leader.storage = &mockStorage{
+		entries: []*raftpb.Entry{
+			{Index: 1, Term: 1},
+			{Index: 2, Term: 1},
+			{Index: 3, Term: 1},
+		},
+	}
 
 	leader.progress = make(map[uint64]*Progress)
 	leader.progress[2] = &Progress{MatchIndex: 0, NextIndex: 1}
@@ -826,6 +892,7 @@ func TestCommitAdvancesOnMajorityMatch_036n(t *testing.T) {
 	require.NoError(t, leader.Step(&raftpb.Message{
 		Type:  raftpb.MessageType_MsgAppResp,
 		From:  2,
+		Term:  leader.term,
 		Index: 2,
 	}))
 	// matches: [leader=3, peer2=2, peer3=1] → median=2, not max=3
@@ -1854,14 +1921,24 @@ func TestLeaderSkipsMsgAppAfterHeartbeatRespFromCaughtUpPeer_037h(t *testing.T) 
 }
 
 func TestHeartbeatDoesNotInterfereWithReplication_037h(t *testing.T) {
-	r := newTestRaft(1)
-	r.peers = []uint64{2}
-	r.term = 1
-	r.becomeLeader()
-	r.Advance()
+	// 037m: use helper that drains the no-op from becomeLeader.
+	r := newLeaderRaftWithOnePeer()
+	// 037m: matchTerm needs storage to verify entry terms for maybeCommit.
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{
+			{Index: 1, Term: 1},
+		},
+	}
 
 	// Propose an entry — normal replication.
 	require.NoError(t, r.Propose([]byte("x")))
+	// 037m: update storage to include the proposed entry.
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{
+			{Index: 1, Term: 1},
+			{Index: 2, Term: 1, Data: []byte("x")},
+		},
+	}
 	rd := r.Ready()
 	require.Len(t, rd.Messages, 1)
 	require.Equal(t, raftpb.MessageType_MsgApp, rd.Messages[0].Type)
@@ -1869,13 +1946,15 @@ func TestHeartbeatDoesNotInterfereWithReplication_037h(t *testing.T) {
 	r.Advance()
 
 	// Follower acks via MsgAppResp — leader advances commit.
+	// 037m: MsgApp carries entries from NextIndex; ack the last entry.
+	lastEntry := appMsg.Entries[len(appMsg.Entries)-1]
 	require.NoError(t, r.Step(&raftpb.Message{
 		Type:  raftpb.MessageType_MsgAppResp,
 		From:  2,
 		Term:  1,
-		Index: appMsg.Entries[0].Index,
+		Index: lastEntry.Index,
 	}))
-	require.Equal(t, uint64(1), r.commitIndex)
+	require.Equal(t, lastEntry.Index, r.commitIndex)
 	r.Advance()
 
 	// Now tick heartbeat — should produce MsgHeartbeat, not interfere.

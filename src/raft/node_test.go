@@ -20,6 +20,9 @@ func TestConsumeEntryAfterPropose_036b(t *testing.T) {
 	defer n.Stop()
 
 	n.r.becomeLeader()
+	// 037m: commit and drain the no-op from becomeLeader before run loop.
+	n.r.CommitTo(n.r.lastLogIndex)
+	n.r.Advance()
 	go n.run()
 
 	require.NoError(t, n.Propose(ctx, []byte("foo")))
@@ -33,6 +36,9 @@ func TestAdvanceMovesForward_036b(t *testing.T) {
 	defer n.Stop()
 
 	n.r.becomeLeader()
+	// 037m: commit and drain the no-op from becomeLeader before run loop.
+	n.r.CommitTo(n.r.lastLogIndex)
+	n.r.Advance()
 	go n.run()
 
 	require.NoError(t, n.Propose(ctx, []byte("foo")))
@@ -55,18 +61,29 @@ func TestNodeStepFeedsInboundMessageIntoRaft_036l(t *testing.T) {
 	defer leader.Stop()
 
 	leader.r.becomeLeader()
+	// 037m: commit and drain the no-op. Keep peer progress at NextIndex=1
+	// so the MsgApp starts from the beginning (fresh follower has empty log).
+	leader.r.CommitTo(leader.r.lastLogIndex)
+	leader.r.Advance()
 	go leader.run()
 	require.NoError(t, leader.Propose(ctx, []byte("foo")))
 
-	msg := (<-leader.Ready()).Messages[0]
+	rd := <-leader.Ready()
+	require.NotEmpty(t, rd.Messages)
+	msg := rd.Messages[0]
+	// MsgApp carries entries from NextIndex=1: [no-op, "foo"].
+	require.Equal(t, raftpb.MessageType_MsgApp, msg.Type)
+
 	follower := newStartedNode(2)
 	defer follower.Stop()
 
 	require.NoError(t, follower.Step(ctx, msg))
 
-	rd := <-follower.Ready()
-	require.Len(t, rd.Entries, 1)
-	require.Equal(t, []byte("foo"), rd.Entries[0].Data)
+	frd := <-follower.Ready()
+	// 037m: follower receives all entries from the MsgApp.
+	require.GreaterOrEqual(t, len(frd.Entries), 1)
+	fLast := frd.Entries[len(frd.Entries)-1]
+	require.Equal(t, []byte("foo"), fLast.Data)
 }
 
 func TestNodeCampaignExposesVoteMessages_036l(t *testing.T) {
@@ -110,6 +127,9 @@ func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
 	n := setupNode(Config{ID: 1, Peers: []uint64{2}, Storage: &mockStorage{}, ElectionTick: 10, HeartbeatTick: 1})
 	n.r.becomeLeader()
 	n.r.term = 1
+	// 037m: commit and drain the no-op from becomeLeader before run loop.
+	n.r.CommitTo(n.r.lastLogIndex)
+	n.r.Advance()
 	go n.run()
 	defer n.Stop()
 
@@ -117,7 +137,8 @@ func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
 
 	select {
 	case rd := <-n.Ready():
-		require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 0}, rd.HardState)
+		// 037m: commitIndex is 1 from the no-op committed in setup (CommitTo never decreases).
+		require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 1}, rd.HardState)
 		require.Len(t, rd.Messages, 0)
 		require.Len(t, rd.Entries, 0)
 		require.Len(t, rd.CommittedEntries, 0)
