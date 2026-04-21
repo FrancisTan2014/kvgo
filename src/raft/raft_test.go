@@ -2217,3 +2217,230 @@ func TestReadIndexPostponedUntilCurrentTermCommit_037l(t *testing.T) {
 	require.Equal(t, rctx, rd.ReadStates[0].RequestCtx)
 	require.Equal(t, uint64(1), rd.ReadStates[0].Index)
 }
+
+// --- 037m: CheckQuorum ---
+//
+// Invariant: a leader that cannot confirm quorum activity within one
+// election-timeout window demotes itself to follower at the same term
+// with lead = None.
+
+// newThreeNodeLeader returns a leader (id=1) in term 1 with peers [2,3].
+// The no-op from becomeLeader is committed and Ready is drained.
+func newThreeNodeLeader(t *testing.T) *Raft {
+	t.Helper()
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3}
+	r.term = 1
+	r.becomeLeader()
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{{Index: 1, Term: 1}},
+	}
+	r.commitIndex = 1
+	r.Advance()
+	return r
+}
+
+// tickElectionWindow ticks tickHeartbeat enough times to trigger MsgCheckQuorum.
+func tickElectionWindow(r *Raft) {
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickHeartbeat()
+		r.Advance() // drain any heartbeat messages
+	}
+}
+
+func TestLeaderStepsDownWhenQuorumSilent_037m(t *testing.T) {
+	r := newThreeNodeLeader(t)
+	origTerm := r.term
+
+	// No MsgHeartbeatResp or MsgAppResp from any peer.
+	tickElectionWindow(r)
+
+	require.Equal(t, Follower, r.state, "leader must step down after electionTimeout with no peer responses")
+	require.Equal(t, None, r.lead, "lead must be None after CheckQuorum demotion")
+	require.Equal(t, origTerm, r.term, "term must not change on CheckQuorum step-down")
+}
+
+func TestLeaderStaysLeaderWithQuorumResponses_037m(t *testing.T) {
+	r := newThreeNodeLeader(t)
+
+	// Send heartbeat responses from one peer periodically within the window.
+	// Self + 1 peer = 2 = quorum of 3.
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickHeartbeat()
+		r.Advance()
+		// Respond from peer 2 every few ticks.
+		if i%3 == 0 {
+			require.NoError(t, r.Step(&raftpb.Message{
+				Type: raftpb.MessageType_MsgHeartbeatResp,
+				From: 2,
+				Term: r.term,
+			}))
+		}
+	}
+
+	require.Equal(t, Leader, r.state, "leader with quorum responses must stay leader")
+}
+
+func TestSubQuorumResponsesNotEnough_037m(t *testing.T) {
+	r := newTestRaft(1)
+	r.peers = []uint64{2, 3, 4, 5} // 5-node cluster, quorum = 3
+	r.term = 1
+	r.becomeLeader()
+	r.storage = &mockStorage{
+		entries: []*raftpb.Entry{{Index: 1, Term: 1}},
+	}
+	r.commitIndex = 1
+	r.Advance()
+
+	// Only one peer responds — self + 1 = 2 < quorum(3).
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickHeartbeat()
+		r.Advance()
+		if i%3 == 0 {
+			require.NoError(t, r.Step(&raftpb.Message{
+				Type: raftpb.MessageType_MsgHeartbeatResp,
+				From: 2,
+				Term: r.term,
+			}))
+		}
+	}
+
+	require.Equal(t, Follower, r.state, "sub-quorum responses must trigger step-down")
+}
+
+func TestRecentActiveResetsAcrossWindows_037m(t *testing.T) {
+	r := newThreeNodeLeader(t)
+
+	// Window 1: full quorum — both peers respond early in the window.
+	// Responses must stop before the last tick (i=electionTimeout-1) because
+	// MsgCheckQuorum fires on that tick and resetRecentActive clears the flags
+	// *before* any response on that tick would re-stamp them.
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickHeartbeat()
+		r.Advance()
+		if i%3 == 0 && i < r.electionTimeout-1 {
+			require.NoError(t, r.Step(&raftpb.Message{
+				Type: raftpb.MessageType_MsgHeartbeatResp,
+				From: 2,
+				Term: r.term,
+			}))
+			require.NoError(t, r.Step(&raftpb.Message{
+				Type: raftpb.MessageType_MsgHeartbeatResp,
+				From: 3,
+				Term: r.term,
+			}))
+		}
+	}
+	require.Equal(t, Leader, r.state, "leader must survive window 1 with full quorum")
+
+	// Window 2: zero responses.
+	tickElectionWindow(r)
+
+	require.Equal(t, Follower, r.state, "leader must step down in window 2 with no responses")
+}
+
+func TestSingletonClusterNeverStepsDown_037m(t *testing.T) {
+	r := newTestRaft(1)
+	// No peers — singleton cluster.
+	r.term = 1
+	r.becomeLeader()
+	r.Advance()
+
+	// Tick through multiple election windows.
+	for window := 0; window < 3; window++ {
+		tickElectionWindow(r)
+	}
+
+	require.Equal(t, Leader, r.state, "singleton leader must never step down")
+}
+
+func TestMsgAppRespCountsAsLiveness_037m(t *testing.T) {
+	r := newThreeNodeLeader(t)
+
+	// Peer 2 sends only MsgAppResp, no heartbeat responses.
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickHeartbeat()
+		r.Advance()
+		if i%3 == 0 {
+			require.NoError(t, r.Step(&raftpb.Message{
+				Type:  raftpb.MessageType_MsgAppResp,
+				From:  2,
+				Term:  r.term,
+				Index: 1,
+			}))
+		}
+	}
+
+	require.Equal(t, Leader, r.state, "MsgAppResp must count as liveness for CheckQuorum")
+}
+
+func TestStaleTermResponsesDoNotCountForCheckQuorum_037m(t *testing.T) {
+	r := newThreeNodeLeader(t)
+
+	// Send heartbeat responses at a lower term.
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickHeartbeat()
+		r.Advance()
+		if i%3 == 0 {
+			require.NoError(t, r.Step(&raftpb.Message{
+				Type: raftpb.MessageType_MsgHeartbeatResp,
+				From: 2,
+				Term: r.term - 1, // stale term
+			}))
+		}
+	}
+
+	require.Equal(t, Follower, r.state, "stale-term responses must not count for CheckQuorum")
+}
+
+func TestSteppedDownNodeAcceptsHigherTermMsgApp_037m(t *testing.T) {
+	r := newThreeNodeLeader(t)
+	origTerm := r.term
+
+	// Force CheckQuorum step-down.
+	tickElectionWindow(r)
+	require.Equal(t, Follower, r.state)
+
+	// Deliver MsgApp at term T+1 from a new leader (node 2).
+	require.NoError(t, r.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgApp,
+		From:    2,
+		To:      1,
+		Term:    origTerm + 1,
+		Index:   1,
+		LogTerm: 1,
+		Commit:  1,
+	}))
+
+	require.Equal(t, origTerm+1, r.term, "term must advance to the new leader's term")
+	require.Equal(t, uint64(2), r.lead, "lead must become the new leader")
+	require.Equal(t, Follower, r.state, "must remain follower under new leader")
+}
+
+func TestStepDownClearsPendingReadIndexQueues_037m(t *testing.T) {
+	r := newThreeNodeLeader(t)
+
+	// Seed readOnly with a pending request.
+	rctx := []byte("rctx-pending")
+	r.readOnly.addRequest(r.commitIndex, &raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		From:    1,
+		Context: rctx,
+	})
+	require.NotEmpty(t, r.readOnly.pendingReadIndex, "precondition: readOnly must have a pending request")
+
+	// Seed pendingReadIndexRequests.
+	r.pendingReadIndexRequests = append(r.pendingReadIndexRequests, &raftpb.Message{
+		Type:    raftpb.MessageType_MsgReadIndex,
+		From:    1,
+		Context: []byte("rctx-deferred"),
+	})
+	require.NotEmpty(t, r.pendingReadIndexRequests, "precondition: pending queue must be non-empty")
+
+	// Trigger CheckQuorum step-down.
+	tickElectionWindow(r)
+	require.Equal(t, Follower, r.state)
+
+	require.Empty(t, r.readOnly.pendingReadIndex, "readOnly must be cleared on step-down")
+	require.Empty(t, r.pendingReadIndexRequests, "pendingReadIndexRequests must be cleared on step-down")
+}

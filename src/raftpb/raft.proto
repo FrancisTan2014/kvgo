@@ -16,6 +16,7 @@ enum MessageType {
     MsgHeartbeatResp = 10;
     MsgReadIndex     = 11;
     MsgReadIndexResp = 12;
+    MsgCheckQuorum   = 13;
 }
 
 message Entry {

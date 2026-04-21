@@ -38,8 +38,9 @@ type Ready struct {
 }
 
 type Progress struct {
-	MatchIndex uint64
-	NextIndex  uint64
+	MatchIndex   uint64
+	NextIndex    uint64
+	RecentActive bool
 }
 
 /*
@@ -346,6 +347,9 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		if !exists {
 			return errors.New("TODO: will be replace with real coordination code later")
 		}
+		if m.Term == r.term {
+			prs.RecentActive = true
+		}
 
 		if m.Reject {
 			firstIndex := r.storage.FirstIndex()
@@ -392,6 +396,10 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 			r.logger.Warn("MsgHeartbeatResp from unknown peer", "from", m.From)
 			return nil
 		}
+		if m.Term == r.term {
+			prs.RecentActive = true
+		}
+
 		if prs.MatchIndex < r.lastLogIndex {
 			r.sendAppend(m.From)
 		}
@@ -418,6 +426,15 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		r.readOnly.addRequest(r.commitIndex, m)
 		r.readOnly.recvAck(r.id, m.Context)
 		r.bcastHeartbeat(m.Context)
+
+	case raftpb.MessageType_MsgCheckQuorum:
+		if !r.hasQuorumActive() {
+			r.logger.Info("leader lost quorum, stepping down",
+				"term", r.term, "id", r.id)
+			r.becomeFollower(r.term, None)
+			return nil
+		}
+		r.resetRecentActive()
 
 	default:
 		// TODO: deal with the remaining message types
@@ -587,6 +604,14 @@ func (r *Raft) tickElection() {
 
 func (r *Raft) tickHeartbeat() {
 	r.heartbeatElapsed++
+	r.electionElapsed++
+
+	if r.electionElapsed >= r.electionTimeout { // NEW block
+		r.electionElapsed = 0
+		if err := r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgCheckQuorum}); err != nil {
+			r.logger.Debug("check quorum step failed", "error", err)
+		}
+	}
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
 		r.heartbeatElapsed = 0
 		if err := r.Step(&raftpb.Message{From: r.id, Type: raftpb.MessageType_MsgBeat}); err != nil {
@@ -605,8 +630,9 @@ func (r *Raft) becomeLeader() {
 	r.progress = make(map[uint64]*Progress, len(r.peers))
 	for _, pid := range r.peers {
 		r.progress[pid] = &Progress{
-			MatchIndex: 0,
-			NextIndex:  r.lastLogIndex + 1,
+			MatchIndex:   0,
+			NextIndex:    r.lastLogIndex + 1,
+			RecentActive: false,
 		}
 	}
 
@@ -652,6 +678,8 @@ func (r *Raft) reset(term uint64) {
 
 	r.votes = make(map[uint64]bool)
 	r.progress = nil
+	r.pendingReadIndexRequests = nil
+	r.readOnly = newReadOnly()
 }
 
 func (r *Raft) getMedian() uint64 {
@@ -922,5 +950,21 @@ func (r *Raft) appendEntry(data []byte) {
 func (r *Raft) bcastAppend() {
 	for _, pid := range r.peers {
 		r.sendAppend(pid)
+	}
+}
+
+func (r *Raft) hasQuorumActive() bool {
+	active := 1 // self
+	for _, pr := range r.progress {
+		if pr.RecentActive {
+			active++
+		}
+	}
+	return active >= (len(r.peers)+1)/2+1
+}
+
+func (r *Raft) resetRecentActive() {
+	for _, pr := range r.progress {
+		pr.RecentActive = false
 	}
 }

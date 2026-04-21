@@ -37,6 +37,7 @@ const (
 	MessageType_MsgHeartbeatResp MessageType = 10
 	MessageType_MsgReadIndex     MessageType = 11
 	MessageType_MsgReadIndexResp MessageType = 12
+	MessageType_MsgCheckQuorum   MessageType = 13
 )
 
 // Enum value maps for MessageType.
@@ -55,6 +56,7 @@ var (
 		10: "MsgHeartbeatResp",
 		11: "MsgReadIndex",
 		12: "MsgReadIndexResp",
+		13: "MsgCheckQuorum",
 	}
 	MessageType_value = map[string]int32{
 		"MsgUnknown":       0,
@@ -70,6 +72,7 @@ var (
 		"MsgHeartbeatResp": 10,
 		"MsgReadIndex":     11,
 		"MsgReadIndexResp": 12,
+		"MsgCheckQuorum":   13,
 	}
 )
 
@@ -436,7 +439,7 @@ const file_raft_proto_rawDesc = "" +
 	" \x01(\x04R\n" +
 	"RejectHint\x120\n" +
 	"\bSnapshot\x18\v \x01(\v2\x14.raftpb.SnapshotMetaR\bSnapshot\x12\x18\n" +
-	"\aContext\x18\f \x01(\fR\aContext*\xda\x01\n" +
+	"\aContext\x18\f \x01(\fR\aContext*\xee\x01\n" +
 	"\vMessageType\x12\x0e\n" +
 	"\n" +
 	"MsgUnknown\x10\x00\x12\n" +
@@ -455,7 +458,8 @@ const file_raft_proto_rawDesc = "" +
 	"\x10MsgHeartbeatResp\x10\n" +
 	"\x12\x10\n" +
 	"\fMsgReadIndex\x10\v\x12\x14\n" +
-	"\x10MsgReadIndexResp\x10\fB\rZ\vkvgo/raftpbb\x06proto3"
+	"\x10MsgReadIndexResp\x10\f\x12\x12\n" +
+	"\x0eMsgCheckQuorum\x10\rB\rZ\vkvgo/raftpbb\x06proto3"
 
 var (
 	file_raft_proto_rawDescOnce sync.Once
