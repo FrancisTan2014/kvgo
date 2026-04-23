@@ -110,6 +110,29 @@ func newTestRaft(id uint64) *Raft {
 	})
 }
 
+// campaignToCandidate drives a node through the PreVote stage into Candidate.
+// 037n: MsgHup now enters PreCandidate first. Tests that need Candidate state
+// must complete the PreVote round before asserting.
+func campaignToCandidate(t *testing.T, r *Raft) {
+	t.Helper()
+	require.NoError(t, r.Campaign())
+	require.Equal(t, PreCandidate, r.state)
+
+	// Grant PreVote from all peers to advance to Candidate.
+	rd := r.Ready()
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgPreVote {
+			require.NoError(t, r.Step(&raftpb.Message{
+				Type: raftpb.MessageType_MsgPreVoteResp,
+				From: msg.To,
+				To:   r.id,
+				Term: msg.Term,
+			}))
+		}
+	}
+	require.Equal(t, Candidate, r.state)
+}
+
 // newLeaderRaftWithOnePeer returns a leader (id=1) in term 1 with one peer.
 // 037m: commits and drains the no-op entry appended by becomeLeader (added
 // in 037l) and advances peer progress past it, so tests start with a clean
@@ -213,7 +236,9 @@ func TestReadyExposesHardStateAfterCampaign_036m(t *testing.T) {
 	r := newTestRaft(1)
 	r.peers = []uint64{2}
 
-	require.NoError(t, r.Campaign())
+	// 037n: Campaign() now enters PreCandidate (term unchanged).
+	// Drive through PreVote to reach Candidate where term advances.
+	campaignToCandidate(t, r)
 
 	rd := r.Ready()
 	require.Equal(t, &raftpb.HardState{Term: 1, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
@@ -389,11 +414,18 @@ func TestCandidateDoesNotBecomeLeaderWithOnlySelfVote_036h(t *testing.T) {
 	n := newTestRaft(1)
 	n.peers = append(n.peers, voterId)
 
-	require.NoError(t, n.Campaign())
+	// 037n: drive through PreVote to reach Candidate.
+	campaignToCandidate(t, n)
+
 	rd := n.Ready()
-	require.Len(t, rd.Messages, 1)
-	require.Equal(t, raftpb.MessageType_MsgVote, rd.Messages[0].Type)
-	require.Equal(t, voterId, rd.Messages[0].To)
+	var voteMessages int
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgVote {
+			voteMessages++
+			require.Equal(t, voterId, msg.To)
+		}
+	}
+	require.Equal(t, 1, voteMessages)
 	require.Equal(t, Candidate, n.state)
 
 	require.NoError(t, n.Step(&raftpb.Message{
@@ -403,7 +435,8 @@ func TestCandidateDoesNotBecomeLeaderWithOnlySelfVote_036h(t *testing.T) {
 		Term:   n.term,
 		Reject: true,
 	}))
-	require.Equal(t, Candidate, n.state)
+	// 037n: majority rejection triggers immediate step-down.
+	require.Equal(t, Follower, n.state)
 }
 
 func TestCandidateBecomesLeaderAfterMajorityVoteResponses_036h(t *testing.T) {
@@ -412,14 +445,15 @@ func TestCandidateBecomesLeaderAfterMajorityVoteResponses_036h(t *testing.T) {
 	n := newTestRaft(1)
 	n.peers = append(n.peers, voterId)
 
-	require.NoError(t, n.Campaign())
+	// 037n: drive through PreVote to reach Candidate.
+	campaignToCandidate(t, n)
 	require.Equal(t, Candidate, n.state)
 
 	require.NoError(t, n.Step(&raftpb.Message{
 		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   voterId,
 		To:     n.id,
-		Term:   1,
+		Term:   n.term,
 		Reject: false,
 	}))
 	require.Equal(t, Leader, n.state)
@@ -489,7 +523,11 @@ func TestStaleVoteRespIgnored_036h(t *testing.T) {
 	n.term = 1
 	n.peers = append(n.peers, voterId)
 
-	require.NoError(t, n.Campaign())
+	// 037n: drive through PreVote to reach Candidate at term 2.
+	campaignToCandidate(t, n)
+	require.Equal(t, Candidate, n.state)
+
+	// Stale vote response from term 1 — should be ignored.
 	require.NoError(t, n.Step(&raftpb.Message{
 		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   voterId,
@@ -605,21 +643,22 @@ func TestHigherTermGrantedVoteResponseMakesCandidateYield_036j(t *testing.T) {
 	n := newTestRaft(1)
 	n.peers = append(n.peers, 2)
 
-	require.NoError(t, n.Campaign())
+	// 037n: drive through PreVote to reach Candidate.
+	campaignToCandidate(t, n)
 	require.Equal(t, Candidate, n.state)
-	require.Equal(t, uint64(1), n.term)
+	candTerm := n.term
 	require.Equal(t, n.id, n.votedFor)
 
 	require.NoError(t, n.Step(&raftpb.Message{
 		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   2,
 		To:     n.id,
-		Term:   2,
+		Term:   candTerm + 1,
 		Reject: false,
 	}))
 
 	require.Equal(t, Follower, n.state)
-	require.Equal(t, uint64(2), n.term)
+	require.Equal(t, candTerm+1, n.term)
 	require.Zero(t, n.votedFor)
 	require.Empty(t, n.votes)
 }
@@ -628,14 +667,16 @@ func TestHigherTermVoteResponseClearsSelfVoteForLaterGrant_036j(t *testing.T) {
 	n := newTestRaft(2)
 	n.peers = append(n.peers, 1, 3)
 
-	require.NoError(t, n.Campaign())
+	// 037n: drive through PreVote to reach Candidate.
+	campaignToCandidate(t, n)
 	require.Equal(t, Candidate, n.state)
+	candTerm := n.term
 
 	require.NoError(t, n.Step(&raftpb.Message{
 		Type:   raftpb.MessageType_MsgVoteResp,
 		From:   1,
 		To:     n.id,
-		Term:   2,
+		Term:   candTerm + 1,
 		Reject: true,
 	}))
 	require.Equal(t, Follower, n.state)
@@ -943,14 +984,19 @@ func TestTickElectionProducesMsgHup_036t(t *testing.T) {
 		r.tick()
 	}
 
-	// The follower should have become a candidate via MsgHup → Step → becomeCandidate.
-	require.Equal(t, Candidate, r.state)
+	// 037n: MsgHup now enters PreCandidate, not Candidate.
+	require.Equal(t, PreCandidate, r.state)
 
-	// MsgVote should be ready for the peer.
+	// MsgPreVote should be ready for the peer.
 	rd := r.Ready()
-	require.Len(t, rd.Messages, 1)
-	require.Equal(t, raftpb.MessageType_MsgVote, rd.Messages[0].Type)
-	require.Equal(t, uint64(2), rd.Messages[0].To)
+	var preVoteCount int
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgPreVote {
+			preVoteCount++
+			require.Equal(t, uint64(2), msg.To)
+		}
+	}
+	require.Equal(t, 1, preVoteCount)
 }
 
 // Superseded by 037h: heartbeats now use dedicated MsgHeartbeat instead of empty MsgApp
@@ -993,29 +1039,53 @@ func TestCandidateReElectsAtHigherTermOnTimeout_036t(t *testing.T) {
 	r := newTestRaft(1)
 	r.peers = []uint64{2, 3}
 
-	// First campaign — becomes candidate at term 1.
-	require.NoError(t, r.Campaign())
+	// 037n: drive through PreVote to reach Candidate at term 1.
+	campaignToCandidate(t, r)
 	require.Equal(t, Candidate, r.state)
-	require.Equal(t, uint64(1), r.term)
+	firstTerm := r.term
 	r.Advance()
 
 	// Election times out — tick past randomizedElectionTimeout.
+	// 037n: re-election enters PreCandidate first, then PreVote grants
+	// advance it to Candidate at the next term.
 	for i := 0; i < 2*r.electionTimeout; i++ {
 		r.tick()
 	}
 
-	// Must re-campaign at a higher term.
+	// After timeout, node is in PreCandidate (term unchanged).
+	require.Equal(t, PreCandidate, r.state)
+	require.Equal(t, firstTerm, r.term)
+
+	// Grant PreVotes to advance to Candidate at higher term.
+	rd := r.Ready()
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgPreVote {
+			require.NoError(t, r.Step(&raftpb.Message{
+				Type: raftpb.MessageType_MsgPreVoteResp,
+				From: msg.To,
+				To:   r.id,
+				Term: msg.Term,
+			}))
+		}
+	}
+
 	require.Equal(t, Candidate, r.state)
-	require.Equal(t, uint64(2), r.term)
+	require.Equal(t, firstTerm+1, r.term)
 	require.Equal(t, r.id, r.votedFor)
 
-	rd := r.Ready()
-	// MsgVote sent to both peers at the new term.
-	require.Len(t, rd.Messages, 2)
+	// Collect MsgVote messages emitted by becomeCandidate before draining.
+	rd = r.Ready()
+	r.Advance()
+
+	var voteCount int
 	for _, msg := range rd.Messages {
-		require.Equal(t, raftpb.MessageType_MsgVote, msg.Type)
-		require.Equal(t, uint64(2), msg.Term)
+		if msg.Type == raftpb.MessageType_MsgVote {
+			voteCount++
+			require.Equal(t, firstTerm+1, msg.Term)
+		}
 	}
+	// MsgVote sent to both peers at the new term.
+	require.Equal(t, 2, voteCount)
 }
 
 func TestNodeStepRejectsLocalMessages_036t(t *testing.T) {
@@ -2522,4 +2592,316 @@ func TestStepDownClearsPendingReadIndexQueues_037m(t *testing.T) {
 
 	require.Empty(t, r.readOnly.pendingReadIndex, "readOnly must be cleared on step-down")
 	require.Empty(t, r.pendingReadIndexRequests, "pendingReadIndexRequests must be cleared on step-down")
+}
+
+// --- 037n: PreVote ---
+//
+// A partitioned node's election timer fires. It campaigns at a higher term.
+// When the partition heals, its MsgVote reaches the healthy leader. Without
+// PreVote, the higher-term vote request forces the leader to step down —
+// even though the partitioned node has no chance of winning (stale log).
+// The cluster loses its leader unnecessarily.
+
+func TestPartitionedNodeDisruptsLeaderWithStaleVote_037n(t *testing.T) {
+	// Node 1 is leader in term 1 with peers [2, 3].
+	leader := newThreeNodeLeader(t)
+	require.Equal(t, Leader, leader.state)
+	require.Equal(t, uint64(1), leader.term)
+
+	// Node 3 is partitioned. Its election timer fires — it campaigns at term 2.
+	// Simulate: a fresh raft node that went through becomePreCandidate().
+	// 037n: with PreVote enabled, the partitioned node sends MsgPreVote,
+	// not MsgVote. Its local term stays at 1 (no advance).
+	isolated := newTestRaft(3)
+	isolated.peers = []uint64{1, 2}
+	isolated.term = 1
+	isolated.becomePreCandidate()
+
+	// Partition heals: node 3's MsgPreVote arrives at the leader.
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgPreVote,
+		From:    3,
+		To:      1,
+		Term:    isolated.term + 1, // asks "would you vote for me at term 2?"
+		Index:   0,                 // stale log — no entries
+		LogTerm: 0,
+	}))
+
+	// 037n: PreVote does not bump the leader's term. The leader rejects
+	// the PreVote (stale log) and stays leader at its original term.
+	require.Equal(t, Leader, leader.state,
+		"leader must not step down from a partitioned node's stale vote request")
+	require.Equal(t, uint64(1), leader.term,
+		"leader's term must not advance from a vote it should have ignored")
+}
+
+func TestPreVoteQuorumRequiredBeforeTermAdvance_037n(t *testing.T) {
+	// 3-node cluster: node 1 (self) + peers [2, 3]. Quorum = 2.
+	n := newTestRaft(1)
+	n.peers = []uint64{2, 3}
+
+	require.NoError(t, n.Campaign())
+	require.Equal(t, PreCandidate, n.state)
+	origTerm := n.term
+
+	// Only peer 2 responds — with rejection. Peer 3 is silent.
+	// Self (grant) + peer 2 (reject) = 1 grant, 1 reject, 1 missing → VotePending.
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgPreVoteResp,
+		From:   2,
+		To:     n.id,
+		Term:   origTerm + 1,
+		Reject: true,
+	}))
+
+	require.Equal(t, PreCandidate, n.state, "PreCandidate must not advance without quorum")
+	require.Equal(t, origTerm, n.term, "term must not change without PreVote quorum")
+
+	// No MsgVote should have been sent.
+	rd := n.Ready()
+	for _, msg := range rd.Messages {
+		require.NotEqual(t, raftpb.MessageType_MsgVote, msg.Type,
+			"MsgVote must not be sent without PreVote quorum")
+	}
+}
+
+func TestPreVoteGrantsAreNonExclusive_037n(t *testing.T) {
+	// Node 3 (voter) receives MsgPreVote from two different candidates.
+	voter := newTestRaft(3)
+	voter.peers = []uint64{1, 2}
+	voter.term = 1
+
+	// Candidate 1 sends MsgPreVote.
+	require.NoError(t, voter.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgPreVote,
+		From:    1,
+		To:      3,
+		Term:    2,
+		Index:   0,
+		LogTerm: 0,
+	}))
+
+	// Candidate 2 sends MsgPreVote.
+	require.NoError(t, voter.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgPreVote,
+		From:    2,
+		To:      3,
+		Term:    2,
+		Index:   0,
+		LogTerm: 0,
+	}))
+
+	// Both should be granted — PreVote is non-exclusive.
+	rd := voter.Ready()
+	var grants int
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgPreVoteResp && !msg.Reject {
+			grants++
+		}
+	}
+	require.Equal(t, 2, grants, "voter must grant PreVote to both candidates")
+}
+
+func TestCandidateStepsDownOnSameTermAuthority_037n(t *testing.T) {
+	n := newTestRaft(1)
+	n.peers = []uint64{2, 3}
+
+	// Drive to Candidate at term 1.
+	campaignToCandidate(t, n)
+	require.Equal(t, Candidate, n.state)
+	candTerm := n.term
+
+	// Receive MsgApp from node 2 at the same term — node 2 won the election.
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgApp,
+		From:    2,
+		To:      1,
+		Term:    candTerm,
+		Index:   0,
+		LogTerm: 0,
+		Entries: []*raftpb.Entry{{Index: 1, Term: candTerm, Data: []byte("x")}},
+	}))
+
+	require.Equal(t, Follower, n.state, "candidate must step down on same-term MsgApp")
+	require.Equal(t, uint64(2), n.lead, "lead must be the MsgApp sender")
+	require.Equal(t, candTerm, n.term, "term must not change")
+}
+
+func TestPreVoteDoesNotSetVotedFor_037n(t *testing.T) {
+	voter := newTestRaft(3)
+	voter.peers = []uint64{1, 2}
+	voter.term = 1
+
+	// Grant PreVote to candidate 1.
+	require.NoError(t, voter.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgPreVote,
+		From:    1,
+		To:      3,
+		Term:    2,
+		Index:   0,
+		LogTerm: 0,
+	}))
+	require.Zero(t, voter.votedFor, "PreVote must not set votedFor")
+
+	// Now a real MsgVote from candidate 2 arrives — voter can still grant.
+	require.NoError(t, voter.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgVote,
+		From:    2,
+		To:      3,
+		Term:    2,
+		Index:   0,
+		LogTerm: 0,
+	}))
+	require.Equal(t, uint64(2), voter.votedFor, "voter must be able to vote for a different candidate after PreVote grant")
+}
+
+func TestSimultaneousPreVoteResolvesInOneRound_037n(t *testing.T) {
+	// 3-node cluster: nodes 1, 2, 3.
+	nodes := make([]*Raft, 3)
+	for i := range nodes {
+		id := uint64(i + 1)
+		peers := make([]uint64, 0, 2)
+		for j := range nodes {
+			if uint64(j+1) != id {
+				peers = append(peers, uint64(j+1))
+			}
+		}
+		nodes[i] = newTestRaft(id)
+		nodes[i].peers = peers
+	}
+
+	// Force nodes 1 and 2 to campaign simultaneously.
+	require.NoError(t, nodes[0].Campaign())
+	require.NoError(t, nodes[1].Campaign())
+
+	// Deliver all messages for up to 50 ticks.
+	for tick := 0; tick < 50; tick++ {
+		for _, n := range nodes {
+			n.tick()
+		}
+		for _, src := range nodes {
+			rd := src.Ready()
+			for _, msg := range rd.Messages {
+				for _, dst := range nodes {
+					if dst.id == msg.To {
+						_ = dst.Step(msg)
+					}
+				}
+			}
+			src.Advance()
+		}
+
+		// Check if exactly one leader exists.
+		var leaders int
+		for _, n := range nodes {
+			if n.state == Leader {
+				leaders++
+			}
+		}
+		if leaders == 1 {
+			return // success
+		}
+	}
+	t.Fatal("simultaneous PreVote did not resolve to a single leader within 50 ticks")
+}
+
+func TestPreVoteRejectedByHigherTermNode_037n(t *testing.T) {
+	// Node at term 5 receives MsgPreVote asking for term 3.
+	n := newTestRaft(1)
+	n.peers = []uint64{2}
+	n.term = 5
+
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgPreVote,
+		From:    2,
+		To:      1,
+		Term:    3,
+		Index:   0,
+		LogTerm: 0,
+	}))
+
+	rd := n.Ready()
+	var found bool
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgPreVoteResp && msg.To == 2 {
+			require.True(t, msg.Reject, "PreVote from lower term must be rejected")
+			found = true
+		}
+	}
+	require.True(t, found, "must respond with MsgPreVoteResp")
+	require.Equal(t, uint64(5), n.term, "receiver's term must not change")
+}
+
+func TestMajorityRejectionTriggersImmediateStepDown_037n(t *testing.T) {
+	// 3-node cluster: node 1 (self) + peers [2, 3]. Quorum = 2.
+	n := newTestRaft(1)
+	n.peers = []uint64{2, 3}
+
+	require.NoError(t, n.Campaign())
+	require.Equal(t, PreCandidate, n.state)
+	origTerm := n.term
+
+	// Both peers reject — majority lost.
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgPreVoteResp,
+		From:   2,
+		To:     n.id,
+		Term:   origTerm + 1,
+		Reject: true,
+	}))
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgPreVoteResp,
+		From:   3,
+		To:     n.id,
+		Term:   origTerm + 1,
+		Reject: true,
+	}))
+
+	require.Equal(t, Follower, n.state, "PreCandidate must step down on majority rejection")
+	require.Equal(t, origTerm, n.term, "term must not advance after PreVote rejection")
+}
+
+func TestHigherTermPreVoteDoesNotDemoteReceiver_037n(t *testing.T) {
+	// Node 1 is a leader at term 3.
+	leader := newTestRaft(1)
+	leader.peers = []uint64{2}
+	leader.term = 3
+	leader.becomeLeader()
+	leader.Advance()
+
+	// Receives MsgPreVote with term 4 — must NOT step down.
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type:    raftpb.MessageType_MsgPreVote,
+		From:    2,
+		To:      1,
+		Term:    4,
+		Index:   0,
+		LogTerm: 0,
+	}))
+
+	require.Equal(t, Leader, leader.state, "leader must not step down on higher-term MsgPreVote")
+	require.Equal(t, uint64(3), leader.term, "leader's term must not change on MsgPreVote")
+}
+
+func TestGrantedPreVoteRespDoesNotDemoteSender_037n(t *testing.T) {
+	// Node 1 is PreCandidate at term 1, sends MsgPreVote with term 2.
+	n := newTestRaft(1)
+	n.peers = []uint64{2}
+
+	require.NoError(t, n.Campaign())
+	require.Equal(t, PreCandidate, n.state)
+	require.Equal(t, uint64(0), n.term)
+
+	// Receives granted MsgPreVoteResp with term 2 (the future term).
+	// m.Term > r.Term, but granted PreVoteResp must not trigger becomeFollower.
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type:   raftpb.MessageType_MsgPreVoteResp,
+		From:   2,
+		To:     n.id,
+		Term:   1, // term the PreCandidate proposed (r.term + 1)
+		Reject: false,
+	}))
+
+	// Should have advanced to Candidate, not stepped down to Follower.
+	require.Equal(t, Candidate, n.state, "granted PreVoteResp must not demote the sender")
 }

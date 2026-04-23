@@ -669,3 +669,37 @@ The lock and the watermark look like different abstractions, but they share the 
 - **Monotonic** (watermark, epoch, barrier): the value only moves forward. Once past your threshold, you're done forever. No re-check, no re-sleep, no herd.
 
 This is worth an article. The claim: most synchronization primitives are instances of the same pattern — "block until a value crosses a threshold" — and the design space is defined by two axes: (1) what the value represents, and (2) whether it's monotonic. The monotonic case is strictly simpler, and recognizing when your problem has a monotonic structure lets you pick a simpler primitive.
+
+---
+
+## 2026-04-23 — Show, Don't Tell
+
+### The lesson
+
+Adjectives like "extreme," "critical," "important," and "complex" are almost always a sign that the concrete detail is missing. If you have to *say* it's extreme, you haven't *shown* it yet.
+
+- ~~"In an extreme case, 3 nodes start PreVote simultaneously"~~
+- "In a 3-node cluster where all 3 nodes start PreVote simultaneously"
+
+The first tells the reader how to feel. The second tells them what happens — and they feel the extremity on their own. The second version is stronger because the reader did the work.
+
+### When adjectives belong
+
+Use adjectives when the reader cannot infer the quality from the facts alone:
+
+1. **Comparative judgment** — "the **naive** approach scans every entry." Without "naive," the reader sees two approaches but doesn't know which one is being evaluated critically.
+2. **Domain terms** — "**stale** log," "**committed** entry," "**non-exclusive** PreVote." Remove these and you lose meaning, not emphasis.
+3. **Deferred depth** — "This creates an **unpredictable** convergence time." You could show it with simulations, but that's a depth-2 digression. The adjective is a placeholder that says "I've thought about this, trust me for now."
+
+### The test
+
+Try removing the adjective. If the sentence loses *meaning*, keep it. If it only loses *emphasis*, cut it and add a concrete detail instead.
+
+### The deeper principle
+
+This is the "show, don't tell" rule. It applies everywhere in technical writing:
+
+- ~~"This is a very expensive operation"~~ → "This scans every entry in the log"
+- ~~"The failure is catastrophic"~~ → "The leader steps down and every in-flight write times out"
+
+The same instinct exists in Chinese writing: 少用形容词，多用动词. The principle is universal — it just occasionally gets overridden by the urge to signal importance to the reader.

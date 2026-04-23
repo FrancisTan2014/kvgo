@@ -19,6 +19,7 @@ type State uint8
 
 const (
 	Follower State = iota
+	PreCandidate
 	Candidate
 	Leader
 )
@@ -42,6 +43,14 @@ type Progress struct {
 	NextIndex    uint64
 	RecentActive bool
 }
+
+type VoteResult uint8
+
+const (
+	VotePending VoteResult = iota
+	VoteWon
+	VoteLost
+)
 
 /*
 Raft presents the pure state machine of the RAFT algorithm.
@@ -182,7 +191,7 @@ func (r *Raft) send(m *raftpb.Message) {
 		m.From = r.id
 	}
 	switch m.Type {
-	case raftpb.MessageType_MsgVote, raftpb.MessageType_MsgVoteResp:
+	case raftpb.MessageType_MsgPreVote, raftpb.MessageType_MsgPreVoteResp, raftpb.MessageType_MsgVote, raftpb.MessageType_MsgVoteResp:
 		if m.Term == 0 {
 			panic("term should be set when sending vote message")
 		}
@@ -245,25 +254,39 @@ func (r *Raft) CommitTo(index uint64) {
 }
 
 func (r *Raft) Step(m *raftpb.Message) error {
-	if m.Term > r.term {
-		// TODO: branch on m.Term vs r.term like etcd (greater, equal, lesser)
-		r.becomeFollower(m.Term, m.From)
+	switch {
+	case m.Term == 0:
+		// Local message — skip term checks.
+	case m.Term > r.term:
+		switch {
+		case m.Type == raftpb.MessageType_MsgPreVote:
+			// Never change our term in response to MsgPreVote
+		case m.Type == raftpb.MessageType_MsgPreVoteResp:
+			// PreVoteResp carries the proposed future term (granted) or
+			// the responder's term (rejected). Neither should trigger
+			// becomeFollower — let stepCandidate tally the result.
+		default:
+			r.becomeFollower(m.Term, m.From)
+		}
+
+	case m.Term < r.term:
+		switch {
+		case m.Type == raftpb.MessageType_MsgPreVote:
+			r.respondVote(m.From, false, raftpb.MessageType_MsgPreVoteResp, r.term)
+		}
 	}
 
 	switch m.Type {
+	case raftpb.MessageType_MsgPreVote:
+		granted := r.canVoteFor(m) && r.isCandidateUpToDate(m)
+		r.respondVote(m.From, granted, raftpb.MessageType_MsgPreVoteResp, m.Term)
+
 	case raftpb.MessageType_MsgVote:
-		rejected := m.Term < r.term ||
-			(m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From) ||
-			!r.isCandidateUpToDate(m)
-		if !rejected {
+		granted := r.canVoteFor(m) && r.isCandidateUpToDate(m)
+		if granted {
 			r.votedFor = m.From
 		}
-		r.send(&raftpb.Message{
-			Type:   raftpb.MessageType_MsgVoteResp,
-			To:     m.From,
-			Term:   r.term,
-			Reject: rejected,
-		})
+		r.respondVote(m.From, granted, raftpb.MessageType_MsgVoteResp, r.term)
 
 	case raftpb.MessageType_MsgHup:
 		if r.state == Leader {
@@ -271,18 +294,8 @@ func (r *Raft) Step(m *raftpb.Message) error {
 			return nil
 		}
 
-		r.becomeCandidate()
-
-		lastLog := r.lastLog()
-		for _, pid := range r.peers {
-			r.send(&raftpb.Message{
-				Type:    raftpb.MessageType_MsgVote,
-				To:      pid,
-				Term:    r.term,
-				Index:   lastLog.Index,
-				LogTerm: lastLog.Term,
-			})
-		}
+		r.becomePreCandidate()
+		r.bcastVote(raftpb.MessageType_MsgPreVote, r.term+1)
 
 	default:
 		return r.step(r, m)
@@ -444,22 +457,47 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 }
 
 func stepCandidate(r *Raft, m *raftpb.Message) error {
+	voteRespType := raftpb.MessageType_MsgPreVoteResp
+	if r.state == Candidate {
+		voteRespType = raftpb.MessageType_MsgVoteResp
+	}
+
 	switch m.Type {
 	case raftpb.MessageType_MsgProp:
 		r.logger.Info("proposal dropped: no leader during election", "node", r.id)
 		return ErrProposalDropped
 
-	case raftpb.MessageType_MsgVoteResp:
+	case voteRespType:
 		if m.Term < r.term {
 			return nil
 		}
-		if _, exists := r.votes[m.From]; !exists {
-			return nil
-		}
 		r.votes[m.From] = !m.Reject
-		if r.voteQuorumReached() {
-			r.becomeLeader()
+
+		vr := r.voteResult()
+		switch vr {
+		case VoteWon:
+			if r.state == PreCandidate {
+				r.becomeCandidate()
+				r.bcastVote(raftpb.MessageType_MsgVote, r.term)
+			} else {
+				r.becomeLeader()
+			}
+		case VoteLost:
+			r.becomeFollower(r.term, None)
+		case VotePending:
 		}
+
+	case raftpb.MessageType_MsgApp:
+		r.becomeFollower(m.Term, m.From)
+		r.handleAppendEntries(m)
+
+	case raftpb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+		r.handleHeartbeat(m)
+
+	case raftpb.MessageType_MsgSnap:
+		r.becomeFollower(m.Term, m.From)
+		r.handleSnapshot(m)
 
 	case raftpb.MessageType_MsgReadIndex:
 		// No leader during election — fast-fail so the caller doesn't wait
@@ -485,66 +523,17 @@ func stepFollower(r *Raft, m *raftpb.Message) error {
 	case raftpb.MessageType_MsgApp:
 		r.electionElapsed = 0
 		r.lead = m.From
-
-		if m.Commit > r.commitIndex {
-			r.CommitTo(m.Commit)
-		}
-
-		if len(m.Entries) == 0 {
-			return nil
-		}
-
-		resp := &raftpb.Message{
-			Type: raftpb.MessageType_MsgAppResp,
-			To:   m.From,
-		}
-		if r.anchorExists(m.Index, m.LogTerm) {
-			r.appendEntries(m.Entries)
-			last := m.Entries[len(m.Entries)-1]
-			resp.Index = last.Index
-			resp.LogTerm = last.Term
-		} else {
-			resp.Reject = true
-			resp.Index = m.Index
-			if snap, err := r.storage.Snapshot(); err == nil {
-				resp.RejectHint = snap.LastIncludedIndex
-			}
-		}
-		r.send(resp)
+		r.handleAppendEntries(m)
 
 	case raftpb.MessageType_MsgSnap:
-		if err := r.storage.ApplySnapshot(m.Snapshot); err != nil {
-			// TODO: log the failure
-			return nil
-		}
-
-		r.log = filterRetainedEntries(r.log, m.Snapshot.LastIncludedIndex)
-		if len(r.log) > 0 {
-			r.lastLogIndex = r.log[len(r.log)-1].Index
-		} else {
-			r.lastLogIndex = m.Snapshot.LastIncludedIndex
-		}
-		if r.stableIndex < m.Snapshot.LastIncludedIndex {
-			r.stableIndex = m.Snapshot.LastIncludedIndex
-		}
-		if r.commitIndex < m.Snapshot.LastIncludedIndex {
-			r.commitIndex = m.Snapshot.LastIncludedIndex
-		}
-		if r.appliedIndex < m.Snapshot.LastIncludedIndex {
-			r.appliedIndex = m.Snapshot.LastIncludedIndex
-		}
+		r.electionElapsed = 0
+		r.lead = m.From
+		r.handleSnapshot(m)
 
 	case raftpb.MessageType_MsgHeartbeat:
 		r.electionElapsed = 0
 		r.lead = m.From
-		if m.Commit > r.commitIndex {
-			r.CommitTo(m.Commit)
-		}
-		r.send(&raftpb.Message{
-			To:      m.From,
-			Type:    raftpb.MessageType_MsgHeartbeatResp,
-			Context: m.Context,
-		})
+		r.handleHeartbeat(m)
 
 	case raftpb.MessageType_MsgReadIndex:
 		if r.lead == None {
@@ -606,7 +595,7 @@ func (r *Raft) tickHeartbeat() {
 	r.heartbeatElapsed++
 	r.electionElapsed++
 
-	if r.electionElapsed >= r.electionTimeout { // NEW block
+	if r.electionElapsed >= r.electionTimeout {
 		r.electionElapsed = 0
 		if err := r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgCheckQuorum}); err != nil {
 			r.logger.Debug("check quorum step failed", "error", err)
@@ -645,16 +634,21 @@ func (r *Raft) becomeLeader() {
 	r.bcastAppend()
 }
 
+func (r *Raft) becomePreCandidate() {
+	r.state = PreCandidate
+	r.step = stepCandidate
+	r.tick = r.tickElection
+	r.lead = None
+	r.resetVotes()
+}
+
 func (r *Raft) becomeCandidate() {
 	r.state = Candidate
 	r.step = stepCandidate
 	r.tick = r.tickElection
 	r.reset(r.term + 1)
+	r.resetVotes()
 	r.votedFor = r.id
-	r.votes[r.id] = true
-	for _, pid := range r.peers {
-		r.votes[pid] = false
-	}
 }
 
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
@@ -966,5 +960,124 @@ func (r *Raft) hasQuorumActive() bool {
 func (r *Raft) resetRecentActive() {
 	for _, pr := range r.progress {
 		pr.RecentActive = false
+	}
+}
+
+func (r *Raft) resetVotes() {
+	r.votes = make(map[uint64]bool)
+	r.votes[r.id] = true
+}
+
+func (r *Raft) canVoteFor(m *raftpb.Message) bool {
+	if m.Term < r.term {
+		return false
+	}
+	if m.Term == r.term && r.votedFor != 0 && r.votedFor != m.From {
+		return false
+	}
+	return true
+}
+
+func (r *Raft) bcastVote(msgType raftpb.MessageType, term uint64) {
+	lastLog := r.lastLog()
+	for _, pid := range r.peers {
+		r.send(&raftpb.Message{
+			Type:    msgType,
+			To:      pid,
+			Term:    term,
+			Index:   lastLog.Index,
+			LogTerm: lastLog.Term,
+		})
+	}
+}
+
+func (r *Raft) respondVote(to uint64, granted bool, respType raftpb.MessageType, term uint64) {
+	r.send(&raftpb.Message{
+		Type:   respType,
+		To:     to,
+		Term:   term,
+		Reject: !granted,
+	})
+}
+
+func (r *Raft) voteResult() VoteResult {
+	granted, rejected := 0, 0
+	for _, v := range r.votes {
+		if v {
+			granted++
+		} else {
+			rejected++
+		}
+	}
+	quorum := (len(r.peers)+1)/2 + 1
+	if granted >= quorum {
+		return VoteWon
+	}
+	total := len(r.peers) + 1
+	if granted+(total-len(r.votes)) < quorum {
+		return VoteLost
+	}
+	return VotePending
+}
+
+func (r *Raft) handleAppendEntries(m *raftpb.Message) {
+	if m.Commit > r.commitIndex {
+		r.CommitTo(m.Commit)
+	}
+
+	if len(m.Entries) == 0 {
+		return
+	}
+
+	resp := &raftpb.Message{
+		Type: raftpb.MessageType_MsgAppResp,
+		To:   m.From,
+	}
+	if r.anchorExists(m.Index, m.LogTerm) {
+		r.appendEntries(m.Entries)
+		last := m.Entries[len(m.Entries)-1]
+		resp.Index = last.Index
+		resp.LogTerm = last.Term
+	} else {
+		resp.Reject = true
+		resp.Index = m.Index
+		if snap, err := r.storage.Snapshot(); err == nil {
+			resp.RejectHint = snap.LastIncludedIndex
+		}
+	}
+	r.send(resp)
+}
+
+func (r *Raft) handleHeartbeat(m *raftpb.Message) {
+	if m.Commit > r.commitIndex {
+		r.CommitTo(m.Commit)
+	}
+	r.send(&raftpb.Message{
+		To:      m.From,
+		Type:    raftpb.MessageType_MsgHeartbeatResp,
+		Context: m.Context,
+	})
+}
+
+func (r *Raft) handleSnapshot(m *raftpb.Message) {
+	if err := r.storage.ApplySnapshot(m.Snapshot); err != nil {
+		r.logger.Warn("failed to apply snapshot", "error", err)
+		return
+	}
+
+	r.log = filterRetainedEntries(r.log, m.Snapshot.LastIncludedIndex)
+	if len(r.log) > 0 {
+		r.lastLogIndex = r.log[len(r.log)-1].Index
+	} else {
+		r.lastLogIndex = m.Snapshot.LastIncludedIndex
+	}
+	if r.stableIndex < m.Snapshot.LastIncludedIndex {
+		r.stableIndex = m.Snapshot.LastIncludedIndex
+	}
+	if r.commitIndex < m.Snapshot.LastIncludedIndex {
+		r.commitIndex = m.Snapshot.LastIncludedIndex
+	}
+	if r.appliedIndex < m.Snapshot.LastIncludedIndex {
+		r.appliedIndex = m.Snapshot.LastIncludedIndex
 	}
 }
