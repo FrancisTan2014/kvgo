@@ -24,22 +24,24 @@ const (
 type MessageType int32
 
 const (
-	MessageType_MsgUnknown       MessageType = 0 // proto3 requires a zero value
-	MessageType_MsgApp           MessageType = 1
-	MessageType_MsgAppResp       MessageType = 2
-	MessageType_MsgVote          MessageType = 3
-	MessageType_MsgVoteResp      MessageType = 4
-	MessageType_MsgSnap          MessageType = 5
-	MessageType_MsgHup           MessageType = 6
-	MessageType_MsgBeat          MessageType = 7
-	MessageType_MsgProp          MessageType = 8
-	MessageType_MsgHeartbeat     MessageType = 9
-	MessageType_MsgHeartbeatResp MessageType = 10
-	MessageType_MsgReadIndex     MessageType = 11
-	MessageType_MsgReadIndexResp MessageType = 12
-	MessageType_MsgCheckQuorum   MessageType = 13
-	MessageType_MsgPreVote       MessageType = 14
-	MessageType_MsgPreVoteResp   MessageType = 15
+	MessageType_MsgUnknown        MessageType = 0 // proto3 requires a zero value
+	MessageType_MsgApp            MessageType = 1
+	MessageType_MsgAppResp        MessageType = 2
+	MessageType_MsgVote           MessageType = 3
+	MessageType_MsgVoteResp       MessageType = 4
+	MessageType_MsgSnap           MessageType = 5
+	MessageType_MsgHup            MessageType = 6
+	MessageType_MsgBeat           MessageType = 7
+	MessageType_MsgProp           MessageType = 8
+	MessageType_MsgHeartbeat      MessageType = 9
+	MessageType_MsgHeartbeatResp  MessageType = 10
+	MessageType_MsgReadIndex      MessageType = 11
+	MessageType_MsgReadIndexResp  MessageType = 12
+	MessageType_MsgCheckQuorum    MessageType = 13
+	MessageType_MsgPreVote        MessageType = 14
+	MessageType_MsgPreVoteResp    MessageType = 15
+	MessageType_MsgTransferLeader MessageType = 16
+	MessageType_MsgTimeoutNow     MessageType = 17
 )
 
 // Enum value maps for MessageType.
@@ -61,24 +63,28 @@ var (
 		13: "MsgCheckQuorum",
 		14: "MsgPreVote",
 		15: "MsgPreVoteResp",
+		16: "MsgTransferLeader",
+		17: "MsgTimeoutNow",
 	}
 	MessageType_value = map[string]int32{
-		"MsgUnknown":       0,
-		"MsgApp":           1,
-		"MsgAppResp":       2,
-		"MsgVote":          3,
-		"MsgVoteResp":      4,
-		"MsgSnap":          5,
-		"MsgHup":           6,
-		"MsgBeat":          7,
-		"MsgProp":          8,
-		"MsgHeartbeat":     9,
-		"MsgHeartbeatResp": 10,
-		"MsgReadIndex":     11,
-		"MsgReadIndexResp": 12,
-		"MsgCheckQuorum":   13,
-		"MsgPreVote":       14,
-		"MsgPreVoteResp":   15,
+		"MsgUnknown":        0,
+		"MsgApp":            1,
+		"MsgAppResp":        2,
+		"MsgVote":           3,
+		"MsgVoteResp":       4,
+		"MsgSnap":           5,
+		"MsgHup":            6,
+		"MsgBeat":           7,
+		"MsgProp":           8,
+		"MsgHeartbeat":      9,
+		"MsgHeartbeatResp":  10,
+		"MsgReadIndex":      11,
+		"MsgReadIndexResp":  12,
+		"MsgCheckQuorum":    13,
+		"MsgPreVote":        14,
+		"MsgPreVoteResp":    15,
+		"MsgTransferLeader": 16,
+		"MsgTimeoutNow":     17,
 	}
 )
 
@@ -444,7 +450,7 @@ const file_raftpb_raft_proto_rawDesc = "" +
 	" \x01(\x04R\n" +
 	"RejectHint\x120\n" +
 	"\bSnapshot\x18\v \x01(\v2\x14.raftpb.SnapshotMetaR\bSnapshot\x12\x18\n" +
-	"\aContext\x18\f \x01(\fR\aContext*\x92\x02\n" +
+	"\aContext\x18\f \x01(\fR\aContext*\xbc\x02\n" +
 	"\vMessageType\x12\x0e\n" +
 	"\n" +
 	"MsgUnknown\x10\x00\x12\n" +
@@ -467,7 +473,9 @@ const file_raftpb_raft_proto_rawDesc = "" +
 	"\x0eMsgCheckQuorum\x10\r\x12\x0e\n" +
 	"\n" +
 	"MsgPreVote\x10\x0e\x12\x12\n" +
-	"\x0eMsgPreVoteResp\x10\x0fB\rZ\vkvgo/raftpbb\x06proto3"
+	"\x0eMsgPreVoteResp\x10\x0f\x12\x15\n" +
+	"\x11MsgTransferLeader\x10\x10\x12\x11\n" +
+	"\rMsgTimeoutNow\x10\x11B\rZ\vkvgo/raftpbb\x06proto3"
 
 var (
 	file_raftpb_raft_proto_rawDescOnce sync.Once

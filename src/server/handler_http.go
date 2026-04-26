@@ -9,8 +9,8 @@ import (
 )
 
 // httpMux returns an HTTP handler that exposes a key-value API for external
-// testing tools (e.g. Jepsen). Reads go through the local state machine;
-// writes go through Raft propose-wait-apply — the same path as CmdPut.
+// testing tools (e.g. Jepsen). Both reads and writes go through Raft:
+// reads via ReadIndex, writes via propose-wait-apply.
 func (s *Server) httpMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /kv/{key}", s.httpGet)

@@ -3,22 +3,24 @@ package raftpb;
 option go_package = "kvgo/raftpb";
 
 enum MessageType {
-    MsgUnknown       = 0; // proto3 requires a zero value
-    MsgApp           = 1;
-    MsgAppResp       = 2;
-    MsgVote          = 3;
-    MsgVoteResp      = 4;
-    MsgSnap          = 5;
-    MsgHup           = 6;
-    MsgBeat          = 7;
-    MsgProp          = 8;
-    MsgHeartbeat     = 9;
-    MsgHeartbeatResp = 10;
-    MsgReadIndex     = 11;
-    MsgReadIndexResp = 12;
-    MsgCheckQuorum   = 13;
-    MsgPreVote       = 14;
-    MsgPreVoteResp   = 15;
+    MsgUnknown         = 0; // proto3 requires a zero value
+    MsgApp             = 1;
+    MsgAppResp         = 2;
+    MsgVote            = 3;
+    MsgVoteResp        = 4;
+    MsgSnap            = 5;
+    MsgHup             = 6;
+    MsgBeat            = 7;
+    MsgProp            = 8;
+    MsgHeartbeat       = 9;
+    MsgHeartbeatResp   = 10;
+    MsgReadIndex       = 11;
+    MsgReadIndexResp   = 12;
+    MsgCheckQuorum     = 13;
+    MsgPreVote         = 14;
+    MsgPreVoteResp     = 15;
+    MsgTransferLeader  = 16;
+    MsgTimeoutNow      = 17;
 }
 
 message Entry {

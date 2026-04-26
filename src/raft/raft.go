@@ -52,6 +52,14 @@ const (
 	VoteLost
 )
 
+type CampaignType string
+
+const (
+	CampaignPreElection CampaignType = "PreElection"
+	CampaignElection    CampaignType = "Election"
+	CampaignTransfer    CampaignType = "Transfer"
+)
+
 /*
 Raft presents the pure state machine of the RAFT algorithm.
 Invariants:
@@ -90,6 +98,8 @@ type Raft struct {
 	heartbeatElapsed          int
 	randomizedElectionTimeout int
 	randMu                    sync.Mutex
+
+	leadTransferee uint64
 
 	tick func()
 	step stepFunc
@@ -289,13 +299,7 @@ func (r *Raft) Step(m *raftpb.Message) error {
 		r.respondVote(m.From, granted, raftpb.MessageType_MsgVoteResp, r.term)
 
 	case raftpb.MessageType_MsgHup:
-		if r.state == Leader {
-			r.logger.Debug("ignoring MsgHup because already leader", "ID", r.id)
-			return nil
-		}
-
-		r.becomePreCandidate()
-		r.bcastVote(raftpb.MessageType_MsgPreVote, r.term+1)
+		r.hup(CampaignPreElection)
 
 	default:
 		return r.step(r, m)
@@ -382,6 +386,14 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 			prs.NextIndex = m.Index + 1
 		}
 
+		// 037o: if a leader transfer is in progress and the target just caught up,
+		// send MsgTimeoutNow to trigger the election.
+		if m.From == r.leadTransferee && prs.MatchIndex == r.lastLogIndex {
+			r.sendTimeoutNow(m.From)
+			r.logger.Info("target caught up, sent MsgTimeoutNow",
+				"id", r.id, "transferee", m.From)
+		}
+
 		median := r.getMedian()
 		if r.maybeCommit(median) {
 			// maybeCommit advanced commitIndex, and matchTerm confirmed the newly
@@ -393,6 +405,11 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		}
 
 	case raftpb.MessageType_MsgProp:
+		if r.leadTransferee != None {
+			r.logger.Debug("proposal dropped: leader transfer in progress",
+				"id", r.id, "term", r.term, "transferee", r.leadTransferee)
+			return ErrProposalDropped
+		}
 		if len(m.Entries) == 0 {
 			r.logger.Error("stepped empty MsgProp", "node", r.id)
 			panic("stepped empty MsgProp")
@@ -448,6 +465,37 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 			return nil
 		}
 		r.resetRecentActive()
+
+	case raftpb.MessageType_MsgTransferLeader:
+		leadTransferee := m.From
+		lastLeadTransferee := r.leadTransferee
+		if lastLeadTransferee != None {
+			if lastLeadTransferee == leadTransferee {
+				r.logger.Info("transfer leadership already in progress to same node",
+					"id", r.id, "term", r.term, "transferee", leadTransferee)
+				return nil
+			}
+			r.abortLeaderTransfer()
+			r.logger.Info("abort previous leader transfer",
+				"id", r.id, "term", r.term, "prev", lastLeadTransferee)
+		}
+		if leadTransferee == r.id {
+			r.logger.Debug("ignored transfer leadership to self", "id", r.id)
+			return nil
+		}
+		r.logger.Info("starting leader transfer",
+			"id", r.id, "term", r.term, "transferee", leadTransferee)
+		// Transfer leadership should be finished in one electionTimeout, so reset r.electionElapsed.
+		r.electionElapsed = 0
+		r.leadTransferee = leadTransferee
+		prs := r.progress[leadTransferee]
+		if prs.MatchIndex == r.lastLogIndex {
+			r.sendTimeoutNow(leadTransferee)
+			r.logger.Info("sent MsgTimeoutNow immediately, target log is up-to-date",
+				"id", r.id, "transferee", leadTransferee)
+		} else {
+			r.sendAppend(leadTransferee)
+		}
 
 	default:
 		// TODO: deal with the remaining message types
@@ -555,6 +603,17 @@ func stepFollower(r *Raft, m *raftpb.Message) error {
 			RequestCtx: m.Context,
 		})
 
+	case raftpb.MessageType_MsgTimeoutNow:
+		r.hup(CampaignTransfer)
+
+	case raftpb.MessageType_MsgTransferLeader:
+		if r.lead == None {
+			r.logger.Info("no leader, dropping MsgTransferLeader", "id", r.id)
+			return nil
+		}
+		m.To = r.lead
+		r.send(m)
+
 	default:
 		// TODO: deal with the remaining message types
 	}
@@ -599,6 +658,10 @@ func (r *Raft) tickHeartbeat() {
 		r.electionElapsed = 0
 		if err := r.Step(&raftpb.Message{Type: raftpb.MessageType_MsgCheckQuorum}); err != nil {
 			r.logger.Debug("check quorum step failed", "error", err)
+		}
+		// If current leader cannot transfer leadership in electionTimeout, it becomes leader again.
+		if r.state == Leader && r.leadTransferee != None {
+			r.abortLeaderTransfer()
 		}
 	}
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
@@ -669,6 +732,8 @@ func (r *Raft) reset(term uint64) {
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.resetRandomizedElectionTimeout()
+
+	r.abortLeaderTransfer()
 
 	r.votes = make(map[uint64]bool)
 	r.progress = nil
@@ -1080,4 +1145,32 @@ func (r *Raft) handleSnapshot(m *raftpb.Message) {
 	if r.appliedIndex < m.Snapshot.LastIncludedIndex {
 		r.appliedIndex = m.Snapshot.LastIncludedIndex
 	}
+}
+
+func (r *Raft) abortLeaderTransfer() {
+	r.leadTransferee = None
+}
+
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.send(&raftpb.Message{To: to, Type: raftpb.MessageType_MsgTimeoutNow})
+}
+
+func (r *Raft) hup(t CampaignType) {
+	if r.state == Leader {
+		r.logger.Debug("ignoring MsgHup because already leader", "ID", r.id)
+		return
+	}
+
+	var voteMsgType raftpb.MessageType
+	var term uint64
+	if t == CampaignPreElection {
+		r.becomePreCandidate()
+		voteMsgType = raftpb.MessageType_MsgPreVote
+		term = r.term + 1
+	} else {
+		r.becomeCandidate()
+		voteMsgType = raftpb.MessageType_MsgVote
+		term = r.term
+	}
+	r.bcastVote(voteMsgType, term)
 }

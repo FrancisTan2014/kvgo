@@ -2905,3 +2905,334 @@ func TestGrantedPreVoteRespDoesNotDemoteSender_037n(t *testing.T) {
 	// Should have advanced to Candidate, not stepped down to Follower.
 	require.Equal(t, Candidate, n.state, "granted PreVoteResp must not demote the sender")
 }
+
+// --- 037o: The Leader Transfer ---
+//
+// A leader wants to step down gracefully (e.g. rolling restart). Without
+// a transfer mechanism, the cluster must wait for the full election timeout
+// before any follower even starts campaigning. This test measures the gap.
+
+func TestPlannedLeaderStepDownCostsFullElectionTimeout_037o(t *testing.T) {
+	// Use a pre-built leader to avoid flaky election setup.
+	leader := newThreeNodeLeader(t)
+	require.Equal(t, Leader, leader.state)
+
+	// Build two followers at the same term that recognize node 1 as leader.
+	follower2 := newTestRaft(2)
+	follower2.peers = []uint64{1, 3}
+	follower2.becomeFollower(leader.term, leader.id)
+
+	follower3 := newTestRaft(3)
+	follower3.peers = []uint64{1, 2}
+	follower3.becomeFollower(leader.term, leader.id)
+
+	nodes := []*Raft{leader, follower2, follower3}
+
+	// Leader is about to be restarted. It stops ticking and sending.
+	// Only nodes 2 and 3 continue.
+	var ticksToNewLeader int
+	for tick := 0; tick < 200; tick++ {
+		ticksToNewLeader++
+		nodes[1].tick()
+		nodes[2].tick()
+		for _, src := range nodes[1:] {
+			rd := src.Ready()
+			for _, msg := range rd.Messages {
+				for _, dst := range nodes[1:] {
+					if dst.id == msg.To {
+						_ = dst.Step(msg)
+					}
+				}
+			}
+			src.Advance()
+		}
+		for _, n := range nodes[1:] {
+			if n.state == Leader {
+				t.Logf("ticksToNewLeader: %d  electionTimeout: %d", ticksToNewLeader, nodes[1].electionTimeout)
+				require.GreaterOrEqual(t, ticksToNewLeader, nodes[1].electionTimeout,
+					"new leader election requires at least electionTimeout ticks of downtime")
+				return
+			}
+		}
+	}
+	t.Fatal("no new leader elected within 200 ticks after leader went silent")
+}
+
+// deliverMessages delivers all pending messages between nodes in a single round.
+func deliverMessages(nodes []*Raft) {
+	for _, src := range nodes {
+		rd := src.Ready()
+		for _, msg := range rd.Messages {
+			for _, dst := range nodes {
+				if dst.id == msg.To {
+					_ = dst.Step(msg)
+				}
+			}
+		}
+		src.Advance()
+	}
+}
+
+// --- 037o: The Leader Transfer ---
+//
+// Invariant: a leader that initiates a transfer hands over leadership
+// within one round trip when the target is caught up, and aborts within
+// one election timeout when the target is unreachable.
+
+func TestCaughtUpTargetReceivesMsgTimeoutNowImmediately_037o(t *testing.T) {
+	leader := newThreeNodeLeader(t)
+
+	// Simulate peer 2 fully caught up.
+	leader.progress[2].MatchIndex = leader.lastLogIndex
+	leader.progress[2].NextIndex = leader.lastLogIndex + 1
+
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 2,
+	}))
+
+	rd := leader.Ready()
+	var found bool
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgTimeoutNow && msg.To == 2 {
+			found = true
+		}
+	}
+	require.True(t, found, "leader must send MsgTimeoutNow immediately to caught-up target")
+	require.Equal(t, uint64(2), leader.leadTransferee)
+}
+
+func TestBehindTargetIsCaughtUpFirst_037o(t *testing.T) {
+	leader := newThreeNodeLeader(t)
+
+	// Peer 2 is behind — MatchIndex < lastLogIndex.
+	leader.progress[2].MatchIndex = 0
+	leader.progress[2].NextIndex = 1
+
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 2,
+	}))
+
+	// Should send MsgApp to catch up, not MsgTimeoutNow.
+	rd := leader.Ready()
+	var hasApp, hasTimeout bool
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgApp && msg.To == 2 {
+			hasApp = true
+		}
+		if msg.Type == raftpb.MessageType_MsgTimeoutNow && msg.To == 2 {
+			hasTimeout = true
+		}
+	}
+	require.True(t, hasApp, "leader must send MsgApp to behind target")
+	require.False(t, hasTimeout, "leader must not send MsgTimeoutNow before target is caught up")
+	leader.Advance()
+
+	// Peer 2 catches up — MsgAppResp advances MatchIndex to lastLogIndex.
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type:  raftpb.MessageType_MsgAppResp,
+		From:  2,
+		Term:  leader.term,
+		Index: leader.lastLogIndex,
+	}))
+
+	rd = leader.Ready()
+	hasTimeout = false
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgTimeoutNow && msg.To == 2 {
+			hasTimeout = true
+		}
+	}
+	require.True(t, hasTimeout, "leader must send MsgTimeoutNow after target catches up")
+}
+
+func TestProposalsDroppedDuringTransfer_037o(t *testing.T) {
+	leader := newThreeNodeLeader(t)
+	leader.progress[2].MatchIndex = leader.lastLogIndex
+	leader.progress[2].NextIndex = leader.lastLogIndex + 1
+
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 2,
+	}))
+	require.NotEqual(t, None, leader.leadTransferee)
+
+	err := leader.Propose([]byte("should-be-dropped"))
+	require.ErrorIs(t, err, ErrProposalDropped)
+}
+
+func TestTransferAbortsOnTimeout_037o(t *testing.T) {
+	leader := newThreeNodeLeader(t)
+
+	// Peer 2 is behind and will never catch up (no messages delivered).
+	leader.progress[2].MatchIndex = 0
+	leader.progress[2].NextIndex = 1
+
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 2,
+	}))
+	require.Equal(t, uint64(2), leader.leadTransferee)
+	leader.Advance()
+
+	// Tick past electionTimeout — keep quorum alive so leader doesn't step down.
+	for i := 0; i < leader.electionTimeout; i++ {
+		leader.tickHeartbeat()
+		leader.Advance()
+		// Keep peer 3 responding to maintain quorum.
+		if i%3 == 0 {
+			require.NoError(t, leader.Step(&raftpb.Message{
+				Type: raftpb.MessageType_MsgHeartbeatResp,
+				From: 3,
+				Term: leader.term,
+			}))
+		}
+	}
+
+	require.Equal(t, Leader, leader.state, "leader must stay leader with quorum")
+	require.Equal(t, None, leader.leadTransferee, "transfer must abort after electionTimeout")
+
+	// Proposals should resume.
+	err := leader.Propose([]byte("after-abort"))
+	require.NoError(t, err)
+}
+
+func TestTargetCampaignsWithoutPreVote_037o(t *testing.T) {
+	follower := newTestRaft(2)
+	follower.peers = []uint64{1, 3}
+	follower.becomeFollower(1, 1)
+
+	require.NoError(t, follower.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTimeoutNow,
+		From: 1,
+		Term: 1,
+	}))
+
+	// Must become Candidate directly, skipping PreCandidate.
+	require.Equal(t, Candidate, follower.state,
+		"MsgTimeoutNow must trigger becomeCandidate, not becomePreCandidate")
+
+	// Must have sent MsgVote, not MsgPreVote.
+	rd := follower.Ready()
+	for _, msg := range rd.Messages {
+		require.NotEqual(t, raftpb.MessageType_MsgPreVote, msg.Type,
+			"transfer target must not send MsgPreVote")
+	}
+	var voteCount int
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgVote {
+			voteCount++
+		}
+	}
+	require.Equal(t, 2, voteCount, "MsgVote must be sent to all peers")
+}
+
+func TestTargetWinsElectionAndOldLeaderStepsDown_037o(t *testing.T) {
+	leader := newThreeNodeLeader(t)
+	leader.progress[2].MatchIndex = leader.lastLogIndex
+	leader.progress[2].NextIndex = leader.lastLogIndex + 1
+
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 2,
+	}))
+	leader.Advance()
+
+	// Target's MsgVote at the next term forces the old leader to step down.
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgVote,
+		From: 2,
+		Term: leader.term + 1,
+	}))
+
+	require.Equal(t, Follower, leader.state, "old leader must step down on target's MsgVote")
+	require.Equal(t, None, leader.leadTransferee, "leadTransferee must be cleared after step-down")
+}
+
+func TestConcurrentTransferReplacesPrevious_037o(t *testing.T) {
+	leader := newThreeNodeLeader(t)
+	leader.progress[2].MatchIndex = 0
+	leader.progress[2].NextIndex = 1
+	leader.progress[3].MatchIndex = leader.lastLogIndex
+	leader.progress[3].NextIndex = leader.lastLogIndex + 1
+
+	// Start transfer to node 2.
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 2,
+	}))
+	require.Equal(t, uint64(2), leader.leadTransferee)
+	leader.Advance()
+
+	// Second transfer to node 3 replaces the first.
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 3,
+	}))
+	require.Equal(t, uint64(3), leader.leadTransferee, "second transfer must replace the first")
+
+	// Node 3 is caught up — should get MsgTimeoutNow immediately.
+	rd := leader.Ready()
+	var found bool
+	for _, msg := range rd.Messages {
+		if msg.Type == raftpb.MessageType_MsgTimeoutNow && msg.To == 3 {
+			found = true
+		}
+	}
+	require.True(t, found, "new transfer target must receive MsgTimeoutNow")
+}
+
+func TestTransferToSelfIsIgnored_037o(t *testing.T) {
+	leader := newThreeNodeLeader(t)
+
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: leader.id,
+	}))
+
+	require.Equal(t, None, leader.leadTransferee, "transfer to self must be a no-op")
+	require.Equal(t, Leader, leader.state)
+}
+
+func TestFollowerForwardsMsgTransferLeaderToLeader_037o(t *testing.T) {
+	follower := newTestRaft(2)
+	follower.peers = []uint64{1, 3}
+	follower.becomeFollower(1, 1)
+	follower.Advance()
+
+	require.NoError(t, follower.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 3, // some external requestor
+	}))
+
+	rd := follower.Ready()
+	require.Len(t, rd.Messages, 1)
+	msg := rd.Messages[0]
+	require.Equal(t, raftpb.MessageType_MsgTransferLeader, msg.Type)
+	require.Equal(t, uint64(1), msg.To, "follower must forward MsgTransferLeader to leader")
+}
+
+func TestGuardClearedOnAnyStateTransition_037o(t *testing.T) {
+	leader := newThreeNodeLeader(t)
+	leader.progress[2].MatchIndex = 0
+	leader.progress[2].NextIndex = 1
+
+	// Start a transfer — guard is set.
+	require.NoError(t, leader.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgTransferLeader,
+		From: 2,
+	}))
+	require.Equal(t, uint64(2), leader.leadTransferee)
+
+	// Force CheckQuorum step-down — should clear the guard.
+	tickElectionWindow(leader)
+	require.Equal(t, Follower, leader.state)
+	require.Equal(t, None, leader.leadTransferee,
+		"leadTransferee must be cleared on state transition (CheckQuorum demotion)")
+
+	// Proposals should work after re-election.
+	leader.becomeLeader()
+	leader.Advance()
+	require.NoError(t, leader.Propose([]byte("after-demotion")))
+}

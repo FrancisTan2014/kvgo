@@ -703,3 +703,40 @@ This is the "show, don't tell" rule. It applies everywhere in technical writing:
 - ~~"The failure is catastrophic"~~ → "The leader steps down and every in-flight write times out"
 
 The same instinct exists in Chinese writing: 少用形容词，多用动词. The principle is universal — it just occasionally gets overridden by the urge to signal importance to the reader.
+
+---
+
+## 2026-04-26 — The Compression Is the Hard Part
+
+### The claim
+
+AI-assisted programming works when the human compresses the design until the spec is unambiguous. The AI then expands it into code mechanically. The compression is the hard part. The expansion is the easy part.
+
+### Why rough ideas fail
+
+An AI is a function: `f(spec) → code`. The quality of the output is bounded by the information content of the input. A rough idea has low information density — many possible interpretations, many valid implementations. The AI picks one. The probability that it picks *yours* decreases exponentially with ambiguity.
+
+A precise spec constrains the output space. Invariant + boundary + test list = enough information to produce one correct implementation. The AI becomes useful not because it's smart, but because the input is rich enough to make the mapping nearly deterministic.
+
+### What works
+
+The workflow that emerged from 037n and 037o:
+
+1. **Human** writes the design doc: invariant, reasoning chain, spec, test list.
+2. **AI** implements code + tests from the spec.
+3. **Human** reviews for gaps between intent and code — challenges what looks risky.
+4. **AI** fixes, re-runs, iterates.
+
+The human's irreplaceable contribution is knowing *what the system actually is* — not what it could be, not what etcd does, but what *this* codebase has today. That context is what makes the review effective.
+
+### Two dangers
+
+1. **The AI implements what you wrote, not what you meant.** The `resetVotes()` bug in 037n — the code matched the spec literally but broke because the spec didn't account for the map being nil. The human caught it because they understood the state machine.
+
+2. **The AI fills gaps with plausible defaults.** The learner guard in 037o — it looked correct, came from etcd, but didn't belong because learners don't exist in the codebase. The human caught it because they know what's real. The AI doesn't distinguish "exists in etcd" from "exists in our system."
+
+### The industry has it backwards
+
+"Describe what you want in natural language and AI writes the code" sells the illusion that `f` works on low-information inputs. It doesn't — it hides the ambiguity by making confident-looking choices the human then has to audit. The audit cost often exceeds the writing cost.
+
+The real leverage: human compresses the design, AI expands it into code. The compression requires understanding the problem. The expansion requires only following instructions. The first is engineering. The second is mechanical.
