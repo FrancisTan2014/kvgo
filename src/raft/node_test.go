@@ -95,9 +95,11 @@ func TestNodeCampaignExposesVoteMessages_036l(t *testing.T) {
 
 	require.NoError(t, n.Campaign(ctx))
 
+	// 038: Campaign enters PreCandidate first (PreVote). The first Ready
+	// carries MsgPreVote, not MsgVote.
 	rd := <-n.Ready()
 	require.Len(t, rd.Messages, 1)
-	require.Equal(t, raftpb.MessageType_MsgVote, rd.Messages[0].Type)
+	require.Equal(t, raftpb.MessageType_MsgPreVote, rd.Messages[0].Type)
 	require.Equal(t, uint64(2), rd.Messages[0].To)
 }
 
@@ -116,8 +118,10 @@ func TestNodeReadyCarriesHardStateFromRaft_036m(t *testing.T) {
 
 	require.NoError(t, n.Campaign(ctx))
 
+	// 038: Campaign enters PreCandidate first. PreCandidate does not advance
+	// term or set votedFor, so HardState is unchanged from the initial state.
 	rd := <-n.Ready()
-	require.Equal(t, &raftpb.HardState{Term: 1, VotedFor: 1, CommittedIndex: 0}, rd.HardState)
+	require.Equal(t, &raftpb.HardState{Term: 0, VotedFor: 0, CommittedIndex: 0}, rd.HardState)
 }
 
 func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {

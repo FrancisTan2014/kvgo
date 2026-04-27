@@ -171,6 +171,7 @@ func NewRaftHost(cfg RaftHostConfig) (*raftHost, error) {
 		transport:    cfg.Transport,
 		tickInterval: tickInterval,
 		applyc:       make(chan toApply, 1),
+		readStatec:   make(chan raft.ReadState, 1),
 		errc:         make(chan error, 1),
 		stopc:        make(chan struct{}),
 		done:         make(chan struct{}),

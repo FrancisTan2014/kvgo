@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"kvgo/raft/quorum"
 	"kvgo/raftpb"
 	"log/slog"
 	"math/big"
@@ -44,14 +45,6 @@ type Progress struct {
 	RecentActive bool
 }
 
-type VoteResult uint8
-
-const (
-	VotePending VoteResult = iota
-	VoteWon
-	VoteLost
-)
-
 type CampaignType string
 
 const (
@@ -84,6 +77,7 @@ type Raft struct {
 	peers    []uint64
 	votes    map[uint64]bool
 	votedFor uint64
+	config   quorum.MajorityConfig
 
 	readStates               []ReadState
 	readOnly                 *readOnly
@@ -145,6 +139,7 @@ func newRaft(cfg Config) *Raft {
 		heartbeatTimeout: cfg.HeartbeatTick,
 		electionTimeout:  cfg.ElectionTick,
 		logger:           cfg.Logger,
+		config:           buildMajorityConfig(cfg.ID, peers),
 	}
 
 	hs, err := cfg.Storage.InitialState()
@@ -187,6 +182,15 @@ func newRaft(cfg Config) *Raft {
 
 	r.becomeFollower(r.term, None)
 	return r
+}
+
+func buildMajorityConfig(self uint64, peers []uint64) quorum.MajorityConfig {
+	c := make(quorum.MajorityConfig)
+	c[self] = struct{}{}
+	for _, pid := range peers {
+		c[pid] = struct{}{}
+	}
+	return c
 }
 
 func (r *Raft) Propose(data []byte) error {
@@ -435,7 +439,8 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		}
 		if len(m.Context) > 0 {
 			acks := r.readOnly.recvAck(m.From, m.Context)
-			if r.hasQuorum(acks) {
+			voteResult := r.config.VoteResult(acks)
+			if voteResult == quorum.VoteWon {
 				rss := r.readOnly.advance(m)
 				for _, rs := range rss {
 					r.respondReadIndexReq(rs.req, rs.index)
@@ -521,18 +526,19 @@ func stepCandidate(r *Raft, m *raftpb.Message) error {
 		}
 		r.votes[m.From] = !m.Reject
 
-		vr := r.voteResult()
+		vr := r.config.VoteResult(r.votes)
 		switch vr {
-		case VoteWon:
+		case quorum.VoteWon:
 			if r.state == PreCandidate {
 				r.becomeCandidate()
+				r.votes[r.id] = true // self-vote for real election
 				r.bcastVote(raftpb.MessageType_MsgVote, r.term)
 			} else {
 				r.becomeLeader()
 			}
-		case VoteLost:
+		case quorum.VoteLost:
 			r.becomeFollower(r.term, None)
-		case VotePending:
+		case quorum.VotePending:
 		}
 
 	case raftpb.MessageType_MsgApp:
@@ -987,11 +993,6 @@ func (r *Raft) drainPendingReadIndexRequests() {
 	}
 }
 
-func (r *Raft) hasQuorum(acks map[uint64]bool) bool {
-	// peers excludes self, so total voting nodes = len(peers) + 1.
-	return len(acks) >= (len(r.peers)+1)/2+1
-}
-
 // appendEntry wraps data into a new Entry at the next index/current term and
 // appends it to the local log. It does not broadcast.
 func (r *Raft) appendEntry(data []byte) {
@@ -1013,13 +1014,12 @@ func (r *Raft) bcastAppend() {
 }
 
 func (r *Raft) hasQuorumActive() bool {
-	active := 1 // self
-	for _, pr := range r.progress {
-		if pr.RecentActive {
-			active++
-		}
+	votes := make(map[uint64]bool)
+	votes[r.id] = true
+	for pid, p := range r.progress {
+		votes[pid] = p.RecentActive
 	}
-	return active >= (len(r.peers)+1)/2+1
+	return r.config.VoteResult(votes) == quorum.VoteWon
 }
 
 func (r *Raft) resetRecentActive() {
@@ -1030,7 +1030,6 @@ func (r *Raft) resetRecentActive() {
 
 func (r *Raft) resetVotes() {
 	r.votes = make(map[uint64]bool)
-	r.votes[r.id] = true
 }
 
 func (r *Raft) canVoteFor(m *raftpb.Message) bool {
@@ -1063,26 +1062,6 @@ func (r *Raft) respondVote(to uint64, granted bool, respType raftpb.MessageType,
 		Term:   term,
 		Reject: !granted,
 	})
-}
-
-func (r *Raft) voteResult() VoteResult {
-	granted, rejected := 0, 0
-	for _, v := range r.votes {
-		if v {
-			granted++
-		} else {
-			rejected++
-		}
-	}
-	quorum := (len(r.peers)+1)/2 + 1
-	if granted >= quorum {
-		return VoteWon
-	}
-	total := len(r.peers) + 1
-	if granted+(total-len(r.votes)) < quorum {
-		return VoteLost
-	}
-	return VotePending
 }
 
 func (r *Raft) handleAppendEntries(m *raftpb.Message) {
@@ -1171,6 +1150,18 @@ func (r *Raft) hup(t CampaignType) {
 		r.becomeCandidate()
 		voteMsgType = raftpb.MessageType_MsgVote
 		term = r.term
+	}
+	// Record self-vote and check quorum immediately. For a single-node
+	// cluster this completes the election without any network messages.
+	r.votes[r.id] = true
+	if vr := r.config.VoteResult(r.votes); vr == quorum.VoteWon {
+		if t == CampaignPreElection {
+			// PreVote won — advance to real election.
+			r.hup(CampaignElection)
+		} else {
+			r.becomeLeader()
+		}
+		return
 	}
 	r.bcastVote(voteMsgType, term)
 }

@@ -110,6 +110,14 @@ func newTestRaft(id uint64) *Raft {
 	})
 }
 
+// setPeers sets the peer list and rebuilds the quorum config.
+// Tests that mutate peers after construction must use this instead of
+// assigning r.peers directly, so that r.config stays in sync.
+func (r *Raft) setPeers(peers []uint64) {
+	r.peers = peers
+	r.config = buildMajorityConfig(r.id, peers)
+}
+
 // campaignToCandidate drives a node through the PreVote stage into Candidate.
 // 037n: MsgHup now enters PreCandidate first. Tests that need Candidate state
 // must complete the PreVote round before asserting.
@@ -139,7 +147,7 @@ func campaignToCandidate(t *testing.T, r *Raft) {
 // Ready slate where the next Propose produces exactly one new entry.
 func newLeaderRaftWithOnePeer() *Raft {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.term = 1
 	r.becomeLeader()
 	// Commit the no-op (simulates quorum ack) so appliedIndex advances past it.
@@ -234,7 +242,7 @@ func TestReadyExposesCommittedEntsOnlyAfterCommitTo_036b(t *testing.T) {
 
 func TestReadyExposesHardStateAfterCampaign_036m(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 
 	// 037n: Campaign() now enters PreCandidate (term unchanged).
 	// Drive through PreVote to reach Candidate where term advances.
@@ -327,7 +335,7 @@ func TestNewEntryIsReadyAfterFollowerStepMsgApp_036f(t *testing.T) {
 	// carries entries from the beginning, including the no-op, so a
 	// fresh follower (empty log) can accept them (prevIndex=0).
 	leader := newTestRaft(1)
-	leader.peers = []uint64{2}
+	leader.setPeers([]uint64{2})
 	leader.term = 1
 	leader.becomeLeader()
 	leader.CommitTo(leader.lastLogIndex)
@@ -412,7 +420,7 @@ func TestCandidateDoesNotBecomeLeaderWithOnlySelfVote_036h(t *testing.T) {
 	voterId := uint64(2)
 
 	n := newTestRaft(1)
-	n.peers = append(n.peers, voterId)
+	n.setPeers(append(n.peers, voterId))
 
 	// 037n: drive through PreVote to reach Candidate.
 	campaignToCandidate(t, n)
@@ -443,7 +451,7 @@ func TestCandidateBecomesLeaderAfterMajorityVoteResponses_036h(t *testing.T) {
 	voterId := uint64(2)
 
 	n := newTestRaft(1)
-	n.peers = append(n.peers, voterId)
+	n.setPeers(append(n.peers, voterId))
 
 	// 037n: drive through PreVote to reach Candidate.
 	campaignToCandidate(t, n)
@@ -521,7 +529,7 @@ func TestStaleVoteRespIgnored_036h(t *testing.T) {
 
 	n := newTestRaft(1)
 	n.term = 1
-	n.peers = append(n.peers, voterId)
+	n.setPeers(append(n.peers, voterId))
 
 	// 037n: drive through PreVote to reach Candidate at term 2.
 	campaignToCandidate(t, n)
@@ -576,7 +584,7 @@ func TestCampaignIncludesLastLogPositionInVoteRequest_036i(t *testing.T) {
 	n := newTestRaft(1)
 	n.term = 2
 	n.log = append(n.log, &raftpb.Entry{Term: 2, Index: 2})
-	n.peers = append(n.peers, 2)
+	n.setPeers(append(n.peers, 2))
 
 	require.NoError(t, n.Campaign())
 
@@ -641,7 +649,7 @@ func TestHigherTermRejectionClearsVoteForLaterSameTermGrant_036j(t *testing.T) {
 
 func TestHigherTermGrantedVoteResponseMakesCandidateYield_036j(t *testing.T) {
 	n := newTestRaft(1)
-	n.peers = append(n.peers, 2)
+	n.setPeers(append(n.peers, 2))
 
 	// 037n: drive through PreVote to reach Candidate.
 	campaignToCandidate(t, n)
@@ -665,7 +673,7 @@ func TestHigherTermGrantedVoteResponseMakesCandidateYield_036j(t *testing.T) {
 
 func TestHigherTermVoteResponseClearsSelfVoteForLaterGrant_036j(t *testing.T) {
 	n := newTestRaft(2)
-	n.peers = append(n.peers, 1, 3)
+	n.setPeers(append(n.peers, 1, 3))
 
 	// 037n: drive through PreVote to reach Candidate.
 	campaignToCandidate(t, n)
@@ -861,8 +869,9 @@ func TestAppendAfterInstalledSnapshotIsReady_036k(t *testing.T) {
 
 func TestProgressInitializedOnElection_036n(t *testing.T) {
 	candidate := newTestRaft(1)
-	candidate.peers = []uint64{2}
+	candidate.setPeers([]uint64{2})
 	candidate.becomeCandidate()
+	candidate.votes[candidate.id] = true // self-vote
 	candidate.votes[2] = false
 
 	require.NoError(t, candidate.Step(&raftpb.Message{
@@ -909,7 +918,7 @@ func TestProposeSendsEntriesFromNextIndex_036n(t *testing.T) {
 
 func TestCommitAdvancesOnMajorityMatch_036n(t *testing.T) {
 	leader := newLeaderRaftWithOnePeer()
-	leader.peers = append(leader.peers, 3)
+	leader.setPeers(append(leader.peers, 3))
 
 	leader.lastLogIndex = 3
 	leader.log = []*raftpb.Entry{
@@ -976,7 +985,7 @@ func TestNextIndexBacksUpOnRejection_036n(t *testing.T) {
 
 func TestTickElectionProducesMsgHup_036t(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 
 	// Tick past the randomized election timeout.
 	// randomizedElectionTimeout ∈ [electionTimeout, 2*electionTimeout).
@@ -1037,7 +1046,7 @@ func TestTickHeartbeatProducesMsgHeartbeat_037h(t *testing.T) {
 
 func TestCandidateReElectsAtHigherTermOnTimeout_036t(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3}
+	r.setPeers([]uint64{2, 3})
 
 	// 037n: drive through PreVote to reach Candidate at term 1.
 	campaignToCandidate(t, r)
@@ -1129,7 +1138,7 @@ func TestNodeStepAcceptsMsgProp_037c(t *testing.T) {
 
 func TestFollowerResetsTimerOnLeaderContact_036t(t *testing.T) {
 	r := newTestRaft(2)
-	r.peers = []uint64{1}
+	r.setPeers([]uint64{1})
 	r.becomeFollower(1, 1)
 
 	// Tick close to election timeout, but send MsgApp from leader each time
@@ -1263,7 +1272,7 @@ func TestNewRaftRestoresPersistedState_036t(t *testing.T) {
 
 func TestFollowerForwardsMsgPropToLeader_037c(t *testing.T) {
 	r := newTestRaft(2)
-	r.peers = []uint64{1}
+	r.setPeers([]uint64{1})
 	r.becomeFollower(1, 1) // term=1, leader=1
 
 	err := r.Step(&raftpb.Message{
@@ -1282,7 +1291,7 @@ func TestFollowerForwardsMsgPropToLeader_037c(t *testing.T) {
 
 func TestFollowerDropsMsgPropWhenNoLeader_037c(t *testing.T) {
 	r := newTestRaft(2)
-	r.peers = []uint64{1}
+	r.setPeers([]uint64{1})
 	r.becomeFollower(1, None) // term=1, no leader known
 
 	err := r.Step(&raftpb.Message{
@@ -1297,7 +1306,7 @@ func TestFollowerDropsMsgPropWhenNoLeader_037c(t *testing.T) {
 
 func TestSendStampsFromOnAllMessages_037c(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.becomeLeader()
 	r.Advance()
 
@@ -1313,7 +1322,7 @@ func TestSendStampsFromOnAllMessages_037c(t *testing.T) {
 
 func TestSendStampsFromOnForwardedProp_037c(t *testing.T) {
 	r := newTestRaft(2)
-	r.peers = []uint64{1}
+	r.setPeers([]uint64{1})
 	r.becomeFollower(1, 1)
 
 	// MsgProp forwarded from follower — From was unset, send should fill it.
@@ -1329,7 +1338,7 @@ func TestSendStampsFromOnForwardedProp_037c(t *testing.T) {
 
 func TestCandidateDropsMsgProp_037c(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3}
+	r.setPeers([]uint64{2, 3})
 	r.becomeCandidate()
 
 	err := r.Step(&raftpb.Message{
@@ -1347,7 +1356,7 @@ func TestCandidateDropsMsgProp_037c(t *testing.T) {
 
 func TestLeaderPanicsOnEmptyMsgProp_037c(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.becomeLeader()
 	r.Advance()
 
@@ -1362,7 +1371,7 @@ func TestLeaderPanicsOnEmptyMsgProp_037c(t *testing.T) {
 func TestStaleLeaderReforwardsMsgProp_037c(t *testing.T) {
 	// Node 2 was leader, stepped down to follower in term 2 with leader=3.
 	r := newTestRaft(2)
-	r.peers = []uint64{1, 3}
+	r.setPeers([]uint64{1, 3})
 	r.becomeFollower(2, 3) // term=2, leader=3
 
 	// A MsgProp arrives from node 1 (forwarded during old term when node 2 was leader).
@@ -1857,7 +1866,7 @@ func TestReplayAfterCompactionBoundedByLog_037g(t *testing.T) {
 
 func TestHeartbeatCarriesCappedCommitIndex_037h(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3}
+	r.setPeers([]uint64{2, 3})
 	r.term = 1
 	r.becomeLeader()
 
@@ -1884,7 +1893,7 @@ func TestHeartbeatCarriesCappedCommitIndex_037h(t *testing.T) {
 
 func TestFollowerResetsElectionTimerOnHeartbeat_037h(t *testing.T) {
 	r := newTestRaft(2)
-	r.peers = []uint64{1}
+	r.setPeers([]uint64{1})
 	r.becomeFollower(1, 1)
 
 	// Advance election timer partway.
@@ -1903,7 +1912,7 @@ func TestFollowerResetsElectionTimerOnHeartbeat_037h(t *testing.T) {
 
 func TestFollowerAdvancesCommitOnHeartbeat_037h(t *testing.T) {
 	r := newTestRaft(2)
-	r.peers = []uint64{1}
+	r.setPeers([]uint64{1})
 	r.becomeFollower(1, 1)
 	r.log = []*raftpb.Entry{
 		{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1},
@@ -1925,7 +1934,7 @@ func TestFollowerAdvancesCommitOnHeartbeat_037h(t *testing.T) {
 
 func TestFollowerRespondsWithMsgHeartbeatResp_037h(t *testing.T) {
 	r := newTestRaft(2)
-	r.peers = []uint64{1}
+	r.setPeers([]uint64{1})
 	r.becomeFollower(1, 1)
 
 	require.NoError(t, r.Step(&raftpb.Message{
@@ -1942,7 +1951,7 @@ func TestFollowerRespondsWithMsgHeartbeatResp_037h(t *testing.T) {
 
 func TestLeaderSendsMsgAppAfterHeartbeatRespFromBehindPeer_037h(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.term = 1
 	r.becomeLeader()
 	r.log = []*raftpb.Entry{
@@ -1970,7 +1979,7 @@ func TestLeaderSendsMsgAppAfterHeartbeatRespFromBehindPeer_037h(t *testing.T) {
 
 func TestLeaderSkipsMsgAppAfterHeartbeatRespFromCaughtUpPeer_037h(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.term = 1
 	r.becomeLeader()
 	r.log = []*raftpb.Entry{
@@ -2038,7 +2047,7 @@ func TestHeartbeatDoesNotInterfereWithReplication_037h(t *testing.T) {
 
 func TestHeartbeatRespSendsSnapshotWhenAnchorIsCompacted_037h(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.term = 1
 	r.becomeLeader()
 	r.storage = &mockStorage{
@@ -2076,7 +2085,7 @@ func TestHeartbeatRespSendsSnapshotWhenAnchorIsCompacted_037h(t *testing.T) {
 // will eventually flip to true (unblocking ReadIndex).
 func TestBecomeLeaderAppendsNoOpEntry_037l(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.term = 1
 	r.becomeLeader()
 
@@ -2129,7 +2138,7 @@ func TestStepFollowerReadIndexWithoutLeaderIsDropped_037l(t *testing.T) {
 
 func TestStepCandidateReadIndexIsDropped_037l(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.becomeCandidate()
 
 	err := r.Step(&raftpb.Message{
@@ -2144,7 +2153,7 @@ func TestStepCandidateReadIndexIsDropped_037l(t *testing.T) {
 // a higher index, which then carries the prior-term entries with it.
 func TestMaybeCommitSkipsPreviousTermMedian_037l(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3}
+	r.setPeers([]uint64{2, 3})
 	r.term = 2
 	r.state = Leader
 	r.step = stepLeader
@@ -2175,7 +2184,7 @@ func TestMaybeCommitSkipsPreviousTermMedian_037l(t *testing.T) {
 // (Concurrent-reader correlation is #16.)
 func TestLeaderReadIndexReturnsReadState_037l(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3}
+	r.setPeers([]uint64{2, 3})
 	r.term = 1
 	r.becomeLeader()
 	// Pre-populate storage so matchTerm(1) is true. Without this the
@@ -2225,7 +2234,7 @@ func TestLeaderReadIndexReturnsReadState_037l(t *testing.T) {
 // releases the first.
 func TestLeaderReadIndexConcurrentRctxCorrelation_037l(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3}
+	r.setPeers([]uint64{2, 3})
 	r.term = 1
 	r.becomeLeader()
 	r.storage = &mockStorage{
@@ -2265,7 +2274,7 @@ func TestLeaderReadIndexConcurrentRctxCorrelation_037l(t *testing.T) {
 // targets r.lead.
 func TestFollowerForwardsMsgReadIndexToLeader_037l(t *testing.T) {
 	r := newTestRaft(2)
-	r.peers = []uint64{1, 3}
+	r.setPeers([]uint64{1, 3})
 	r.becomeFollower(1, 1) // term=1, lead=1
 	r.Advance()
 
@@ -2290,7 +2299,7 @@ func TestFollowerForwardsMsgReadIndexToLeader_037l(t *testing.T) {
 // pending in readOnly until quorum arrives or the caller times out.
 func TestLeaderWithoutQuorumDoesNotEmitReadState_037l(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3, 4, 5} // quorum = 3
+	r.setPeers([]uint64{2, 3, 4, 5}) // quorum = 3
 	r.term = 1
 	r.becomeLeader()
 	r.storage = &mockStorage{
@@ -2322,7 +2331,7 @@ func TestLeaderWithoutQuorumDoesNotEmitReadState_037l(t *testing.T) {
 // drains and the request is processed.
 func TestReadIndexPostponedUntilCurrentTermCommit_037l(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2}
+	r.setPeers([]uint64{2})
 	r.term = 2
 	r.becomeLeader()
 	// becomeLeader appended a term-2 no-op at index 1. Pre-populate storage
@@ -2378,7 +2387,7 @@ func TestReadIndexPostponedUntilCurrentTermCommit_037l(t *testing.T) {
 func newThreeNodeLeader(t *testing.T) *Raft {
 	t.Helper()
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3}
+	r.setPeers([]uint64{2, 3})
 	r.term = 1
 	r.becomeLeader()
 	r.storage = &mockStorage{
@@ -2432,7 +2441,7 @@ func TestLeaderStaysLeaderWithQuorumResponses_037m(t *testing.T) {
 
 func TestSubQuorumResponsesNotEnough_037m(t *testing.T) {
 	r := newTestRaft(1)
-	r.peers = []uint64{2, 3, 4, 5} // 5-node cluster, quorum = 3
+	r.setPeers([]uint64{2, 3, 4, 5}) // 5-node cluster, quorum = 3
 	r.term = 1
 	r.becomeLeader()
 	r.storage = &mockStorage{
@@ -2613,7 +2622,7 @@ func TestPartitionedNodeDisruptsLeaderWithStaleVote_037n(t *testing.T) {
 	// 037n: with PreVote enabled, the partitioned node sends MsgPreVote,
 	// not MsgVote. Its local term stays at 1 (no advance).
 	isolated := newTestRaft(3)
-	isolated.peers = []uint64{1, 2}
+	isolated.setPeers([]uint64{1, 2})
 	isolated.term = 1
 	isolated.becomePreCandidate()
 
@@ -2638,7 +2647,7 @@ func TestPartitionedNodeDisruptsLeaderWithStaleVote_037n(t *testing.T) {
 func TestPreVoteQuorumRequiredBeforeTermAdvance_037n(t *testing.T) {
 	// 3-node cluster: node 1 (self) + peers [2, 3]. Quorum = 2.
 	n := newTestRaft(1)
-	n.peers = []uint64{2, 3}
+	n.setPeers([]uint64{2, 3})
 
 	require.NoError(t, n.Campaign())
 	require.Equal(t, PreCandidate, n.state)
@@ -2668,7 +2677,7 @@ func TestPreVoteQuorumRequiredBeforeTermAdvance_037n(t *testing.T) {
 func TestPreVoteGrantsAreNonExclusive_037n(t *testing.T) {
 	// Node 3 (voter) receives MsgPreVote from two different candidates.
 	voter := newTestRaft(3)
-	voter.peers = []uint64{1, 2}
+	voter.setPeers([]uint64{1, 2})
 	voter.term = 1
 
 	// Candidate 1 sends MsgPreVote.
@@ -2704,7 +2713,7 @@ func TestPreVoteGrantsAreNonExclusive_037n(t *testing.T) {
 
 func TestCandidateStepsDownOnSameTermAuthority_037n(t *testing.T) {
 	n := newTestRaft(1)
-	n.peers = []uint64{2, 3}
+	n.setPeers([]uint64{2, 3})
 
 	// Drive to Candidate at term 1.
 	campaignToCandidate(t, n)
@@ -2729,7 +2738,7 @@ func TestCandidateStepsDownOnSameTermAuthority_037n(t *testing.T) {
 
 func TestPreVoteDoesNotSetVotedFor_037n(t *testing.T) {
 	voter := newTestRaft(3)
-	voter.peers = []uint64{1, 2}
+	voter.setPeers([]uint64{1, 2})
 	voter.term = 1
 
 	// Grant PreVote to candidate 1.
@@ -2767,7 +2776,7 @@ func TestSimultaneousPreVoteResolvesInOneRound_037n(t *testing.T) {
 			}
 		}
 		nodes[i] = newTestRaft(id)
-		nodes[i].peers = peers
+		nodes[i].setPeers(peers)
 	}
 
 	// Force nodes 1 and 2 to campaign simultaneously.
@@ -2808,7 +2817,7 @@ func TestSimultaneousPreVoteResolvesInOneRound_037n(t *testing.T) {
 func TestPreVoteRejectedByHigherTermNode_037n(t *testing.T) {
 	// Node at term 5 receives MsgPreVote asking for term 3.
 	n := newTestRaft(1)
-	n.peers = []uint64{2}
+	n.setPeers([]uint64{2})
 	n.term = 5
 
 	require.NoError(t, n.Step(&raftpb.Message{
@@ -2835,7 +2844,7 @@ func TestPreVoteRejectedByHigherTermNode_037n(t *testing.T) {
 func TestMajorityRejectionTriggersImmediateStepDown_037n(t *testing.T) {
 	// 3-node cluster: node 1 (self) + peers [2, 3]. Quorum = 2.
 	n := newTestRaft(1)
-	n.peers = []uint64{2, 3}
+	n.setPeers([]uint64{2, 3})
 
 	require.NoError(t, n.Campaign())
 	require.Equal(t, PreCandidate, n.state)
@@ -2864,7 +2873,7 @@ func TestMajorityRejectionTriggersImmediateStepDown_037n(t *testing.T) {
 func TestHigherTermPreVoteDoesNotDemoteReceiver_037n(t *testing.T) {
 	// Node 1 is a leader at term 3.
 	leader := newTestRaft(1)
-	leader.peers = []uint64{2}
+	leader.setPeers([]uint64{2})
 	leader.term = 3
 	leader.becomeLeader()
 	leader.Advance()
@@ -2886,7 +2895,7 @@ func TestHigherTermPreVoteDoesNotDemoteReceiver_037n(t *testing.T) {
 func TestGrantedPreVoteRespDoesNotDemoteSender_037n(t *testing.T) {
 	// Node 1 is PreCandidate at term 1, sends MsgPreVote with term 2.
 	n := newTestRaft(1)
-	n.peers = []uint64{2}
+	n.setPeers([]uint64{2})
 
 	require.NoError(t, n.Campaign())
 	require.Equal(t, PreCandidate, n.state)
@@ -2919,11 +2928,11 @@ func TestPlannedLeaderStepDownCostsFullElectionTimeout_037o(t *testing.T) {
 
 	// Build two followers at the same term that recognize node 1 as leader.
 	follower2 := newTestRaft(2)
-	follower2.peers = []uint64{1, 3}
+	follower2.setPeers([]uint64{1, 3})
 	follower2.becomeFollower(leader.term, leader.id)
 
 	follower3 := newTestRaft(3)
-	follower3.peers = []uint64{1, 2}
+	follower3.setPeers([]uint64{1, 2})
 	follower3.becomeFollower(leader.term, leader.id)
 
 	nodes := []*Raft{leader, follower2, follower3}
@@ -3100,7 +3109,7 @@ func TestTransferAbortsOnTimeout_037o(t *testing.T) {
 
 func TestTargetCampaignsWithoutPreVote_037o(t *testing.T) {
 	follower := newTestRaft(2)
-	follower.peers = []uint64{1, 3}
+	follower.setPeers([]uint64{1, 3})
 	follower.becomeFollower(1, 1)
 
 	require.NoError(t, follower.Step(&raftpb.Message{
@@ -3197,7 +3206,7 @@ func TestTransferToSelfIsIgnored_037o(t *testing.T) {
 
 func TestFollowerForwardsMsgTransferLeaderToLeader_037o(t *testing.T) {
 	follower := newTestRaft(2)
-	follower.peers = []uint64{1, 3}
+	follower.setPeers([]uint64{1, 3})
 	follower.becomeFollower(1, 1)
 	follower.Advance()
 
@@ -3235,4 +3244,83 @@ func TestGuardClearedOnAnyStateTransition_037o(t *testing.T) {
 	leader.becomeLeader()
 	leader.Advance()
 	require.NoError(t, leader.Propose([]byte("after-demotion")))
+}
+
+// ---------------------------------------------------------------------------
+// 038 — The Majority
+// ---------------------------------------------------------------------------
+
+func TestSingleNodeElectionCompletes_038(t *testing.T) {
+	// A Raft node with no peers must transition Follower → Leader
+	// after one election timeout, without any external messages.
+	n := newTestRaft(1) // no peers — single-node cluster
+
+	// Tick past election timeout.
+	for i := 0; i <= n.electionTimeout*2; i++ {
+		n.tick()
+	}
+
+	require.Equal(t, Leader, n.state, "single-node must self-elect")
+	require.Equal(t, n.id, n.lead, "leader must be self")
+}
+
+func TestSingleNodeReadIndexResolvesWithoutHeartbeat_038(t *testing.T) {
+	n := newTestRaft(1)
+	// Self-elect: tick past election timeout.
+	for i := 0; i <= n.electionTimeout*2; i++ {
+		n.tick()
+	}
+	require.Equal(t, Leader, n.state)
+	n.Advance()
+
+	// Commit the no-op so we have a current-term committed entry.
+	n.CommitTo(n.lastLogIndex)
+	n.Advance()
+
+	// Issue ReadIndex.
+	rctx := []byte("read-ctx")
+	require.NoError(t, n.ReadIndex(rctx))
+
+	rd := n.Ready()
+	// Must produce a ReadState without sending any MsgHeartbeat.
+	for _, msg := range rd.Messages {
+		require.NotEqual(t, raftpb.MessageType_MsgHeartbeat, msg.Type,
+			"single-node ReadIndex must not send heartbeat")
+	}
+	require.Len(t, rd.ReadStates, 1, "must produce exactly one ReadState")
+	require.Equal(t, rctx, rd.ReadStates[0].RequestCtx)
+}
+
+func TestSingleNodeCheckQuorumIsNoOp_038(t *testing.T) {
+	n := newTestRaft(1)
+	for i := 0; i <= n.electionTimeout*2; i++ {
+		n.tick()
+	}
+	require.Equal(t, Leader, n.state)
+	n.Advance()
+
+	// Tick through a full election window with no peer responses.
+	for i := 0; i < n.electionTimeout; i++ {
+		n.tickHeartbeat()
+		n.Advance()
+	}
+
+	require.Equal(t, Leader, n.state, "single-node leader must survive CheckQuorum")
+}
+
+func TestThreeNodeElectionStillWorks_038(t *testing.T) {
+	n := newTestRaft(1)
+	n.setPeers([]uint64{2, 3})
+
+	campaignToCandidate(t, n)
+	require.Equal(t, Candidate, n.state)
+
+	// Peer 2 grants, peer 3 silent — majority reached.
+	require.NoError(t, n.Step(&raftpb.Message{
+		Type: raftpb.MessageType_MsgVoteResp,
+		From: 2,
+		Term: n.term,
+	}))
+
+	require.Equal(t, Leader, n.state, "must become leader with majority grant")
 }

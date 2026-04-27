@@ -740,3 +740,53 @@ The human's irreplaceable contribution is knowing *what the system actually is* 
 "Describe what you want in natural language and AI writes the code" sells the illusion that `f` works on low-information inputs. It doesn't — it hides the ambiguity by making confident-looking choices the human then has to audit. The audit cost often exceeds the writing cost.
 
 The real leverage: human compresses the design, AI expands it into code. The compression requires understanding the problem. The expansion requires only following instructions. The first is engineering. The second is mechanical.
+
+---
+
+## 2026-04-27 — Debugging a Silent Channel: How to Find a Nil
+
+### The incident
+
+Episode 038. A 3-node integration test (`TestHTTPPutGetIntegration_037j`) timed out on HTTP GET. PUT succeeded. GET returned 504 after 5 seconds. No error, no panic, no log. The failure was total silence.
+
+### Bottom-up: the systematic search
+
+The first hypothesis was wrong. I assumed `committedEntryInCurrentTerm()` was broken by compaction — a plausible theory that fit the symptom. Before writing a single fix, I checked etcd's implementation of the same function. etcd's `raftLog.term()` checks the unstable log first, then storage. Our `storage.Term()` also handles the snapshot boundary correctly. Compaction was not the cause. The hypothesis saved time anyway — it eliminated a large branch of the search tree.
+
+The real search went through seven rounds of instrumentation, each one narrowing the scope:
+
+1. **Response body** — confirmed the 504 came from `proposeRead` returning `context.DeadlineExceeded`, not from a missing key or a protocol error.
+2. **proposeRead path** — added logging at each stage. `ReadIndex` was submitted without error. The timeout was on waiting for `ReadState` — the channel never delivered.
+3. **Raft stepLeader** — added `slog` at the `MsgReadIndex` handler. Nothing appeared. First wrong conclusion: "the node isn't leader." But `raftHost.LeaderID()` said it was.
+4. **Logger mismatch** — realized the Raft struct's logger was `noopLogger` (set at construction time), while the test's debug logger was set after construction. Switched to `fmt.Printf` to bypass the logger entirely.
+5. **Raft state confirmed** — `fmt.Printf` showed the node was Leader (`state=3`), the ReadIndex heartbeat round completed, quorum was reached, `respondReadIndexReq` was called.
+6. **handleBatch** — added traces at the `readStatec <- rs` send. The "forwarding ReadStates" log appeared, but the "sent" log after the channel send did not. The send was blocked.
+7. **Node identity** — added the node ID to each trace. Confirmed the blocked send was on the *leader's own* `readStatec`. The leader's `s.run()` was idle in `select`, ready to receive — but the channel was nil.
+
+Total wall-clock time: ~30 minutes. Each round answered exactly one question and raised the next.
+
+### Top-down: the structural lesson
+
+The root cause was one missing line: `readStatec: make(chan raft.ReadState, 1)` in `NewRaftHost`. The internal constructor `newRaftHost` had it. The public constructor `NewRaftHost` did not. Unit tests used the internal constructor; integration tests used the public one. The bug was invisible to every test except the one that exercised the full ReadIndex → ReadState → `readStatec` → `s.run()` path through the public constructor.
+
+**Why it was hard to find:** a nil channel in Go does not panic on send. It blocks forever. No error, no log, no stack trace. The symptom ("ReadState never arrived") pointed everywhere except the channel itself.
+
+### Checklist: constructor parity
+
+When a package has two constructors (internal for tests, public for production), the following must match:
+
+1. **Every channel initialized** — a nil channel blocks silently on both send and receive.
+2. **Every map initialized** — a nil map panics on write but not on read.
+3. **Every default applied** — if the internal constructor sets a default, the public one must too.
+
+A mechanical check: diff the two constructor bodies field by field. If a field appears in one but not the other, that's a bug until proven otherwise.
+
+### Checklist: debugging silent failures
+
+When a goroutine hangs with no error and no log:
+
+1. **Identify the blocked operation** — which channel send/receive, which lock, which I/O call.
+2. **Check for nil channels** — a nil channel blocks forever on both send and receive. This is Go's most silent failure mode.
+3. **Check the logger** — if instrumentation produces no output, the logger itself might be discarding. Use `fmt.Printf` to bypass.
+4. **Trace with node identity** — in multi-node tests, every trace line must say *which* node produced it. "handleBatch forwarding ReadStates" is useless without knowing which of 3 nodes said it.
+5. **Narrow before theorizing** — each instrumentation round should answer one question. Resist the urge to build a theory until the blocked operation is identified.
