@@ -262,6 +262,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `start` is generic; `launch` is more dramatic; `fork` implies duplication; `spawn` specifically connotes creating something that lives on its own
 - **where it breaks:** too informal for describing static structure; best reserved for runtime creation of concurrent activity
 
+## symptom
+- **meaning:** an observable effect of a deeper problem, not the problem itself
+- **pressure:** use it when a fix addresses what you see (the error, the timeout, the crash) without reaching the root cause — "this patch fixes the symptom"
+- **tone:** diagnostic, slightly cautionary — implies more digging is needed
+- **nearby alternatives:** `sign` is neutral and broader; `manifestation` is formal; `indicator` is weaker; `symptom` specifically implies a hidden cause that the visible effect does not explain
+- **where it breaks:** do not use it when the visible problem IS the root cause; "symptom" always implies something deeper exists
+
 ## speculative
 - **meaning:** based on guessing or theorizing without evidence
 - **pressure:** use it when a design choice solves future pressure that has not appeared yet

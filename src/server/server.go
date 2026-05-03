@@ -463,6 +463,11 @@ func (s *Server) applyBatch(ap toApply) {
 }
 
 func (s *Server) applyEntry(raw []byte) {
+	if len(raw) == 0 {
+		// no-op entry
+		return
+	}
+
 	id, payload, err := unmarshalEnvelope(raw)
 	if err != nil {
 		s.log().Warn("apply: malformed envelope", "error", err)

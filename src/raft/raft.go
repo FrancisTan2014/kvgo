@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"kvgo/raft/quorum"
+	"kvgo/raft/tracker"
 	"kvgo/raftpb"
 	"log/slog"
 	"math/big"
-	"sort"
 	"sync"
 )
 
@@ -39,12 +39,6 @@ type Ready struct {
 	ReadStates       []ReadState
 }
 
-type Progress struct {
-	MatchIndex   uint64
-	NextIndex    uint64
-	RecentActive bool
-}
-
 type CampaignType string
 
 const (
@@ -72,12 +66,11 @@ type Raft struct {
 	lastLogIndex uint64
 	stableIndex  uint64
 
-	messages []*raftpb.Message
-	progress map[uint64]*Progress
-	peers    []uint64
-	votes    map[uint64]bool
-	votedFor uint64
-	config   quorum.MajorityConfig
+	messages        []*raftpb.Message
+	msgsAfterAppend []*raftpb.Message
+	trk             *tracker.ProgressTracker
+	peers           []uint64
+	votedFor        uint64
 
 	readStates               []ReadState
 	readOnly                 *readOnly
@@ -129,17 +122,23 @@ func newRaft(cfg Config) *Raft {
 	peers := make([]uint64, len(cfg.Peers))
 	copy(peers, cfg.Peers)
 
+	trk := tracker.NewTracker(cfg.ID, buildMajorityConfig(cfg.ID, peers))
+	for _, pid := range peers {
+		trk.InitProgress(pid, 0, 1)
+	}
+
 	r := &Raft{
 		id:               cfg.ID,
 		log:              make([]*raftpb.Entry, 0),
 		peers:            peers,
 		messages:         make([]*raftpb.Message, 0),
+		msgsAfterAppend:  make([]*raftpb.Message, 0),
+		trk:              trk,
 		readOnly:         newReadOnly(),
 		storage:          cfg.Storage,
 		heartbeatTimeout: cfg.HeartbeatTick,
 		electionTimeout:  cfg.ElectionTick,
 		logger:           cfg.Logger,
-		config:           buildMajorityConfig(cfg.ID, peers),
 	}
 
 	hs, err := cfg.Storage.InitialState()
@@ -214,7 +213,15 @@ func (r *Raft) send(m *raftpb.Message) {
 	default:
 		m.Term = r.term
 	}
-	r.messages = append(r.messages, m)
+
+	switch m.Type {
+	case raftpb.MessageType_MsgAppResp,
+		raftpb.MessageType_MsgVoteResp,
+		raftpb.MessageType_MsgPreVoteResp:
+		r.msgsAfterAppend = append(r.msgsAfterAppend, m)
+	default:
+		r.messages = append(r.messages, m)
+	}
 }
 
 func (r *Raft) HardState() *raftpb.HardState {
@@ -232,11 +239,18 @@ func IsEmptyHardState(hard *raftpb.HardState) bool {
 }
 
 func (r *Raft) Ready() Ready {
+	msgs := make([]*raftpb.Message, 0, len(r.messages)+len(r.msgsAfterAppend))
+	msgs = append(msgs, r.messages...)
+	for _, m := range r.msgsAfterAppend {
+		if m.To != r.id {
+			msgs = append(msgs, m)
+		}
+	}
 	return Ready{
 		Lead:             r.lead,
 		Entries:          r.entriesBetween(r.stableIndex, r.lastLogIndex),
 		CommittedEntries: r.entriesBetween(r.appliedIndex, r.commitIndex),
-		Messages:         r.messages,
+		Messages:         msgs,
 		HardState:        r.HardState(),
 		ReadStates:       r.readStates,
 	}
@@ -244,6 +258,7 @@ func (r *Raft) Ready() Ready {
 
 func (r *Raft) HasReady() bool {
 	return len(r.messages) > 0 ||
+		len(r.msgsAfterAppend) > 0 ||
 		len(r.readStates) > 0 ||
 		r.stableIndex < r.lastLogIndex ||
 		r.appliedIndex < r.commitIndex
@@ -252,8 +267,9 @@ func (r *Raft) HasReady() bool {
 func (r *Raft) Advance() {
 	r.stableIndex = r.lastLogIndex
 	r.appliedIndex = r.commitIndex
-	r.messages = make([]*raftpb.Message, 0)
-	r.readStates = make([]ReadState, 0)
+	r.messages = r.messages[:0]
+	r.msgsAfterAppend = r.msgsAfterAppend[:0]
+	r.readStates = r.readStates[:0]
 }
 
 func (r *Raft) Tick() {
@@ -315,13 +331,13 @@ func (r *Raft) Step(m *raftpb.Message) error {
 type stepFunc func(r *Raft, m *raftpb.Message) error
 
 func (r *Raft) sendAppend(to uint64) {
-	prs, exists := r.progress[to]
-	if !exists {
+	p := r.trk.Progress(to)
+	if p == nil {
 		r.logger.Warn("sendAppend to unknown peer", "to", to)
 		return
 	}
 
-	prevIndex := prs.NextIndex - 1
+	prevIndex := p.NextIndex - 1
 	var prevTerm uint64
 	for _, e := range r.log {
 		if e.Index == prevIndex {
@@ -357,15 +373,15 @@ func (r *Raft) sendAppend(to uint64) {
 		Index:   prevIndex,
 		LogTerm: prevTerm,
 		Commit:  r.commitIndex,
-		Entries: r.entriesBetween(prs.NextIndex-1, r.lastLogIndex),
+		Entries: r.entriesBetween(p.NextIndex-1, r.lastLogIndex),
 	})
 }
 
 func stepLeader(r *Raft, m *raftpb.Message) error {
 	switch m.Type {
 	case raftpb.MessageType_MsgAppResp:
-		prs, exists := r.progress[m.From]
-		if !exists {
+		prs := r.trk.Progress(m.From)
+		if prs == nil {
 			return errors.New("TODO: will be replace with real coordination code later")
 		}
 		if m.Term == r.term {
@@ -398,8 +414,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 				"id", r.id, "transferee", m.From)
 		}
 
-		median := r.getMedian()
-		if r.maybeCommit(median) {
+		if r.maybeCommit(r.trk.Committed()) {
 			// maybeCommit advanced commitIndex, and matchTerm confirmed the newly
 			// committed entry is from the current term. Per Raft §5.4.2, this is the
 			// moment stale commitIndex is safe to serve: the leader has proven its log
@@ -425,8 +440,8 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		r.bcastHeartbeat(nil)
 
 	case raftpb.MessageType_MsgHeartbeatResp:
-		prs, exists := r.progress[m.From]
-		if !exists {
+		prs := r.trk.Progress(m.From)
+		if prs == nil {
 			r.logger.Warn("MsgHeartbeatResp from unknown peer", "from", m.From)
 			return nil
 		}
@@ -439,8 +454,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		}
 		if len(m.Context) > 0 {
 			acks := r.readOnly.recvAck(m.From, m.Context)
-			voteResult := r.config.VoteResult(acks)
-			if voteResult == quorum.VoteWon {
+			if r.trk.Voters.VoteResult(acks) == quorum.VoteWon {
 				rss := r.readOnly.advance(m)
 				for _, rs := range rss {
 					r.respondReadIndexReq(rs.req, rs.index)
@@ -449,7 +463,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		}
 
 	case raftpb.MessageType_MsgReadIndex:
-		if r.singletonCluster() {
+		if r.trk.IsSingleton() {
 			r.respondReadIndexReq(m, r.commitIndex)
 			return nil
 		}
@@ -463,13 +477,17 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		r.bcastHeartbeat(m.Context)
 
 	case raftpb.MessageType_MsgCheckQuorum:
-		if !r.hasQuorumActive() {
+		if !r.trk.QuorumActive() {
 			r.logger.Info("leader lost quorum, stepping down",
 				"term", r.term, "id", r.id)
 			r.becomeFollower(r.term, None)
 			return nil
 		}
-		r.resetRecentActive()
+		r.trk.Visit(func(id uint64, pr *tracker.Progress) {
+			if id != r.id {
+				pr.RecentActive = false
+			}
+		})
 
 	case raftpb.MessageType_MsgTransferLeader:
 		leadTransferee := m.From
@@ -493,7 +511,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		// Transfer leadership should be finished in one electionTimeout, so reset r.electionElapsed.
 		r.electionElapsed = 0
 		r.leadTransferee = leadTransferee
-		prs := r.progress[leadTransferee]
+		prs := r.trk.Progress(leadTransferee)
 		if prs.MatchIndex == r.lastLogIndex {
 			r.sendTimeoutNow(leadTransferee)
 			r.logger.Info("sent MsgTimeoutNow immediately, target log is up-to-date",
@@ -524,14 +542,14 @@ func stepCandidate(r *Raft, m *raftpb.Message) error {
 		if m.Term < r.term {
 			return nil
 		}
-		r.votes[m.From] = !m.Reject
 
-		vr := r.config.VoteResult(r.votes)
+		r.trk.RecordVote(m.From, !m.Reject)
+		vr := r.trk.TallyVotes()
 		switch vr {
 		case quorum.VoteWon:
 			if r.state == PreCandidate {
 				r.becomeCandidate()
-				r.votes[r.id] = true // self-vote for real election
+				r.trk.RecordVote(r.id, true)
 				r.bcastVote(raftpb.MessageType_MsgVote, r.term)
 			} else {
 				r.becomeLeader()
@@ -684,15 +702,7 @@ func (r *Raft) becomeLeader() {
 	r.tick = r.tickHeartbeat
 	r.reset(r.term)
 	r.lead = r.id
-
-	r.progress = make(map[uint64]*Progress, len(r.peers))
-	for _, pid := range r.peers {
-		r.progress[pid] = &Progress{
-			MatchIndex:   0,
-			NextIndex:    r.lastLogIndex + 1,
-			RecentActive: false,
-		}
-	}
+	r.trk.Progress(r.id).RecentActive = true
 
 	// Append a no-op entry in the new term. Per Raft §5.4.2, a leader cannot
 	// commit entries from prior terms directly; it must commit something in
@@ -708,7 +718,6 @@ func (r *Raft) becomePreCandidate() {
 	r.step = stepCandidate
 	r.tick = r.tickElection
 	r.lead = None
-	r.resetVotes()
 }
 
 func (r *Raft) becomeCandidate() {
@@ -716,7 +725,6 @@ func (r *Raft) becomeCandidate() {
 	r.step = stepCandidate
 	r.tick = r.tickElection
 	r.reset(r.term + 1)
-	r.resetVotes()
 	r.votedFor = r.id
 }
 
@@ -741,20 +749,18 @@ func (r *Raft) reset(term uint64) {
 
 	r.abortLeaderTransfer()
 
-	r.votes = make(map[uint64]bool)
-	r.progress = nil
+	r.trk.ResetVotes()
+	r.trk.Visit(func(id uint64, pr *tracker.Progress) {
+		pr.MatchIndex = 0
+		pr.NextIndex = r.lastLogIndex + 1
+		pr.RecentActive = false
+		if id == r.id {
+			pr.MatchIndex = r.lastLogIndex
+		}
+	})
+
 	r.pendingReadIndexRequests = nil
 	r.readOnly = newReadOnly()
-}
-
-func (r *Raft) getMedian() uint64 {
-	matches := []uint64{r.lastLogIndex} // leader's own match
-	for _, p := range r.progress {
-		matches = append(matches, p.MatchIndex)
-	}
-	sort.Slice(matches, func(i, j int) bool { return matches[i] > matches[j] })
-	median := matches[len(matches)/2]
-	return median
 }
 
 // anchorExists proves if the specified anchor exists locally
@@ -835,18 +841,6 @@ func (r *Raft) isCandidateUpToDate(candidate *raftpb.Message) bool {
 	return candidate.Index >= lastLog.Index
 }
 
-func (r *Raft) voteQuorumReached() bool {
-	var cnt int
-	for _, granted := range r.votes {
-		if granted {
-			cnt++
-		}
-	}
-
-	quorum := len(r.votes)/2 + 1
-	return cnt >= quorum
-}
-
 // findConflict returns the index of the first entry in entries that conflicts
 // with the existing log (same index, different term). Returns 0 if all entries
 // match or the log is empty.
@@ -921,10 +915,6 @@ func (r *Raft) ReadIndex(ctx []byte) error {
 	})
 }
 
-func (r *Raft) singletonCluster() bool {
-	return len(r.peers) == 0
-}
-
 func (r *Raft) matchTerm(i uint64) bool {
 	if t, err := r.storage.Term(i); err != nil {
 		r.logger.Warn("matchTerm: storage.Term failed", "commitIndex", r.commitIndex, "error", err)
@@ -969,15 +959,17 @@ func (r *Raft) respondReadIndexReq(m *raftpb.Message, readIndex uint64) {
 }
 
 func (r *Raft) bcastHeartbeat(ctx []byte) {
-	for _, pid := range r.peers {
-		prs := r.progress[pid]
+	r.trk.Visit(func(id uint64, pr *tracker.Progress) {
+		if id == r.id {
+			return
+		}
 		r.send(&raftpb.Message{
-			To:      pid,
+			To:      id,
 			Type:    raftpb.MessageType_MsgHeartbeat,
-			Commit:  min(prs.MatchIndex, r.commitIndex),
+			Commit:  min(pr.MatchIndex, r.commitIndex),
 			Context: ctx,
 		})
-	}
+	})
 }
 
 func (r *Raft) drainPendingReadIndexRequests() {
@@ -1003,33 +995,18 @@ func (r *Raft) appendEntry(data []byte) {
 		Data:  data,
 	}
 	r.appendEntries([]*raftpb.Entry{e})
+	r.send(&raftpb.Message{To: r.id, Type: raftpb.MessageType_MsgAppResp, Index: r.lastLogIndex})
 }
 
 // bcastAppend sends MsgApp to every peer. Callers are responsible for having
 // appended the entry locally first.
 func (r *Raft) bcastAppend() {
-	for _, pid := range r.peers {
-		r.sendAppend(pid)
-	}
-}
-
-func (r *Raft) hasQuorumActive() bool {
-	votes := make(map[uint64]bool)
-	votes[r.id] = true
-	for pid, p := range r.progress {
-		votes[pid] = p.RecentActive
-	}
-	return r.config.VoteResult(votes) == quorum.VoteWon
-}
-
-func (r *Raft) resetRecentActive() {
-	for _, pr := range r.progress {
-		pr.RecentActive = false
-	}
-}
-
-func (r *Raft) resetVotes() {
-	r.votes = make(map[uint64]bool)
+	r.trk.Visit(func(id uint64, pr *tracker.Progress) {
+		if id == r.id {
+			return
+		}
+		r.sendAppend(id)
+	})
 }
 
 func (r *Raft) canVoteFor(m *raftpb.Message) bool {
@@ -1153,8 +1130,8 @@ func (r *Raft) hup(t CampaignType) {
 	}
 	// Record self-vote and check quorum immediately. For a single-node
 	// cluster this completes the election without any network messages.
-	r.votes[r.id] = true
-	if vr := r.config.VoteResult(r.votes); vr == quorum.VoteWon {
+	r.trk.RecordVote(r.id, true)
+	if vr := r.trk.TallyVotes(); vr == quorum.VoteWon {
 		if t == CampaignPreElection {
 			// PreVote won — advance to real election.
 			r.hup(CampaignElection)

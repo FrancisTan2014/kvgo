@@ -37,17 +37,18 @@ type Node interface {
 }
 
 type node struct {
-	r          *Raft
-	propc      chan proposeRequest
-	stepc      chan stepRequest
-	campaignc  chan campaignRequest
-	readIndexc chan readIndexRequest
-	readyc     chan Ready
-	advancec   chan struct{}
-	tickc      chan struct{}
-	stopc      chan struct{}
-	stopOnce   sync.Once
-	prevHard   *raftpb.HardState
+	r              *Raft
+	propc          chan proposeRequest
+	stepc          chan stepRequest
+	campaignc      chan campaignRequest
+	readIndexc     chan readIndexRequest
+	readyc         chan Ready
+	advancec       chan struct{}
+	tickc          chan struct{}
+	stopc          chan struct{}
+	stopOnce       sync.Once
+	prevHard       *raftpb.HardState
+	stepsOnAdvance []*raftpb.Message
 
 	// TODO: define a logger interface instead of relying on a concrete logger
 	lg *slog.Logger
@@ -80,16 +81,17 @@ func NewNode(cfg Config) Node {
 
 func setupNode(cfg Config) *node {
 	return &node{
-		r:          newRaft(cfg),
-		propc:      make(chan proposeRequest),
-		stepc:      make(chan stepRequest),
-		campaignc:  make(chan campaignRequest),
-		readIndexc: make(chan readIndexRequest),
-		readyc:     make(chan Ready),
-		advancec:   make(chan struct{}),
-		tickc:      make(chan struct{}, 128),
-		stopc:      make(chan struct{}),
-		lg:         cfg.Logger,
+		r:              newRaft(cfg),
+		propc:          make(chan proposeRequest),
+		stepc:          make(chan stepRequest),
+		campaignc:      make(chan campaignRequest),
+		readIndexc:     make(chan readIndexRequest),
+		readyc:         make(chan Ready),
+		advancec:       make(chan struct{}),
+		tickc:          make(chan struct{}, 128),
+		stopc:          make(chan struct{}),
+		lg:             cfg.Logger,
+		stepsOnAdvance: make([]*raftpb.Message, 0),
 	}
 }
 
@@ -107,6 +109,11 @@ func (n *node) run() {
 		case readyc <- rd:
 			readyc = nil
 			advancec = n.advancec
+			for _, m := range n.r.msgsAfterAppend {
+				if m.To == n.r.id {
+					n.stepsOnAdvance = append(n.stepsOnAdvance, m)
+				}
+			}
 		case req := <-n.propc:
 			req.resp <- n.r.Propose(req.data)
 		case req := <-n.stepc:
@@ -120,6 +127,10 @@ func (n *node) run() {
 				n.prevHard = rd.HardState
 			}
 			n.r.Advance()
+			for _, m := range n.stepsOnAdvance {
+				_ = n.r.Step(m)
+			}
+			n.stepsOnAdvance = n.stepsOnAdvance[:0]
 			rd = Ready{}
 			advancec = nil
 		case <-n.tickc:
