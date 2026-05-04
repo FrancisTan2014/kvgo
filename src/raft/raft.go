@@ -55,16 +55,10 @@ Invariants:
 	#2: appliedIndex <= commitIndex
 */
 type Raft struct {
-	id           uint64
-	term         uint64
-	state        State
-	log          []*raftpb.Entry
-	commitIndex  uint64
-	appliedIndex uint64
-
-	// volatile local states
-	lastLogIndex uint64
-	stableIndex  uint64
+	id      uint64
+	term    uint64
+	state   State
+	raftLog *raftLog
 
 	messages        []*raftpb.Message
 	msgsAfterAppend []*raftpb.Message
@@ -75,8 +69,6 @@ type Raft struct {
 	readStates               []ReadState
 	readOnly                 *readOnly
 	pendingReadIndexRequests []*raftpb.Message
-
-	storage Storage
 
 	lead                      uint64
 	heartbeatTimeout          int
@@ -129,16 +121,15 @@ func newRaft(cfg Config) *Raft {
 
 	r := &Raft{
 		id:               cfg.ID,
-		log:              make([]*raftpb.Entry, 0),
 		peers:            peers,
 		messages:         make([]*raftpb.Message, 0),
 		msgsAfterAppend:  make([]*raftpb.Message, 0),
 		trk:              trk,
 		readOnly:         newReadOnly(),
-		storage:          cfg.Storage,
 		heartbeatTimeout: cfg.HeartbeatTick,
 		electionTimeout:  cfg.ElectionTick,
 		logger:           cfg.Logger,
+		raftLog:          newRaftLog(cfg.Storage, cfg.Logger),
 	}
 
 	hs, err := cfg.Storage.InitialState()
@@ -148,36 +139,29 @@ func newRaft(cfg Config) *Raft {
 	if !IsEmptyHardState(hs) {
 		r.term = hs.Term
 		r.votedFor = hs.VotedFor
-		r.commitIndex = hs.CommittedIndex
+		r.raftLog.committed = hs.CommittedIndex
 	}
 
-	if cfg.Applied > r.commitIndex {
-		panic(fmt.Sprintf("applied(%d) is greater than committed(%d)", cfg.Applied, r.commitIndex))
-	}
-
-	// Load persisted log entries from storage (restart path).
-	first := cfg.Storage.FirstIndex()
-	last := cfg.Storage.LastIndex()
-	if last > 0 && last >= first {
-		entries, err := cfg.Storage.Entries(first, last+1)
-		if err != nil {
-			panic(err)
-		}
-		r.log = entries
-		r.lastLogIndex = entries[len(entries)-1].Index
-		r.stableIndex = r.lastLogIndex
+	if cfg.Applied > r.raftLog.committed {
+		panic(fmt.Sprintf("applied(%d) is greater than committed(%d)", cfg.Applied, r.raftLog.committed))
 	}
 
 	// Applied=0 means "no state machine position" — replay from beginning of
 	// available log. Any other value must be reachable: at or above the first
 	// log entry minus one (the snapshot boundary). Values between 1 and
 	// firstIndex-2 indicate a caller bug — the position was compacted away.
-	if cfg.Applied > 0 && len(r.log) > 0 && cfg.Applied < r.log[0].Index-1 {
+	firstIndex := cfg.Storage.FirstIndex()
+	if cfg.Applied > 0 && firstIndex > 0 && cfg.Applied < firstIndex-1 {
 		panic(fmt.Sprintf("applied(%d) is before the first log entry(%d); compacted entries cannot be replayed",
-			cfg.Applied, r.log[0].Index))
+			cfg.Applied, firstIndex))
 	}
 
-	r.appliedIndex = cfg.Applied
+	if cfg.Applied > 0 {
+		r.raftLog.applied = cfg.Applied
+	} else if firstIndex > 0 {
+		// No explicit applied position — start from the compaction boundary.
+		r.raftLog.applied = firstIndex - 1
+	}
 
 	r.becomeFollower(r.term, None)
 	return r
@@ -228,7 +212,7 @@ func (r *Raft) HardState() *raftpb.HardState {
 	return &raftpb.HardState{
 		Term:           r.term,
 		VotedFor:       r.votedFor,
-		CommittedIndex: r.commitIndex,
+		CommittedIndex: r.raftLog.committed,
 	}
 }
 
@@ -248,8 +232,8 @@ func (r *Raft) Ready() Ready {
 	}
 	return Ready{
 		Lead:             r.lead,
-		Entries:          r.entriesBetween(r.stableIndex, r.lastLogIndex),
-		CommittedEntries: r.entriesBetween(r.appliedIndex, r.commitIndex),
+		Entries:          r.raftLog.nextUnstableEnts(),
+		CommittedEntries: r.raftLog.nextCommittedEnts(),
 		Messages:         msgs,
 		HardState:        r.HardState(),
 		ReadStates:       r.readStates,
@@ -260,15 +244,20 @@ func (r *Raft) HasReady() bool {
 	return len(r.messages) > 0 ||
 		len(r.msgsAfterAppend) > 0 ||
 		len(r.readStates) > 0 ||
-		r.stableIndex < r.lastLogIndex ||
-		r.appliedIndex < r.commitIndex
+		r.raftLog.hasNextUnstableEnts() ||
+		r.raftLog.hasNextCommittedEnts()
 }
 
-func (r *Raft) Advance() {
-	r.stableIndex = r.lastLogIndex
-	r.appliedIndex = r.commitIndex
+func (r *Raft) Advance(rd Ready) {
+	if len(rd.Entries) > 0 {
+		e := rd.Entries[len(rd.Entries)-1]
+		r.raftLog.stableTo(e.Index, e.Term)
+	}
+	if len(rd.CommittedEntries) > 0 {
+		e := rd.CommittedEntries[len(rd.CommittedEntries)-1]
+		r.raftLog.appliedTo(e.Index)
+	}
 	r.messages = r.messages[:0]
-	r.msgsAfterAppend = r.msgsAfterAppend[:0]
 	r.readStates = r.readStates[:0]
 }
 
@@ -277,10 +266,7 @@ func (r *Raft) Tick() {
 }
 
 func (r *Raft) CommitTo(index uint64) {
-	if index < r.commitIndex || index > r.lastLogIndex {
-		return
-	}
-	r.commitIndex = index
+	r.raftLog.commitTo(index)
 }
 
 func (r *Raft) Step(m *raftpb.Message) error {
@@ -338,42 +324,31 @@ func (r *Raft) sendAppend(to uint64) {
 	}
 
 	prevIndex := p.NextIndex - 1
-	var prevTerm uint64
-	for _, e := range r.log {
-		if e.Index == prevIndex {
-			prevTerm = e.Term
-			break
-		}
-	}
-
-	// Entry not in log — check snapshot or fall back to snapshot transfer.
-	if prevIndex > 0 && prevTerm == 0 {
-		snap, err := r.storage.Snapshot()
-		if err != nil {
-			r.logger.Warn("sendAppend failed to load snapshot", "to", to, "error", err)
+	prevTerm, err := r.raftLog.term(prevIndex)
+	if err != nil {
+		// Entry compacted or unavailable — send snapshot instead.
+		snap, serr := r.raftLog.storage.Snapshot()
+		if serr != nil {
+			r.logger.Warn("sendAppend failed to load snapshot", "to", to, "error", serr)
 			return
 		}
-		if snap.LastIncludedIndex == prevIndex {
-			prevTerm = snap.LastIncludedTerm
-		} else {
-			// Anchor is compacted beyond snapshot boundary — send snapshot.
-			r.logger.Info("sendAppend falling back to snapshot", "to", to, "prevIndex", prevIndex, "snapIndex", snap.LastIncludedIndex)
-			r.send(&raftpb.Message{
-				Type:     raftpb.MessageType_MsgSnap,
-				To:       to,
-				Snapshot: snap,
-			})
-			return
-		}
+		r.logger.Info("sendAppend falling back to snapshot", "to", to, "prevIndex", prevIndex, "snapIndex", snap.LastIncludedIndex)
+		r.send(&raftpb.Message{
+			Type:     raftpb.MessageType_MsgSnap,
+			To:       to,
+			Snapshot: snap,
+		})
+		return
 	}
 
+	lastIndex := r.raftLog.lastIndex()
 	r.send(&raftpb.Message{
 		To:      to,
 		Type:    raftpb.MessageType_MsgApp,
 		Index:   prevIndex,
 		LogTerm: prevTerm,
-		Commit:  r.commitIndex,
-		Entries: r.entriesBetween(p.NextIndex-1, r.lastLogIndex),
+		Commit:  r.raftLog.committed,
+		Entries: r.raftLog.slice(p.NextIndex, lastIndex+1),
 	})
 }
 
@@ -389,9 +364,9 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		}
 
 		if m.Reject {
-			firstIndex := r.storage.FirstIndex()
+			firstIndex := r.raftLog.storage.FirstIndex()
 			if firstIndex > 0 && m.RejectHint < firstIndex-1 {
-				if snap, err := r.storage.Snapshot(); err == nil {
+				if snap, err := r.raftLog.storage.Snapshot(); err == nil {
 					r.send(&raftpb.Message{
 						Type:     raftpb.MessageType_MsgSnap,
 						To:       m.From,
@@ -408,7 +383,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 
 		// 037o: if a leader transfer is in progress and the target just caught up,
 		// send MsgTimeoutNow to trigger the election.
-		if m.From == r.leadTransferee && prs.MatchIndex == r.lastLogIndex {
+		if m.From == r.leadTransferee && prs.MatchIndex == r.raftLog.lastIndex() {
 			r.sendTimeoutNow(m.From)
 			r.logger.Info("target caught up, sent MsgTimeoutNow",
 				"id", r.id, "transferee", m.From)
@@ -449,7 +424,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 			prs.RecentActive = true
 		}
 
-		if prs.MatchIndex < r.lastLogIndex {
+		if prs.MatchIndex < r.raftLog.lastIndex() {
 			r.sendAppend(m.From)
 		}
 		if len(m.Context) > 0 {
@@ -464,7 +439,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 
 	case raftpb.MessageType_MsgReadIndex:
 		if r.trk.IsSingleton() {
-			r.respondReadIndexReq(m, r.commitIndex)
+			r.respondReadIndexReq(m, r.raftLog.committed)
 			return nil
 		}
 		if !r.committedEntryInCurrentTerm() {
@@ -472,7 +447,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 			return nil
 		}
 
-		r.readOnly.addRequest(r.commitIndex, m)
+		r.readOnly.addRequest(r.raftLog.committed, m)
 		r.readOnly.recvAck(r.id, m.Context)
 		r.bcastHeartbeat(m.Context)
 
@@ -512,7 +487,7 @@ func stepLeader(r *Raft, m *raftpb.Message) error {
 		r.electionElapsed = 0
 		r.leadTransferee = leadTransferee
 		prs := r.trk.Progress(leadTransferee)
-		if prs.MatchIndex == r.lastLogIndex {
+		if prs.MatchIndex == r.raftLog.lastIndex() {
 			r.sendTimeoutNow(leadTransferee)
 			r.logger.Info("sent MsgTimeoutNow immediately, target log is up-to-date",
 				"id", r.id, "transferee", leadTransferee)
@@ -752,10 +727,10 @@ func (r *Raft) reset(term uint64) {
 	r.trk.ResetVotes()
 	r.trk.Visit(func(id uint64, pr *tracker.Progress) {
 		pr.MatchIndex = 0
-		pr.NextIndex = r.lastLogIndex + 1
+		pr.NextIndex = r.raftLog.lastIndex() + 1
 		pr.RecentActive = false
 		if id == r.id {
-			pr.MatchIndex = r.lastLogIndex
+			pr.MatchIndex = r.raftLog.lastIndex()
 		}
 	})
 
@@ -763,143 +738,8 @@ func (r *Raft) reset(term uint64) {
 	r.readOnly = newReadOnly()
 }
 
-// anchorExists proves if the specified anchor exists locally
-func (r *Raft) anchorExists(index uint64, term uint64) bool {
-	if index == 0 && term == 0 {
-		return true
-	}
-
-	snap, err := r.storage.Snapshot()
-	if err != nil {
-		r.logger.Warn("anchorExists failed to load snapshot", "error", err)
-		snap = nil
-	}
-
-	if snap != nil && index == snap.LastIncludedIndex && term == snap.LastIncludedTerm {
-		return true
-	}
-
-	for _, e := range r.log {
-		if snap != nil && e.Index <= snap.LastIncludedIndex {
-			continue
-		}
-		if e.Index == index && e.Term == term {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (r *Raft) lastLog() *raftpb.Entry {
-	lastLog := &raftpb.Entry{}
-	if snap, err := r.storage.Snapshot(); err == nil && snap.LastIncludedIndex > 0 {
-		lastLog = &raftpb.Entry{Index: snap.LastIncludedIndex, Term: snap.LastIncludedTerm}
-	}
-	size := len(r.log)
-	if size > 0 {
-		if r.log[size-1].Index >= lastLog.Index {
-			lastLog = r.log[size-1]
-		}
-	}
-	return lastLog
-}
-
-func (r *Raft) entriesBetween(lo, hi uint64) []*raftpb.Entry {
-	if hi <= lo || len(r.log) == 0 {
-		return nil
-	}
-
-	first := r.log[0].Index
-	startIndex := lo + 1
-	if startIndex < first {
-		startIndex = first
-	}
-	if hi < startIndex {
-		return nil
-	}
-
-	start := int(startIndex - first)
-	end := int(hi-first) + 1
-	ents := make([]*raftpb.Entry, end-start)
-	for i, e := range r.log[start:end] {
-		var data []byte
-		if e.Data != nil {
-			data = make([]byte, len(e.Data))
-			copy(data, e.Data)
-		}
-		ents[i] = &raftpb.Entry{Index: e.Index, Term: e.Term, Data: data}
-	}
-	return ents
-}
-
 func (r *Raft) isCandidateUpToDate(candidate *raftpb.Message) bool {
-	lastLog := r.lastLog()
-	if candidate.LogTerm != lastLog.Term {
-		return candidate.LogTerm > lastLog.Term
-	}
-	return candidate.Index >= lastLog.Index
-}
-
-// findConflict returns the index of the first entry in entries that conflicts
-// with the existing log (same index, different term). Returns 0 if all entries
-// match or the log is empty.
-func (r *Raft) findConflict(entries []*raftpb.Entry) uint64 {
-	if len(r.log) == 0 {
-		return 0
-	}
-	first := r.log[0].Index
-	for _, e := range entries {
-		if e.Index < first {
-			continue
-		}
-		offset := int(e.Index - first)
-		if offset >= len(r.log) {
-			return 0 // extends beyond — no conflict
-		}
-		if r.log[offset].Term != e.Term {
-			return e.Index
-		}
-	}
-	return 0 // all match
-}
-
-func (r *Raft) appendEntries(entries []*raftpb.Entry) {
-	if len(entries) == 0 {
-		return
-	}
-
-	if len(r.log) > 0 {
-		first := r.log[0].Index
-		ci := r.findConflict(entries)
-		if ci > 0 {
-			// Truncate at the conflict point and append from there.
-			offset := int(ci - first)
-			r.log = r.log[:offset]
-			if truncIdx := first + uint64(offset) - 1; r.stableIndex > truncIdx {
-				r.stableIndex = truncIdx
-			}
-			entries = entries[ci-entries[0].Index:]
-		} else {
-			// No conflict — skip entries we already have, keep only the tail
-			// that extends beyond our log.
-			lastIdx := r.log[len(r.log)-1].Index
-			var tail []*raftpb.Entry
-			for i, e := range entries {
-				if e.Index > lastIdx {
-					tail = entries[i:]
-					break
-				}
-			}
-			entries = tail
-		}
-		if len(entries) == 0 {
-			return
-		}
-	}
-
-	r.log = append(r.log, entries...)
-	r.lastLogIndex = r.log[len(r.log)-1].Index
+	return r.raftLog.isUpToDate(candidate.Index, candidate.LogTerm)
 }
 
 func (r *Raft) Campaign() error {
@@ -915,22 +755,13 @@ func (r *Raft) ReadIndex(ctx []byte) error {
 	})
 }
 
-func (r *Raft) matchTerm(i uint64) bool {
-	if t, err := r.storage.Term(i); err != nil {
-		r.logger.Warn("matchTerm: storage.Term failed", "commitIndex", r.commitIndex, "error", err)
-		return false
-	} else {
-		return t == r.term
-	}
-}
-
 func (r *Raft) committedEntryInCurrentTerm() bool {
-	return r.matchTerm(r.commitIndex)
+	return r.raftLog.matchTerm(r.raftLog.committed, r.term)
 }
 
 func (r *Raft) maybeCommit(i uint64) bool {
-	if i > r.commitIndex && r.matchTerm(i) {
-		r.CommitTo(i)
+	if i > r.raftLog.committed && r.raftLog.matchTerm(i, r.term) {
+		r.raftLog.commitTo(i)
 		return true
 	}
 	return false
@@ -966,7 +797,7 @@ func (r *Raft) bcastHeartbeat(ctx []byte) {
 		r.send(&raftpb.Message{
 			To:      id,
 			Type:    raftpb.MessageType_MsgHeartbeat,
-			Commit:  min(pr.MatchIndex, r.commitIndex),
+			Commit:  min(pr.MatchIndex, r.raftLog.committed),
 			Context: ctx,
 		})
 	})
@@ -981,21 +812,21 @@ func (r *Raft) drainPendingReadIndexRequests() {
 	r.pendingReadIndexRequests = nil
 
 	for _, req := range reqs {
-		r.respondReadIndexReq(req, r.commitIndex)
+		r.respondReadIndexReq(req, r.raftLog.committed)
 	}
 }
 
 // appendEntry wraps data into a new Entry at the next index/current term and
 // appends it to the local log. It does not broadcast.
 func (r *Raft) appendEntry(data []byte) {
-	prev := r.lastLog()
+	lastIndex := r.raftLog.lastIndex()
 	e := &raftpb.Entry{
-		Index: prev.Index + 1,
+		Index: lastIndex + 1,
 		Term:  r.term,
 		Data:  data,
 	}
-	r.appendEntries([]*raftpb.Entry{e})
-	r.send(&raftpb.Message{To: r.id, Type: raftpb.MessageType_MsgAppResp, Index: r.lastLogIndex})
+	r.raftLog.appendEntries([]*raftpb.Entry{e})
+	r.send(&raftpb.Message{To: r.id, Type: raftpb.MessageType_MsgAppResp, Index: r.raftLog.lastIndex()})
 }
 
 // bcastAppend sends MsgApp to every peer. Callers are responsible for having
@@ -1020,14 +851,14 @@ func (r *Raft) canVoteFor(m *raftpb.Message) bool {
 }
 
 func (r *Raft) bcastVote(msgType raftpb.MessageType, term uint64) {
-	lastLog := r.lastLog()
+	lastIndex, lastTerm := r.raftLog.lastEntryID()
 	for _, pid := range r.peers {
 		r.send(&raftpb.Message{
 			Type:    msgType,
 			To:      pid,
 			Term:    term,
-			Index:   lastLog.Index,
-			LogTerm: lastLog.Term,
+			Index:   lastIndex,
+			LogTerm: lastTerm,
 		})
 	}
 }
@@ -1042,27 +873,25 @@ func (r *Raft) respondVote(to uint64, granted bool, respType raftpb.MessageType,
 }
 
 func (r *Raft) handleAppendEntries(m *raftpb.Message) {
-	if m.Commit > r.commitIndex {
-		r.CommitTo(m.Commit)
-	}
-
-	if len(m.Entries) == 0 {
-		return
-	}
-
 	resp := &raftpb.Message{
 		Type: raftpb.MessageType_MsgAppResp,
 		To:   m.From,
 	}
-	if r.anchorExists(m.Index, m.LogTerm) {
-		r.appendEntries(m.Entries)
-		last := m.Entries[len(m.Entries)-1]
-		resp.Index = last.Index
-		resp.LogTerm = last.Term
+
+	if r.raftLog.matchTerm(m.Index, m.LogTerm) {
+		if len(m.Entries) > 0 {
+			r.raftLog.appendEntries(m.Entries)
+			last := m.Entries[len(m.Entries)-1]
+			resp.Index = last.Index
+			resp.LogTerm = last.Term
+		}
+		if m.Commit > r.raftLog.committed {
+			r.raftLog.commitTo(min(m.Commit, r.raftLog.lastIndex()))
+		}
 	} else {
 		resp.Reject = true
 		resp.Index = m.Index
-		if snap, err := r.storage.Snapshot(); err == nil {
+		if snap, err := r.raftLog.storage.Snapshot(); err == nil {
 			resp.RejectHint = snap.LastIncludedIndex
 		}
 	}
@@ -1070,9 +899,7 @@ func (r *Raft) handleAppendEntries(m *raftpb.Message) {
 }
 
 func (r *Raft) handleHeartbeat(m *raftpb.Message) {
-	if m.Commit > r.commitIndex {
-		r.CommitTo(m.Commit)
-	}
+	r.raftLog.commitTo(m.Commit)
 	r.send(&raftpb.Message{
 		To:      m.From,
 		Type:    raftpb.MessageType_MsgHeartbeatResp,
@@ -1081,26 +908,11 @@ func (r *Raft) handleHeartbeat(m *raftpb.Message) {
 }
 
 func (r *Raft) handleSnapshot(m *raftpb.Message) {
-	if err := r.storage.ApplySnapshot(m.Snapshot); err != nil {
+	if err := r.raftLog.storage.ApplySnapshot(m.Snapshot); err != nil {
 		r.logger.Warn("failed to apply snapshot", "error", err)
 		return
 	}
-
-	r.log = filterRetainedEntries(r.log, m.Snapshot.LastIncludedIndex)
-	if len(r.log) > 0 {
-		r.lastLogIndex = r.log[len(r.log)-1].Index
-	} else {
-		r.lastLogIndex = m.Snapshot.LastIncludedIndex
-	}
-	if r.stableIndex < m.Snapshot.LastIncludedIndex {
-		r.stableIndex = m.Snapshot.LastIncludedIndex
-	}
-	if r.commitIndex < m.Snapshot.LastIncludedIndex {
-		r.commitIndex = m.Snapshot.LastIncludedIndex
-	}
-	if r.appliedIndex < m.Snapshot.LastIncludedIndex {
-		r.appliedIndex = m.Snapshot.LastIncludedIndex
-	}
+	r.raftLog.restore(m.Snapshot.LastIncludedIndex)
 }
 
 func (r *Raft) abortLeaderTransfer() {

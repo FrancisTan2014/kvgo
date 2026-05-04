@@ -26,8 +26,13 @@ func TestApplierDoesNotApplyUncommittedEntries_036d(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeLeader()
 	// 037m: drain AND commit the no-op (singleton = self-quorum).
-	r.CommitTo(r.lastLogIndex)
-	r.Advance()
+	r.CommitTo(r.raftLog.lastIndex())
+	r.msgsAfterAppend = nil
+	rd0 := r.Ready()
+	if len(rd0.Entries) > 0 {
+		r.raftLog.storage.(*mockStorage).entries = append(r.raftLog.storage.(*mockStorage).entries, rd0.Entries...)
+	}
+	r.Advance(rd0)
 	target := &fakeApplyTarget{}
 	a := NewApplier(r, target)
 
@@ -44,8 +49,13 @@ func TestApplierAppliesCommittedEntriesBeforeAdvance_036d(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeLeader()
 	// 037m: drain AND commit the no-op (singleton = self-quorum).
-	r.CommitTo(r.lastLogIndex)
-	r.Advance()
+	r.CommitTo(r.raftLog.lastIndex())
+	r.msgsAfterAppend = nil
+	rd0 := r.Ready()
+	if len(rd0.Entries) > 0 {
+		r.raftLog.storage.(*mockStorage).entries = append(r.raftLog.storage.(*mockStorage).entries, rd0.Entries...)
+	}
+	r.Advance(rd0)
 	target := &fakeApplyTarget{}
 	a := NewApplier(r, target)
 
@@ -76,8 +86,13 @@ func TestApplierBlocksAdvanceOnApplyFailure_036d(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeLeader()
 	// 037m: drain AND commit the no-op (singleton = self-quorum).
-	r.CommitTo(r.lastLogIndex)
-	r.Advance()
+	r.CommitTo(r.raftLog.lastIndex())
+	r.msgsAfterAppend = nil
+	rd0 := r.Ready()
+	if len(rd0.Entries) > 0 {
+		r.raftLog.storage.(*mockStorage).entries = append(r.raftLog.storage.(*mockStorage).entries, rd0.Entries...)
+	}
+	r.Advance(rd0)
 	target := &fakeApplyTarget{err: errors.New("apply failed")}
 	a := NewApplier(r, target)
 

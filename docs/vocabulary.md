@@ -58,6 +58,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `collect` is looser; `gather` is broader; `compile` suggests deliberate arrangement
 - **where it breaks:** outside code, do not confuse it with `build`; `compile examples` works, `compile an opinion` usually does not
 
+## conflate
+- **meaning:** merge two distinct things into one, treating them as the same when they are not
+- **pressure:** use it when a design or argument silently collapses a meaningful distinction — two concepts that should be separate are handled by one mechanism
+- **tone:** precise, critical — signals a design flaw or reasoning error
+- **nearby alternatives:** `merge` is neutral and intentional; `confuse` is about misunderstanding; `conflate` says the merging itself is the mistake
+- **where it breaks:** do not use it when combining things is intentional and correct; `conflate` implies the combination loses something important
+
 ## conclude
 - **meaning:** finish something, or reach a judgment through reasoning
 - **pressure:** use it when evidence or argument reaches an endpoint
@@ -241,6 +248,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `reason` is broader; `motivation` is more personal; `rationale` is the design and decision word
 - **where it breaks:** can sound too formal in casual speech; use it when explicit justification matters
 
+## scatter
+- **meaning:** spread across many places without clear organization
+- **pressure:** use it when a responsibility, invariant, or piece of logic is distributed across multiple sites instead of being owned by one — "the invariant is scattered across the codebase"
+- **tone:** mildly critical, diagnostic — implies the spreading is a problem, not a feature
+- **nearby alternatives:** `spread` is neutral; `distribute` can be intentional; `scatter` implies accidental or undesirable fragmentation
+- **where it breaks:** do not use it for intentional distribution (e.g., sharding); `scatter` suggests the spread happened without design, and consolidation would be better
+
 ## seam
 - **meaning:** a boundary where two parts meet
 - **pressure:** use it when the connection point is useful for testing, changing, or reasoning about ownership
@@ -275,6 +289,13 @@ Each word is shown through visible dimensions for word choice:
 - **tone:** mildly critical, cautionary
 - **nearby alternatives:** `theoretical` is more neutral; `hypothetical` is broader; `speculative` suggests building on uncertain ground
 - **where it breaks:** do not use it for any future thinking; it specifically warns about low-evidence design
+
+## surface
+- **meaning:** become visible or known, especially something that was hidden or not yet noticed
+- **pressure:** use it when investigation or reading reveals a gap, bug, or concern that was not obvious before — "these issues surfaced after reading the code"
+- **tone:** neutral, factual, slightly investigative
+- **nearby alternatives:** `emerge` implies gradual organic revealing; `appear` is flat; `uncover` implies the finder did active digging; `surface` sits between — the thing was there all along, and some activity made it visible
+- **where it breaks:** do not use it for things that were always obvious or explicitly stated; `surface` implies prior hiddenness
 
 ## throughline
 - **meaning:** the main connecting idea running through a larger work

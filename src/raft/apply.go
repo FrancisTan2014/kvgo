@@ -40,12 +40,21 @@ func (a *Applier) ConsumeReady() (Ready, error) {
 	}
 
 	rd := a.r.Ready()
+
+	// Persist unstable entries to storage before advancing.
+	if len(rd.Entries) > 0 {
+		if err := a.r.raftLog.storage.Save(rd.Entries, nil); err != nil {
+			return rd, err
+		}
+	}
+
 	if len(rd.CommittedEntries) > 0 {
 		if err := a.target.Apply(rd.CommittedEntries); err != nil {
 			return rd, err
 		}
 	}
 
-	a.r.Advance()
+	a.r.msgsAfterAppend = nil
+	a.r.Advance(rd)
 	return rd, nil
 }

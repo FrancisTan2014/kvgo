@@ -114,6 +114,7 @@ func (n *node) run() {
 					n.stepsOnAdvance = append(n.stepsOnAdvance, m)
 				}
 			}
+			n.r.msgsAfterAppend = nil
 		case req := <-n.propc:
 			req.resp <- n.r.Propose(req.data)
 		case req := <-n.stepc:
@@ -126,7 +127,7 @@ func (n *node) run() {
 			if !IsEmptyHardState(rd.HardState) {
 				n.prevHard = rd.HardState
 			}
-			n.r.Advance()
+			n.r.Advance(rd)
 			for _, m := range n.stepsOnAdvance {
 				_ = n.r.Step(m)
 			}

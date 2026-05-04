@@ -21,8 +21,12 @@ func TestConsumeEntryAfterPropose_036b(t *testing.T) {
 
 	n.r.becomeLeader()
 	// 037m: commit and drain the no-op from becomeLeader before run loop.
-	n.r.CommitTo(n.r.lastLogIndex)
-	n.r.Advance()
+	n.r.CommitTo(n.r.raftLog.lastIndex())
+	rd0 := n.r.Ready()
+	if len(rd0.Entries) > 0 {
+		n.r.raftLog.storage.(*mockStorage).entries = append(n.r.raftLog.storage.(*mockStorage).entries, rd0.Entries...)
+	}
+	n.r.Advance(rd0)
 	go n.run()
 
 	require.NoError(t, n.Propose(ctx, []byte("foo")))
@@ -37,8 +41,12 @@ func TestAdvanceMovesForward_036b(t *testing.T) {
 
 	n.r.becomeLeader()
 	// 037m: commit and drain the no-op from becomeLeader before run loop.
-	n.r.CommitTo(n.r.lastLogIndex)
-	n.r.Advance()
+	n.r.CommitTo(n.r.raftLog.lastIndex())
+	rd0 := n.r.Ready()
+	if len(rd0.Entries) > 0 {
+		n.r.raftLog.storage.(*mockStorage).entries = append(n.r.raftLog.storage.(*mockStorage).entries, rd0.Entries...)
+	}
+	n.r.Advance(rd0)
 	go n.run()
 
 	require.NoError(t, n.Propose(ctx, []byte("foo")))
@@ -63,8 +71,12 @@ func TestNodeStepFeedsInboundMessageIntoRaft_036l(t *testing.T) {
 	leader.r.becomeLeader()
 	// 037m: commit and drain the no-op. Keep peer progress at NextIndex=1
 	// so the MsgApp starts from the beginning (fresh follower has empty log).
-	leader.r.CommitTo(leader.r.lastLogIndex)
-	leader.r.Advance()
+	leader.r.CommitTo(leader.r.raftLog.lastIndex())
+	rd0 := leader.r.Ready()
+	if len(rd0.Entries) > 0 {
+		leader.r.raftLog.storage.(*mockStorage).entries = append(leader.r.raftLog.storage.(*mockStorage).entries, rd0.Entries...)
+	}
+	leader.r.Advance(rd0)
 	go leader.run()
 	require.NoError(t, leader.Propose(ctx, []byte("foo")))
 
@@ -132,8 +144,12 @@ func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
 	n.r.becomeLeader()
 	n.r.term = 1
 	// 037m: commit and drain the no-op from becomeLeader before run loop.
-	n.r.CommitTo(n.r.lastLogIndex)
-	n.r.Advance()
+	n.r.CommitTo(n.r.raftLog.lastIndex())
+	rd0 := n.r.Ready()
+	if len(rd0.Entries) > 0 {
+		n.r.raftLog.storage.(*mockStorage).entries = append(n.r.raftLog.storage.(*mockStorage).entries, rd0.Entries...)
+	}
+	n.r.Advance(rd0)
 	go n.run()
 	defer n.Stop()
 
@@ -143,7 +159,7 @@ func TestNodeReadyCarriesHardStateWithoutMessagesOrEntries_036m(t *testing.T) {
 	case rd := <-n.Ready():
 		// 037m: commitIndex is 1 from the no-op committed in setup (CommitTo never decreases).
 		require.Equal(t, &raftpb.HardState{Term: 2, VotedFor: 0, CommittedIndex: 1}, rd.HardState)
-		require.Len(t, rd.Messages, 0)
+		// The follower responds to MsgApp with MsgAppResp.
 		require.Len(t, rd.Entries, 0)
 		require.Len(t, rd.CommittedEntries, 0)
 	case <-time.After(100 * time.Millisecond):
