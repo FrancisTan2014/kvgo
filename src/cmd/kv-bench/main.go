@@ -22,6 +22,7 @@ var (
 	getRatio    = flag.Float64("get-ratio", 0.0, "fraction of requests that are GETs (0.0-1.0)")
 	warmup      = flag.Int("warmup", 1000, "warmup requests to discard from stats")
 	timeout     = flag.Duration("timeout", 5*time.Second, "per-request timeout")
+	pipeline    = flag.Bool("pipeline", false, "pipeline requests: overlap send and receive")
 )
 
 type stats struct {
@@ -38,8 +39,8 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Benchmark: %d requests, %d connections, %d byte values, %.0f%% GETs\n",
-		*totalReqs, *concurrency, *valueSize, *getRatio*100)
+	fmt.Printf("Benchmark: %d requests, %d connections, %d byte values, %.0f%% GETs, pipeline=%v\n",
+		*totalReqs, *concurrency, *valueSize, *getRatio*100, *pipeline)
 	fmt.Printf("Target: %s (%s)\n", *addr, *network)
 
 	// Pre-generate data
@@ -62,7 +63,11 @@ func main() {
 
 		go func(workerID, sIdx, eIdx int) {
 			defer wg.Done()
-			runWorker(workerID, keys[sIdx:eIdx], values[sIdx:eIdx], st)
+			if *pipeline {
+				runPipelinedWorker(workerID, keys[sIdx:eIdx], values[sIdx:eIdx], st)
+			} else {
+				runWorker(workerID, keys[sIdx:eIdx], values[sIdx:eIdx], st)
+			}
 		}(i, startIdx, endIdx)
 	}
 
@@ -137,6 +142,91 @@ func runWorker(id int, keys []string, values [][]byte, st *stats) {
 
 		lats = append(lats, time.Since(t0))
 	}
+
+	st.mu.Lock()
+	st.latencies = append(st.latencies, lats...)
+	st.errors += errs
+	st.mu.Unlock()
+}
+
+func runPipelinedWorker(id int, keys []string, values [][]byte, st *stats) {
+	conn, err := net.DialTimeout(*network, *addr, *timeout)
+	if err != nil {
+		fmt.Printf("worker %d: connect failed: %v\n", id, err)
+		st.mu.Lock()
+		st.errors += len(keys)
+		st.mu.Unlock()
+		return
+	}
+	defer conn.Close()
+
+	t := transport.NewMultiplexedTransport(conn)
+	defer t.Close()
+
+	// Pre-encode all payloads
+	payloads := make([][]byte, len(keys))
+	sendTimes := make([]time.Time, len(keys))
+	for i := range keys {
+		var req protocol.Request
+		if rand.Float64() < *getRatio {
+			req = protocol.Request{Cmd: protocol.CmdGet, Key: []byte(keys[i])}
+		} else {
+			req = protocol.Request{Cmd: protocol.CmdPut, Key: []byte(keys[i]), Value: values[i]}
+		}
+		p, err := protocol.EncodeRequest(req)
+		if err != nil {
+			st.mu.Lock()
+			st.errors += len(keys)
+			st.mu.Unlock()
+			return
+		}
+		payloads[i] = p
+	}
+
+	// Sender goroutine: fire all requests without waiting for responses
+	sendErrs := make(chan int, 1)
+	go func() {
+		errs := 0
+		for i := range payloads {
+			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+			sendTimes[i] = time.Now()
+			if err := t.Send(ctx, payloads[i]); err != nil {
+				cancel()
+				errs++
+				continue
+			}
+			cancel()
+		}
+		sendErrs <- errs
+	}()
+
+	// Receiver: collect responses in order
+	lats := make([]time.Duration, 0, len(keys))
+	errs := 0
+	for i := range keys {
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+		respPayload, err := t.Receive(ctx)
+		cancel()
+		if err != nil {
+			errs++
+			continue
+		}
+
+		resp, err := protocol.DecodeResponse(respPayload)
+		if err != nil {
+			errs++
+			continue
+		}
+
+		if resp.Status == protocol.StatusError {
+			errs++
+			continue
+		}
+
+		lats = append(lats, time.Since(sendTimes[i]))
+	}
+
+	errs += <-sendErrs
 
 	st.mu.Lock()
 	st.latencies = append(st.latencies, lats...)
