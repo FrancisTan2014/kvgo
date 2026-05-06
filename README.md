@@ -16,19 +16,28 @@ Small essays distilled from the build process:
 
 ## Current status
 
-As of episode `037h`, `kv-go` is a Raft-owned distributed key-value store in active construction.
+As of episode `040`, `kv-go` is a Raft-owned distributed key-value store with a production-shaped consensus core.
 
 What works today:
 - three-node Raft cluster with tick-driven election and TCP transport
-- `PUT` flows through propose → majority agreement → apply
-- restart recovery from durable storage
-- segmented WAL with automatic compaction
-- dedicated heartbeat messages (`MsgHeartbeat` / `MsgHeartbeatResp`) preparing the path for linearizable reads
+- `PUT` flows through propose → majority agreement → apply on any node
+- linearizable `GET` via ReadIndex (quorum proof-of-leadership + apply catch-up)
+- two-layer raft log (`raftLog` + `unstable`) — concurrent proposals at any connection count
+- PreVote protocol prevents partitioned nodes from disrupting the cluster
+- CheckQuorum ensures a partitioned leader steps down within one election timeout
+- leader transfer with PreVote bypass for graceful handover
+- restart recovery from durable storage with segmented WAL and automatic compaction
+- Jepsen linearizability testing with partition nemesis
+
+Benchmarks (single-node, 128-byte values):
+- 1 connection: ~158 req/s, p50 5.6ms
+- 50 connections: ~170 req/s, p50 294ms, 0 errors
 
 Still open:
-- `ReadIndex` / linearizable `GET`
+- batch optimization (throughput plateau under concurrency — episode 041)
 - membership changes and learners
-- snapshot transfer and more client-facing polish
+- snapshot transfer
+- cross-layer conflict detection (`maybeAppend` for followers)
 
 ## Sabotage
 I think of this as a question-driven methodology: I start with questions and let them guide me through distributed
@@ -56,6 +65,13 @@ Episode 036 (the-raft) is not another feature. It's an identity change. The syst
 **Phase 2 — The consensus system (episodes 036–)**
 
 From here, every write enters through the replicated log, gets majority agreement, then reaches the database. Adding a new consensus feature means defining a new entry type — not building a new fan-out, counter, and quorum check.
+
+Key milestones:
+- 036: Raft state machine, node loop, Ready/Advance contract
+- 037 series: server rewrite (recovery, WAL, heartbeats, ReadIndex, CheckQuorum, PreVote, leader transfer)
+- 038: unified quorum primitive, single-node election
+- 039: self-ack via deferred messages, ProgressTracker
+- 040: two-layer raft log (stable/unstable split), concurrent proposals fixed
 
 ## References & Acknowledgements
 

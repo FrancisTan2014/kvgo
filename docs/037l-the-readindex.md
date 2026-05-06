@@ -2,7 +2,7 @@
 
 037k's Jepsen partition test caught a stale read:
 
-![Partition timeline showing stale read](imgs/037l-evidence-1.png)
+![Partition timeline showing stale read](files/037l-evidence-1.png)
 
 Time flows downward. Blue boxes are successful operations; orange boxes are writes that timed out. At the top, `0 write 1` and `2 write 2` both complete (blue). Then `1 write 1` begins — it stretches into a tall orange block, stuck waiting for a quorum that will never come. Around the same time, `0 read 1` returns (blue) with value `1`. But `2 write 2` already committed — the value should be `2`. On a different worker, `3 read 2` returns the correct value at roughly the same moment. Two concurrent reads, two different answers. The checker flags it: `{:valid? false}`.
 

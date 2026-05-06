@@ -44,6 +44,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `underneath` is more natural and visual; `below` is more literal; `beneath` feels more reflective
 - **where it breaks:** can sound too formal in casual speech; do not force it where plain `under` is enough
 
+## burst
+- **meaning:** a short period of high activity that then subsides
+- **pressure:** use it when traffic, proposals, or events arrive in a concentrated spike before settling into a stable pattern — "the initial burst of 5 proposals batched together"
+- **tone:** technical, dynamic, time-aware
+- **nearby alternatives:** `spike` is sharper and more alarming; `surge` is broader; `burst` emphasizes brevity — high then done
+- **where it breaks:** do not use it for sustained high load; a burst is short by definition. Pair it with `steady state` for the contrast
+
 ## coherent
 - **meaning:** logically connected and consistent as a whole
 - **pressure:** use it when many parts fit together without contradiction
@@ -234,6 +241,13 @@ Each word is shown through visible dimensions for word choice:
 - **nearby alternatives:** `writing` is broader; `text` is flatter; `prose` highlights explanatory language as a form
 - **where it breaks:** do not use it when plain `writing` is enough and no contrast in form is needed
 
+## prove
+- **meaning:** show that something is true through evidence or reasoning
+- **pressure:** use it when a claim needs backing — "prove it with evidence," "prove it by measuring"
+- **tone:** rigorous, assertive
+- **nearby alternatives:** `demonstrate` is softer; `verify` implies checking against a known answer; `confirm` implies prior expectation; `prove` is the strongest — it claims the matter is settled
+- **where it breaks:** preposition matters: "prove **with** evidence" (instrument), "prove **by** measuring" (method), "prove **through** testing" (process). Not "prove by evidence" — that conflates method and instrument
+
 ## purge
 - **meaning:** remove completely and deliberately, leaving nothing behind
 - **pressure:** use it when the removal is total and intentional — not trimming, not deprecating, but eliminating
@@ -289,6 +303,13 @@ Each word is shown through visible dimensions for word choice:
 - **tone:** mildly critical, cautionary
 - **nearby alternatives:** `theoretical` is more neutral; `hypothetical` is broader; `speculative` suggests building on uncertain ground
 - **where it breaks:** do not use it for any future thinking; it specifically warns about low-evidence design
+
+## steady state
+- **meaning:** the long-term stable pattern after an initial transient settles
+- **pressure:** use it when a system transitions from startup or burst behavior into a repeating rhythm — "in steady state, each cycle carries 1 entry"
+- **tone:** technical, analytical, systems-oriented
+- **nearby alternatives:** `stable` describes the property; `sustained` describes duration; `steady state` names the phase — the period after transients die out
+- **where it breaks:** do not use it during startup, warmup, or recovery — those are transient phases, not steady state. Pair it with `burst` for the contrast
 
 ## surface
 - **meaning:** become visible or known, especially something that was hidden or not yet noticed
