@@ -163,7 +163,9 @@ func (s *shard) flush(batch []*writeRequest) {
 		// Failing to fsync means we cannot guarantee durability.
 		// Panic propagates to Server layer for logging and graceful shutdown.
 		for _, r := range batch {
-			r.respCh <- fmt.Errorf("WAL write value failed: %w", err)
+			if r.respCh != nil {
+				r.respCh <- fmt.Errorf("WAL write value failed: %w", err)
+			}
 		}
 		panic(fmt.Sprintf("wal write value failed: %v filename=%s", err, s.wal.valueFilename))
 	}
@@ -172,7 +174,9 @@ func (s *shard) flush(batch []*writeRequest) {
 		// Index write failed after value write succeeded.
 		// Panic propagates to Server layer for logging and graceful shutdown.
 		for _, r := range batch {
-			r.respCh <- fmt.Errorf("WAL write index failed: %w", err)
+			if r.respCh != nil {
+				r.respCh <- fmt.Errorf("WAL write index failed: %w", err)
+			}
 		}
 		panic(fmt.Sprintf("wal write index failed: %v filename=%s", err, s.wal.indexFilename))
 	}
@@ -181,9 +185,12 @@ func (s *shard) flush(batch []*writeRequest) {
 	s.valueOffset.Store(valueFileOff)
 
 	for _, r := range batch {
-		// Apply to memory only after WAL fsync succeeds ("strict" durability for acks).
-		s.putInternal(r.key, r.value)
-		r.respCh <- nil
+		if r.respCh != nil {
+			// Sync path: apply to memory after WAL fsync, then ack.
+			s.putInternal(r.key, r.value)
+			r.respCh <- nil
+		}
+		// Async path: memory already applied in putAsync, WAL write is done.
 	}
 }
 

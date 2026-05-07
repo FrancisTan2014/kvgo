@@ -121,6 +121,14 @@ func (db *DB) Put(key string, value []byte) error {
 	return s.put(key, value)
 }
 
+// PutAsync applies the write to in-memory state immediately and enqueues the
+// WAL write without blocking. Callers that have their own durability guarantee
+// (e.g., Raft WAL) use this to avoid waiting for the engine's group commit.
+func (db *DB) PutAsync(key string, value []byte) {
+	s := db.getShard(key)
+	s.putAsync(key, value)
+}
+
 func (db *DB) Get(key string) ([]byte, bool) {
 	s := db.getShard(key)
 	data, ok, err := s.get(key)

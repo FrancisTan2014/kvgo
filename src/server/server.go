@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"kvgo/engine"
+	"kvgo/kvpb"
 	"kvgo/pkg/wait"
 	"kvgo/protocol"
 	"kvgo/raft"
@@ -20,6 +21,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 var (
@@ -52,6 +55,7 @@ type Options struct {
 	SyncInterval time.Duration
 
 	HTTPPort uint16 // optional: HTTP API port for external tools (0 = disabled)
+	GRPCPort uint16 // optional: gRPC API port (0 = disabled)
 
 	Logger *slog.Logger // optional debug logger; nil disables logging
 }
@@ -59,6 +63,7 @@ type Options struct {
 type StateMachine interface {
 	Get(key string) ([]byte, bool)
 	Put(key string, value []byte) error
+	PutAsync(key string, value []byte)
 }
 
 type Server struct {
@@ -94,6 +99,10 @@ type Server struct {
 	// HTTP API (optional, for external testing tools like Jepsen)
 	httpLn  net.Listener
 	httpSrv *http.Server
+
+	// gRPC API (optional)
+	grpcLn  net.Listener
+	grpcSrv *grpc.Server
 }
 
 func validate(opts *Options) error {
@@ -147,6 +156,13 @@ func (s *Server) HTTPAddr() string {
 		return ""
 	}
 	return s.httpLn.Addr().String()
+}
+
+func (s *Server) GRPCAddr() string {
+	if s.grpcLn == nil {
+		return ""
+	}
+	return s.grpcLn.Addr().String()
 }
 
 func (s *Server) Start() (err error) {
@@ -227,6 +243,22 @@ func (s *Server) Start() (err error) {
 		s.httpSrv = &http.Server{Handler: s.httpMux()}
 		go s.httpSrv.Serve(s.httpLn)
 		s.log().Info("http api listening", "addr", s.httpLn.Addr().String())
+	}
+
+	// Start optional gRPC API server.
+	if s.opts.GRPCPort > 0 {
+		grpcAddr := fmt.Sprintf("%s:%d", s.opts.Host, s.opts.GRPCPort)
+		if s.opts.Host == "" {
+			grpcAddr = fmt.Sprintf("%s:%d", defaultHost, s.opts.GRPCPort)
+		}
+		s.grpcLn, err = net.Listen("tcp", grpcAddr)
+		if err != nil {
+			return fmt.Errorf("server: grpc listen: %w", err)
+		}
+		s.grpcSrv = grpc.NewServer()
+		kvpb.RegisterKVServer(s.grpcSrv, &grpcServer{s: s})
+		go s.grpcSrv.Serve(s.grpcLn)
+		s.log().Info("grpc api listening", "addr", s.grpcLn.Addr().String())
 	}
 
 	return nil
@@ -342,6 +374,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Stop HTTP server if running.
 	if s.httpSrv != nil {
 		_ = s.httpSrv.Shutdown(ctx)
+	}
+
+	// Stop gRPC server if running.
+	if s.grpcSrv != nil {
+		s.grpcSrv.GracefulStop()
 	}
 
 	// Cancel all subsystem contexts.
@@ -483,12 +520,10 @@ func (s *Server) applyEntry(raw []byte) {
 
 	switch req.Cmd {
 	case protocol.CmdPut:
-		err := s.sm.Put(string(req.Key), req.Value)
-		if err != nil {
-			s.w.Trigger(id, err)
-		} else {
-			s.w.Trigger(id, nil)
-		}
+		// Raft WAL guarantees durability. Apply to in-memory state immediately;
+		// engine WAL write happens asynchronously via group committer.
+		s.sm.PutAsync(string(req.Key), req.Value)
+		s.w.Trigger(id, nil)
 	default:
 		s.log().Warn("apply: unknown command", "cmd", req.Cmd)
 		s.w.Trigger(id, fmt.Errorf("unknown command in apply: %d", req.Cmd))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"kvgo/kvpb"
 	"kvgo/protocol"
 	"kvgo/transport"
 	"math/rand"
@@ -11,6 +12,9 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
@@ -23,6 +27,7 @@ var (
 	warmup      = flag.Int("warmup", 1000, "warmup requests to discard from stats")
 	timeout     = flag.Duration("timeout", 5*time.Second, "per-request timeout")
 	pipeline    = flag.Bool("pipeline", false, "pipeline requests: overlap send and receive")
+	useGRPC     = flag.Bool("grpc", false, "use gRPC protocol instead of binary")
 )
 
 type stats struct {
@@ -39,8 +44,8 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Benchmark: %d requests, %d connections, %d byte values, %.0f%% GETs, pipeline=%v\n",
-		*totalReqs, *concurrency, *valueSize, *getRatio*100, *pipeline)
+	fmt.Printf("Benchmark: %d requests, %d connections, %d byte values, %.0f%% GETs, pipeline=%v, grpc=%v\n",
+		*totalReqs, *concurrency, *valueSize, *getRatio*100, *pipeline, *useGRPC)
 	fmt.Printf("Target: %s (%s)\n", *addr, *network)
 
 	// Pre-generate data
@@ -53,6 +58,23 @@ func main() {
 
 	reqsPerWorker := *totalReqs / *concurrency
 
+	// For gRPC, share a single connection across all workers (like etcd's bench).
+	// Each worker fires RPCs concurrently over the same HTTP/2 connection.
+	var sharedGRPCClient kvpb.KVClient
+	var sharedGRPCConn *grpc.ClientConn
+	if *useGRPC {
+		var err error
+		sharedGRPCConn, err = grpc.NewClient(*addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			fmt.Printf("grpc dial failed: %v\n", err)
+			return
+		}
+		defer sharedGRPCConn.Close()
+		sharedGRPCClient = kvpb.NewKVClient(sharedGRPCConn)
+	}
+
 	for i := 0; i < *concurrency; i++ {
 		wg.Add(1)
 		startIdx := i * reqsPerWorker
@@ -63,7 +85,9 @@ func main() {
 
 		go func(workerID, sIdx, eIdx int) {
 			defer wg.Done()
-			if *pipeline {
+			if *useGRPC {
+				runGRPCWorker(workerID, keys[sIdx:eIdx], values[sIdx:eIdx], st, sharedGRPCClient)
+			} else if *pipeline {
 				runPipelinedWorker(workerID, keys[sIdx:eIdx], values[sIdx:eIdx], st)
 			} else {
 				runWorker(workerID, keys[sIdx:eIdx], values[sIdx:eIdx], st)
@@ -310,4 +334,38 @@ func min64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func runGRPCWorker(id int, keys []string, values [][]byte, st *stats, client kvpb.KVClient) {
+	lats := make([]time.Duration, 0, len(keys))
+	errs := 0
+	var err error
+
+	for i := range keys {
+		key := keys[i]
+		val := values[i]
+
+		t0 := time.Now()
+
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+
+		if rand.Float64() < *getRatio {
+			_, err = client.Get(ctx, &kvpb.GetRequest{Key: []byte(key)})
+		} else {
+			_, err = client.Put(ctx, &kvpb.PutRequest{Key: []byte(key), Value: val})
+		}
+		cancel()
+
+		if err != nil {
+			errs++
+			continue
+		}
+
+		lats = append(lats, time.Since(t0))
+	}
+
+	st.mu.Lock()
+	st.latencies = append(st.latencies, lats...)
+	st.errors += errs
+	st.mu.Unlock()
 }

@@ -173,6 +173,31 @@ func (s *shard) put(key string, value []byte) error {
 	return <-respCh
 }
 
+// putAsync applies to in-memory state immediately, then enqueues WAL write
+// without blocking on the flush. The caller relies on external durability
+// (Raft WAL), but the engine WAL must still receive every write — Raft WAL
+// compaction deletes segments assuming the engine has persisted them.
+func (s *shard) putAsync(key string, value []byte) {
+	if value == nil {
+		value = make([]byte, 0)
+	}
+
+	// Apply to memory first — reads see the new value immediately.
+	s.putInternal(key, value)
+
+	// Enqueue WAL write. The channel is buffered (200 slots) and the group
+	// committer drains at ~10,000 writes/s. Under normal load this never
+	// blocks. Under extreme burst, the send blocks until a slot opens —
+	// natural backpressure, not a deadlock. We must not drop writes because
+	// MaybeCompact deletes Raft WAL segments that the engine WAL is expected
+	// to cover.
+	req := &writeRequest{key: key, value: value}
+	select {
+	case s.committer.reqCh <- req:
+	case <-s.committer.stopCh:
+	}
+}
+
 func (s *shard) putInternal(key string, value []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

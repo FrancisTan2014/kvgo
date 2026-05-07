@@ -182,6 +182,10 @@ func (s *fakeStateMachine) Put(key string, value []byte) error {
 	return nil
 }
 
+func (s *fakeStateMachine) PutAsync(key string, value []byte) {
+	s.data[key] = append([]byte(nil), value...)
+}
+
 type fakeRaftHost struct {
 	applyc          chan toApply
 	errorc          chan error

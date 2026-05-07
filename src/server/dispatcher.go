@@ -34,14 +34,20 @@ func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duratio
 
 		req, err := protocol.DecodeRequest(payload)
 		if err != nil {
-			s.log().Error("failed to decode request", "error", err)
-			return
+			s.log().Warn("failed to decode request", "error", err)
+			if writeErr := s.writeResponse(t, protocol.Response{Status: protocol.StatusError}); writeErr != nil {
+				return
+			}
+			continue
 		}
 
 		handler := s.requestHandlers[req.Cmd]
 		if handler == nil {
-			s.log().Error("unsupported request detected", "cmd", req.Cmd)
-			return
+			s.log().Warn("unsupported request detected", "cmd", req.Cmd)
+			if writeErr := s.writeResponse(t, protocol.Response{Status: protocol.StatusError}); writeErr != nil {
+				return
+			}
+			continue
 		}
 
 		ctx := &RequestContext{
@@ -50,8 +56,12 @@ func (s *Server) handleRequest(t transport.StreamTransport, timeout time.Duratio
 		}
 
 		if err := handler(s, ctx); err != nil {
-			s.log().Error("failed to process the request", "cmd", req.Cmd, "error", err)
-			return
+			s.log().Warn("request failed", "cmd", req.Cmd, "error", err)
+			// Send error response instead of killing connection.
+			// Only close on transport write failure (connection dead).
+			if writeErr := s.writeResponse(t, protocol.Response{Status: protocol.StatusError}); writeErr != nil {
+				return
+			}
 		}
 	}
 }

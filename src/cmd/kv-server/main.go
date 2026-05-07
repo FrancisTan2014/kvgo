@@ -47,6 +47,7 @@ func main() {
 		host         = flag.String("host", "", "listen address or unix socket path (default 127.0.0.1)")
 		port         = flag.Int("port", 4000, "listen port (ignored for unix)")
 		httpPort     = flag.Int("http-port", 0, "HTTP API port for external tools like Jepsen (0 = disabled)")
+		grpcPort     = flag.Int("grpc-port", 0, "gRPC API port (0 = disabled)")
 		dataDir      = flag.String("data-dir", "", "data directory (required)")
 		readTO       = flag.Duration("read-timeout", 0, "per-request read timeout (default 5s)")
 		writeTO      = flag.Duration("write-timeout", 0, "per-request write timeout (default 5s)")
@@ -88,6 +89,11 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *grpcPort < 0 || *grpcPort > 65535 {
+		fmt.Fprintln(os.Stderr, "error: -grpc-port must be in range 0-65535")
+		os.Exit(2)
+	}
+
 	peers, err := parsePeers(*peersRaw)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -109,6 +115,7 @@ func main() {
 		Port:         uint16(*port),
 		RaftPort:     uint16(*raftPort),
 		HTTPPort:     uint16(*httpPort),
+		GRPCPort:     uint16(*grpcPort),
 		DataDir:      *dataDir,
 		ReadTimeout:  *readTO,
 		WriteTimeout: *writeTO,
@@ -131,6 +138,9 @@ func main() {
 	fmt.Printf("kv-server listening on %s\n", s.Addr())
 	if s.HTTPAddr() != "" {
 		fmt.Printf("http api listening on %s\n", s.HTTPAddr())
+	}
+	if s.GRPCAddr() != "" {
+		fmt.Printf("grpc api listening on %s\n", s.GRPCAddr())
 	}
 
 	// Wait for interrupt signal.
