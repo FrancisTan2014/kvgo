@@ -1,0 +1,59 @@
+services:
+  node1:
+    build: .
+    container_name: kv-node1
+    command:
+      - --node-id=1
+      - --host=0.0.0.0
+      - --port=4000
+      - --raft-port=5000
+      - --grpc-port=4200
+      - --data-dir=/data
+      - --peers=2=kv-node2:5000,3=kv-node3:5000
+      - --write-timeout=10s
+    ports:
+      - "4001:4000"
+      - "4201:4200"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    build: .
+    container_name: kv-node2
+    command:
+      - --node-id=2
+      - --host=0.0.0.0
+      - --port=4000
+      - --raft-port=5000
+      - --grpc-port=4200
+      - --data-dir=/data
+      - --peers=1=kv-node1:5000,3=kv-node3:5000
+      - --write-timeout=10s
+    ports:
+      - "4002:4000"
+      - "4202:4200"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    build: .
+    container_name: kv-node3
+    command:
+      - --node-id=3
+      - --host=0.0.0.0
+      - --port=4000
+      - --raft-port=5000
+      - --grpc-port=4200
+      - --data-dir=/data
+      - --peers=1=kv-node1:5000,2=kv-node2:5000
+      - --write-timeout=10s
+    ports:
+      - "4003:4000"
+      - "4203:4200"
+    volumes:
+      - node3-data:/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

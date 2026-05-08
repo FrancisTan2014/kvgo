@@ -1,8 +1,22 @@
 # kv-go
 
-A distributed key-value store built on a custom Raft consensus implementation in Go. Every layer — consensus, replication, storage, transport — is written from scratch. 200+ unit tests across the Raft, server, engine, and transport layers.
+A distributed key-value store built on a custom Raft consensus implementation in Go.
+
+This is not a tutorial port or a library wrapper. Every layer — leader election, log replication, WAL persistence, storage engine, network transport — is implemented from scratch to understand how systems like etcd work under the hood. 200+ unit tests, Jepsen linearizability testing under network partitions, and benchmarks compared against etcd on the same hardware.
+
+Why I built this:
+1. Apply what I learned from *Computer Systems: A Programmer's Perspective*
+2. After 10 years of C#/.NET, learn Go through a project with real concurrency, I/O, and protocol constraints
+3. Learn how modern distributed systems work
+
+## Writing
+
+- [Stop Before the Boundary and Prove What You Have](docs/articles/stop-before-the-boundary.md) — why shrinking the subject and proving what you have beats building the whole thing first.
+- [Software Design Moves Top-Down, Bottom-Up, and Back Again](docs/articles/back-and-forth-in-software-design.md) — how the Raft rewrite taught me that real design stabilizes through repeated movement between architecture and implementation pressure.
 
 ## Quick start
+
+**Single node:**
 
 ```bash
 cd src
@@ -15,6 +29,20 @@ OK
 > get mykey
 myvalue
 > quit
+```
+
+**3-node cluster (Docker):**
+
+```bash
+docker compose up -d          # start 3-node cluster
+docker compose logs --tail 3  # verify all nodes listening
+
+# write to node 1, read from node 2:
+echo "put hello world" | docker exec -i kv-node1 kv-cli -addr 127.0.0.1:4000 -timeout 10s
+echo "get hello"       | docker exec -i kv-node2 kv-cli -addr 127.0.0.1:4000 -timeout 10s
+# → world
+
+docker compose down -v        # cleanup
 ```
 
 ## Architecture
@@ -131,7 +159,7 @@ This is linearizable: the read sees every write that completed before it started
 
 ## Benchmarks
 
-Single-node, 128-byte values, PUT-only:
+Single-node, 128-byte values, PUT-only. No batching, no multiplexing, no pipelining — each connection sends one request at a time and waits for the Raft round-trip before sending the next.
 
 | Connections | Throughput | P50 | P99 |
 |-------------|-----------|-----|-----|
@@ -168,6 +196,17 @@ src/
     └── kv-cli/     # CLI client
 ```
 
+## Tests
+
+```bash
+cd src && go test ./... -count=1
+```
+
+200+ unit tests across the Raft core, server, engine, and transport layers. Key test areas:
+- Raft state machine: election, replication, PreVote, CheckQuorum, leader transfer, ReadIndex, raftLog
+- Server: propose-apply lifecycle, ReadIndex integration, error handling
+- Engine: WAL durability, compaction, concurrent access
+
 ## Design documentation
 
 Each episode is a self-contained thinking doc in [`docs/`](docs/). The system is built through a question-driven methodology — every feature exists because a specific failure mode demanded it.
@@ -177,11 +216,6 @@ Each episode is a self-contained thinking doc in [`docs/`](docs/). The system is
 **Episode 036 — The watershed:** The system stops being a KV store that bolts on consensus and becomes a consensus system with a KV state machine.
 
 **Phase 2 (036–042):** Raft consensus system — state machine, Ready/Advance, WAL, ReadIndex, PreVote, CheckQuorum, leader transfer, raftLog, throughput diagnosis, non-blocking apply.
-
-## Articles
-
-- [Stop Before the Boundary and Prove What You Have](docs/articles/stop-before-the-boundary.md)
-- [Software Design Moves Top-Down, Bottom-Up, and Back Again](docs/articles/back-and-forth-in-software-design.md)
 
 ## References
 
